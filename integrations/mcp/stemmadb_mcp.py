@@ -98,7 +98,7 @@ def resolve(query: str, database: str) -> dict[str, Any]:
     rejected near-misses with reasons) for clients that visualize resolution.
     """
     _browser(database)  # validate name before the RPC
-    trace = _client.explain_dict(query, database=database)
+    trace = _client.explain_dict(query, database=database, source="mcp", session=os.environ.get("STEMMADB_SESSION", ""))
     out = _compact(trace)
     out["trajectory"] = trace
     return out

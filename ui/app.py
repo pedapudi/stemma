@@ -126,7 +126,7 @@ def create_app(
     def resolve(name: str, q: str):
         browser(name)  # 404 on unknown db before touching gRPC
         try:
-            return client.explain_dict(q, database=name)
+            return client.explain_dict(q, database=name, source="console")
         except grpc.RpcError as e:
             raise HTTPException(502, f"stemma-server: {e.code().name}: {e.details()}") from e
 
@@ -148,7 +148,9 @@ def create_app(
         try:
             return await agent_chat.send(
                 name, text,
-                explain_fn=lambda q, database: client.explain_dict(q, database=database),
+                explain_fn=lambda q, database: client.explain_dict(
+                    q, database=database, source="agent", session=f"{name}/default"
+                ),
             )
         except Exception as e:
             raise HTTPException(502, f"agent: {e}") from e
@@ -164,10 +166,11 @@ def create_app(
     def history(name: str, limit: int = 8):
         try:
             r = browser(name).query(
-                "SELECT query, max(asked_at) AS at FROM query_log "
+                "SELECT query, max(asked_at) AS at, max(source) AS src FROM query_log "
                 f"GROUP BY query ORDER BY at DESC LIMIT {min(int(limit), 30)}"
             )
-            return {"queries": [row[0] for row in r["rows"]]}
+            return {"queries": [row[0] for row in r["rows"]],
+                    "tagged": [{"query": row[0], "source": row[2]} for row in r["rows"]]}
         except Exception:
             return {"queries": []}
 

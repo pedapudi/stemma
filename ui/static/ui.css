@@ -727,3 +727,19 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .sf-dot.rej { background: transparent; border: 1px solid var(--flat); opacity: .7; }
 .sf-dot:hover { transform: translate(-50%, -50%) scale(1.5); }
 .sf-detail { padding: 4px 0 10px; }
+
+/* score-field interactivity */
+.sf-channels { display: inline-flex; gap: 4px; margin-left: 12px; }
+.sf-channels .chip { cursor: pointer; }
+.sf-channels .chip.on-chan { color: var(--accent); border-color: var(--accent); }
+.sf-axis { cursor: crosshair; }
+.sf-tick.preview { color: var(--accent); }
+.sf-dot.dim { opacity: .12 !important; }
+.sf-kgchip { margin-left: 7px; color: var(--brand-accent); border-color: var(--brand-accent); }
+.cand-card { margin-top: 12px; border: 1px solid var(--accent); border-radius: 5px; background: var(--paper); padding: 10px 14px; }
+.cand-card[hidden] { display: none; }
+.cc-head { display: flex; align-items: baseline; gap: 12px; }
+.cc-body { margin: 8px 0; font-size: calc(12px * var(--fs)); line-height: 1.5; }
+.cc-body .snippet { white-space: normal; }
+.cc-channels { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.cc-actions { display: flex; gap: 10px; align-items: baseline; }

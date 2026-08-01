@@ -75,6 +75,9 @@ message TraceSpan {
   // "selected" | "overlapped" | "no_candidates" | "weak" | "skipped"
   string status = 5;
   repeated TraceCandidate candidates = 6;
+  // The span's text matches a knowledge-graph phrase/term entity — mention
+  // detection used the KG, and selection favored this span.
+  bool kg_alias = 7;
 }
 
 message ResolveRequest {
@@ -93,6 +96,12 @@ message ResolveOptions {
   bool allow_lm = 2;
   // Drop candidates below this confidence (0 = server default).
   double min_confidence = 3;
+  // Where the query came from ("console", "agent", "mcp", ...). Recorded in
+  // the store's query history.
+  string source = 4;
+  // Session/conversation identifier for history tagging (e.g. an agent
+  // session id). Empty for one-off queries.
+  string session = 5;
 }
 
 message ResolveResponse {

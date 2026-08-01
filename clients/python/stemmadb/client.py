@@ -32,23 +32,39 @@ class StemmaClient:
     def close(self) -> None:
         self._channel.close()
 
-    def _request(self, query: str, database: str) -> resolve_pb2.ResolveRequest:
-        return resolve_pb2.ResolveRequest(query=query, database=database)
+    def _request(
+        self, query: str, database: str, source: str = "", session: str = ""
+    ) -> resolve_pb2.ResolveRequest:
+        options = None
+        if source or session:
+            options = resolve_pb2.ResolveOptions(source=source, session=session)
+        return resolve_pb2.ResolveRequest(query=query, database=database, options=options)
 
-    def resolve(self, query: str, database: str) -> resolve_pb2.ResolveResponse:
-        """Selected mentions with their candidates and evidence."""
-        return self._stub.Resolve(self._request(query, database), timeout=self._timeout)
+    def resolve(
+        self, query: str, database: str, source: str = "", session: str = ""
+    ) -> resolve_pb2.ResolveResponse:
+        """Selected mentions with their candidates and evidence. `source` and
+        `session` tag the store's query history."""
+        return self._stub.Resolve(
+            self._request(query, database, source, session), timeout=self._timeout
+        )
 
-    def explain(self, query: str, database: str) -> resolve_pb2.ExplainResponse:
+    def explain(
+        self, query: str, database: str, source: str = "", session: str = ""
+    ) -> resolve_pb2.ExplainResponse:
         """The full resolution trajectory, near-misses included."""
-        return self._stub.Explain(self._request(query, database), timeout=self._timeout)
+        return self._stub.Explain(
+            self._request(query, database, source, session), timeout=self._timeout
+        )
 
-    def explain_dict(self, query: str, database: str) -> dict[str, Any]:
+    def explain_dict(
+        self, query: str, database: str, source: str = "", session: str = ""
+    ) -> dict[str, Any]:
         """explain() as a plain dict (JSON-ready), preserving zero fields."""
         from google.protobuf.json_format import MessageToDict
 
         return MessageToDict(
-            self.explain(query, database),
+            self.explain(query, database, source, session),
             preserving_proto_field_name=True,
             always_print_fields_with_no_presence=True,
         )

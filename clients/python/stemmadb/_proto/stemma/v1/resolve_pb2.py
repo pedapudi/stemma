@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17stemma/v1/resolve.proto\x12\tstemma.v1\"\x92\x01\n\x0f\x45xplainResponse\x12\r\n\x05query\x18\x01 \x01(\t\x12\x12\n\nelapsed_ms\x18\x02 \x01(\x01\x12%\n\x06tokens\x18\x03 \x03(\x0b\x32\x15.stemma.v1.TraceToken\x12#\n\x05spans\x18\x04 \x03(\x0b\x32\x14.stemma.v1.TraceSpan\x12\x10\n\x08mentions\x18\x05 \x03(\r\"H\n\nTraceToken\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\r\n\x05start\x18\x02 \x01(\r\x12\x0b\n\x03\x65nd\x18\x03 \x01(\r\x12\x10\n\x08stopword\x18\x04 \x01(\x08\"?\n\x11TraceChannelScore\x12\x0f\n\x07\x63hannel\x18\x01 \x01(\t\x12\x0c\n\x04rank\x18\x02 \x01(\r\x12\x0b\n\x03raw\x18\x03 \x01(\x01\"\xef\x01\n\x0eTraceCandidate\x12\r\n\x05table\x18\x01 \x01(\t\x12\x0e\n\x06\x63olumn\x18\x02 \x01(\t\x12\r\n\x05rowid\x18\x03 \x01(\x03\x12\r\n\x05value\x18\x04 \x01(\t\x12\x17\n\x0fvalue_truncated\x18\x05 \x01(\x08\x12\r\n\x05score\x18\x06 \x01(\x01\x12\x10\n\x08selected\x18\x07 \x01(\x08\x12\x15\n\rreject_reason\x18\x08 \x01(\t\x12.\n\x08\x63hannels\x18\t \x03(\x0b\x32\x1c.stemma.v1.TraceChannelScore\x12\x0f\n\x07snippet\x18\n \x01(\t\x12\x0e\n\x06is_doc\x18\x0b \x01(\x08\"\x80\x01\n\tTraceSpan\x12\n\n\x02id\x18\x01 \x01(\r\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\r\n\x05start\x18\x03 \x01(\r\x12\x0b\n\x03\x65nd\x18\x04 \x01(\r\x12\x0e\n\x06status\x18\x05 \x01(\t\x12-\n\ncandidates\x18\x06 \x03(\x0b\x32\x19.stemma.v1.TraceCandidate\"]\n\x0eResolveRequest\x12\r\n\x05query\x18\x01 \x01(\t\x12\x10\n\x08\x64\x61tabase\x18\x02 \x01(\t\x12*\n\x07options\x18\x03 \x01(\x0b\x32\x19.stemma.v1.ResolveOptions\"^\n\x0eResolveOptions\x12\"\n\x1amax_candidates_per_mention\x18\x01 \x01(\r\x12\x10\n\x08\x61llow_lm\x18\x02 \x01(\x08\x12\x16\n\x0emin_confidence\x18\x03 \x01(\x01\"P\n\x0fResolveResponse\x12$\n\x08mentions\x18\x01 \x03(\x0b\x32\x12.stemma.v1.Mention\x12\x17\n\x0frewritten_query\x18\x02 \x01(\t\"j\n\x07Mention\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\r\n\x05start\x18\x02 \x01(\r\x12\x0b\n\x03\x65nd\x18\x03 \x01(\r\x12(\n\ncandidates\x18\x04 \x03(\x0b\x32\x14.stemma.v1.Candidate\x12\x0b\n\x03nil\x18\x05 \x01(\x08\"\x9f\x01\n\tCandidate\x12\r\n\x05table\x18\x01 \x01(\t\x12\r\n\x05rowid\x18\x02 \x01(\x03\x12\x0e\n\x06\x63olumn\x18\x03 \x01(\t\x12\r\n\x05value\x18\x04 \x01(\t\x12\r\n\x05score\x18\x05 \x01(\x01\x12%\n\x08\x65vidence\x18\x06 \x03(\x0b\x32\x13.stemma.v1.Evidence\x12\x0f\n\x07snippet\x18\x07 \x01(\t\x12\x0e\n\x06is_doc\x18\x08 \x01(\x08\"\xec\x01\n\x08\x45vidence\x12*\n\x07lexical\x18\x01 \x01(\x0b\x32\x17.stemma.v1.LexicalMatchH\x00\x12,\n\x08semantic\x18\x02 \x01(\x0b\x32\x18.stemma.v1.SemanticMatchH\x00\x12$\n\x07kg_path\x18\x03 \x01(\x0b\x32\x11.stemma.v1.KgPathH\x00\x12\'\n\x05probe\x18\x04 \x01(\x0b\x32\x16.stemma.v1.ProbeResultH\x00\x12/\n\x0c\x61\x64judication\x18\x05 \x01(\x0b\x32\x17.stemma.v1.AdjudicationH\x00\x42\x06\n\x04kind\"D\n\x0cLexicalMatch\x12\x0f\n\x07\x63hannel\x18\x01 \x01(\t\x12\x14\n\x0cmatched_text\x18\x02 \x01(\t\x12\r\n\x05score\x18\x03 \x01(\x01\"2\n\rSemanticMatch\x12\r\n\x05model\x18\x01 \x01(\t\x12\x12\n\nsimilarity\x18\x02 \x01(\x01\"&\n\x06KgPath\x12\r\n\x05nodes\x18\x01 \x03(\t\x12\r\n\x05\x65\x64ges\x18\x02 \x03(\t\"-\n\x0bProbeResult\x12\x0b\n\x03sql\x18\x01 \x01(\t\x12\x11\n\trow_count\x18\x02 \x01(\x04\"0\n\x0c\x41\x64judication\x12\r\n\x05model\x18\x01 \x01(\t\x12\x11\n\trationale\x18\x02 \x01(\t2\x94\x01\n\x0eResolveService\x12@\n\x07Resolve\x12\x19.stemma.v1.ResolveRequest\x1a\x1a.stemma.v1.ResolveResponse\x12@\n\x07\x45xplain\x12\x19.stemma.v1.ResolveRequest\x1a\x1a.stemma.v1.ExplainResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17stemma/v1/resolve.proto\x12\tstemma.v1\"\x92\x01\n\x0f\x45xplainResponse\x12\r\n\x05query\x18\x01 \x01(\t\x12\x12\n\nelapsed_ms\x18\x02 \x01(\x01\x12%\n\x06tokens\x18\x03 \x03(\x0b\x32\x15.stemma.v1.TraceToken\x12#\n\x05spans\x18\x04 \x03(\x0b\x32\x14.stemma.v1.TraceSpan\x12\x10\n\x08mentions\x18\x05 \x03(\r\"H\n\nTraceToken\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\r\n\x05start\x18\x02 \x01(\r\x12\x0b\n\x03\x65nd\x18\x03 \x01(\r\x12\x10\n\x08stopword\x18\x04 \x01(\x08\"?\n\x11TraceChannelScore\x12\x0f\n\x07\x63hannel\x18\x01 \x01(\t\x12\x0c\n\x04rank\x18\x02 \x01(\r\x12\x0b\n\x03raw\x18\x03 \x01(\x01\"\xef\x01\n\x0eTraceCandidate\x12\r\n\x05table\x18\x01 \x01(\t\x12\x0e\n\x06\x63olumn\x18\x02 \x01(\t\x12\r\n\x05rowid\x18\x03 \x01(\x03\x12\r\n\x05value\x18\x04 \x01(\t\x12\x17\n\x0fvalue_truncated\x18\x05 \x01(\x08\x12\r\n\x05score\x18\x06 \x01(\x01\x12\x10\n\x08selected\x18\x07 \x01(\x08\x12\x15\n\rreject_reason\x18\x08 \x01(\t\x12.\n\x08\x63hannels\x18\t \x03(\x0b\x32\x1c.stemma.v1.TraceChannelScore\x12\x0f\n\x07snippet\x18\n \x01(\t\x12\x0e\n\x06is_doc\x18\x0b \x01(\x08\"\x92\x01\n\tTraceSpan\x12\n\n\x02id\x18\x01 \x01(\r\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\r\n\x05start\x18\x03 \x01(\r\x12\x0b\n\x03\x65nd\x18\x04 \x01(\r\x12\x0e\n\x06status\x18\x05 \x01(\t\x12-\n\ncandidates\x18\x06 \x03(\x0b\x32\x19.stemma.v1.TraceCandidate\x12\x10\n\x08kg_alias\x18\x07 \x01(\x08\"]\n\x0eResolveRequest\x12\r\n\x05query\x18\x01 \x01(\t\x12\x10\n\x08\x64\x61tabase\x18\x02 \x01(\t\x12*\n\x07options\x18\x03 \x01(\x0b\x32\x19.stemma.v1.ResolveOptions\"\x7f\n\x0eResolveOptions\x12\"\n\x1amax_candidates_per_mention\x18\x01 \x01(\r\x12\x10\n\x08\x61llow_lm\x18\x02 \x01(\x08\x12\x16\n\x0emin_confidence\x18\x03 \x01(\x01\x12\x0e\n\x06source\x18\x04 \x01(\t\x12\x0f\n\x07session\x18\x05 \x01(\t\"P\n\x0fResolveResponse\x12$\n\x08mentions\x18\x01 \x03(\x0b\x32\x12.stemma.v1.Mention\x12\x17\n\x0frewritten_query\x18\x02 \x01(\t\"j\n\x07Mention\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\r\n\x05start\x18\x02 \x01(\r\x12\x0b\n\x03\x65nd\x18\x03 \x01(\r\x12(\n\ncandidates\x18\x04 \x03(\x0b\x32\x14.stemma.v1.Candidate\x12\x0b\n\x03nil\x18\x05 \x01(\x08\"\x9f\x01\n\tCandidate\x12\r\n\x05table\x18\x01 \x01(\t\x12\r\n\x05rowid\x18\x02 \x01(\x03\x12\x0e\n\x06\x63olumn\x18\x03 \x01(\t\x12\r\n\x05value\x18\x04 \x01(\t\x12\r\n\x05score\x18\x05 \x01(\x01\x12%\n\x08\x65vidence\x18\x06 \x03(\x0b\x32\x13.stemma.v1.Evidence\x12\x0f\n\x07snippet\x18\x07 \x01(\t\x12\x0e\n\x06is_doc\x18\x08 \x01(\x08\"\xec\x01\n\x08\x45vidence\x12*\n\x07lexical\x18\x01 \x01(\x0b\x32\x17.stemma.v1.LexicalMatchH\x00\x12,\n\x08semantic\x18\x02 \x01(\x0b\x32\x18.stemma.v1.SemanticMatchH\x00\x12$\n\x07kg_path\x18\x03 \x01(\x0b\x32\x11.stemma.v1.KgPathH\x00\x12\'\n\x05probe\x18\x04 \x01(\x0b\x32\x16.stemma.v1.ProbeResultH\x00\x12/\n\x0c\x61\x64judication\x18\x05 \x01(\x0b\x32\x17.stemma.v1.AdjudicationH\x00\x42\x06\n\x04kind\"D\n\x0cLexicalMatch\x12\x0f\n\x07\x63hannel\x18\x01 \x01(\t\x12\x14\n\x0cmatched_text\x18\x02 \x01(\t\x12\r\n\x05score\x18\x03 \x01(\x01\"2\n\rSemanticMatch\x12\r\n\x05model\x18\x01 \x01(\t\x12\x12\n\nsimilarity\x18\x02 \x01(\x01\"&\n\x06KgPath\x12\r\n\x05nodes\x18\x01 \x03(\t\x12\r\n\x05\x65\x64ges\x18\x02 \x03(\t\"-\n\x0bProbeResult\x12\x0b\n\x03sql\x18\x01 \x01(\t\x12\x11\n\trow_count\x18\x02 \x01(\x04\"0\n\x0c\x41\x64judication\x12\r\n\x05model\x18\x01 \x01(\t\x12\x11\n\trationale\x18\x02 \x01(\t2\x94\x01\n\x0eResolveService\x12@\n\x07Resolve\x12\x19.stemma.v1.ResolveRequest\x1a\x1a.stemma.v1.ResolveResponse\x12@\n\x07\x45xplain\x12\x19.stemma.v1.ResolveRequest\x1a\x1a.stemma.v1.ExplainResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -40,29 +40,29 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TRACECANDIDATE']._serialized_start=327
   _globals['_TRACECANDIDATE']._serialized_end=566
   _globals['_TRACESPAN']._serialized_start=569
-  _globals['_TRACESPAN']._serialized_end=697
-  _globals['_RESOLVEREQUEST']._serialized_start=699
-  _globals['_RESOLVEREQUEST']._serialized_end=792
-  _globals['_RESOLVEOPTIONS']._serialized_start=794
-  _globals['_RESOLVEOPTIONS']._serialized_end=888
-  _globals['_RESOLVERESPONSE']._serialized_start=890
-  _globals['_RESOLVERESPONSE']._serialized_end=970
-  _globals['_MENTION']._serialized_start=972
-  _globals['_MENTION']._serialized_end=1078
-  _globals['_CANDIDATE']._serialized_start=1081
-  _globals['_CANDIDATE']._serialized_end=1240
-  _globals['_EVIDENCE']._serialized_start=1243
-  _globals['_EVIDENCE']._serialized_end=1479
-  _globals['_LEXICALMATCH']._serialized_start=1481
-  _globals['_LEXICALMATCH']._serialized_end=1549
-  _globals['_SEMANTICMATCH']._serialized_start=1551
-  _globals['_SEMANTICMATCH']._serialized_end=1601
-  _globals['_KGPATH']._serialized_start=1603
-  _globals['_KGPATH']._serialized_end=1641
-  _globals['_PROBERESULT']._serialized_start=1643
-  _globals['_PROBERESULT']._serialized_end=1688
-  _globals['_ADJUDICATION']._serialized_start=1690
-  _globals['_ADJUDICATION']._serialized_end=1738
-  _globals['_RESOLVESERVICE']._serialized_start=1741
-  _globals['_RESOLVESERVICE']._serialized_end=1889
+  _globals['_TRACESPAN']._serialized_end=715
+  _globals['_RESOLVEREQUEST']._serialized_start=717
+  _globals['_RESOLVEREQUEST']._serialized_end=810
+  _globals['_RESOLVEOPTIONS']._serialized_start=812
+  _globals['_RESOLVEOPTIONS']._serialized_end=939
+  _globals['_RESOLVERESPONSE']._serialized_start=941
+  _globals['_RESOLVERESPONSE']._serialized_end=1021
+  _globals['_MENTION']._serialized_start=1023
+  _globals['_MENTION']._serialized_end=1129
+  _globals['_CANDIDATE']._serialized_start=1132
+  _globals['_CANDIDATE']._serialized_end=1291
+  _globals['_EVIDENCE']._serialized_start=1294
+  _globals['_EVIDENCE']._serialized_end=1530
+  _globals['_LEXICALMATCH']._serialized_start=1532
+  _globals['_LEXICALMATCH']._serialized_end=1600
+  _globals['_SEMANTICMATCH']._serialized_start=1602
+  _globals['_SEMANTICMATCH']._serialized_end=1652
+  _globals['_KGPATH']._serialized_start=1654
+  _globals['_KGPATH']._serialized_end=1692
+  _globals['_PROBERESULT']._serialized_start=1694
+  _globals['_PROBERESULT']._serialized_end=1739
+  _globals['_ADJUDICATION']._serialized_start=1741
+  _globals['_ADJUDICATION']._serialized_end=1789
+  _globals['_RESOLVESERVICE']._serialized_start=1792
+  _globals['_RESOLVESERVICE']._serialized_end=1940
 # @@protoc_insertion_point(module_scope)

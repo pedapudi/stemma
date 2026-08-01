@@ -60,9 +60,21 @@ impl Resolver {
         // Query history is store working memory; a failed write must never
         // fail the resolution.
         if !req.query.trim().is_empty() {
+            let (source, session) = req
+                .options
+                .as_ref()
+                .map(|o| (o.source.clone(), o.session.clone()))
+                .unwrap_or_default();
             let _ = db.conn().execute(
-                "INSERT INTO query_log (query, mentions, elapsed_ms) VALUES (?1, ?2, ?3)",
-                stemmadb::rusqlite::params![req.query, trace.mentions.len() as i64, trace.elapsed_ms],
+                "INSERT INTO query_log (query, mentions, elapsed_ms, source, session)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                stemmadb::rusqlite::params![
+                    req.query,
+                    trace.mentions.len() as i64,
+                    trace.elapsed_ms,
+                    source,
+                    session
+                ],
             );
         }
         Ok(trace)

@@ -859,46 +859,167 @@ function renderTrace(out, trace) {
   }
   if (cursor < trace.query.length) qline.append(trace.query.slice(cursor));
   const THRESHOLD = 0.35;
+  let previewT = null;
+  const activeChannels = /* @__PURE__ */ new Set();
+  const allDots = [];
+  const card = el("div", {
+    class: "cand-card",
+    hidden: ""
+  });
+  function restyle() {
+    const t = previewT ?? THRESHOLD;
+    for (const { dot, c } of allDots) {
+      const wouldSelect = c.score >= t;
+      dot.classList.toggle("rej", !wouldSelect);
+      dot.classList.toggle("sel", wouldSelect && !dot.classList.contains("top"));
+      if (previewT !== null) dot.classList.remove("top");
+      const dimmed = activeChannels.size > 0 && !c.channels.some((ch) => activeChannels.has(ch.channel));
+      dot.classList.toggle("dim", dimmed);
+    }
+    threshRules.forEach((r) => {
+      r.style.left = `${t * 100}%`;
+    });
+    threshTick.style.left = `${t * 100}%`;
+    threshTick.textContent = previewT === null ? "threshold" : `preview ${t.toFixed(2)}`;
+    threshTick.classList.toggle("preview", previewT !== null);
+  }
+  const threshRules = [];
+  const threshTick = el("span", {
+    class: "sf-tick sf-thresh",
+    style: `left:${THRESHOLD * 100}%`
+  }, "threshold");
+  const axis = el("div", {
+    class: "sf-axis",
+    title: "click to preview a different threshold"
+  }, el("span", {
+    class: "sf-tick",
+    style: "left:0%"
+  }, "0"), threshTick, el("span", {
+    class: "sf-tick",
+    style: "left:100%"
+  }, "1"));
+  axis.addEventListener("click", (e) => {
+    const r = axis.getBoundingClientRect();
+    const t = Math.min(0.99, Math.max(0.01, (e.clientX - r.left) / r.width));
+    previewT = Math.abs(t - THRESHOLD) < 0.02 ? null : t;
+    restyle();
+  });
+  const channels = [
+    "exact",
+    "bm25",
+    "trigram",
+    "kg"
+  ];
+  const chanRow = el("span", {
+    class: "sf-channels"
+  }, channels.map((ch) => {
+    const chip = el("button", {
+      class: "chip",
+      onclick: (e) => {
+        e.stopPropagation();
+        if (activeChannels.has(ch)) activeChannels.delete(ch);
+        else activeChannels.add(ch);
+        chip.classList.toggle("on-chan");
+        restyle();
+      }
+    }, ch);
+    return chip;
+  }), el("button", {
+    class: "chip",
+    onclick: (e) => {
+      e.stopPropagation();
+      previewT = null;
+      activeChannels.clear();
+      field.querySelectorAll(".on-chan").forEach((x) => x.classList.remove("on-chan"));
+      restyle();
+    }
+  }, "reset"));
   const field = el("div", {
     class: "scorefield"
   });
   field.append(el("div", {
     class: "sf-head"
-  }, el("span", {
+  }, el("span", null, el("span", {
     class: "sf-label subhead",
     style: "margin:0"
-  }, "mention"), el("div", {
-    class: "sf-axis"
-  }, el("span", {
-    class: "sf-tick",
-    style: "left:0%"
-  }, "0"), el("span", {
-    class: "sf-tick sf-thresh",
-    style: `left:${THRESHOLD * 100}%`
-  }, "threshold"), el("span", {
-    class: "sf-tick",
-    style: "left:100%"
-  }, "1"))));
+  }, "mention"), chanRow), axis));
+  function showCard(sp, c) {
+    hideHover();
+    card.hidden = false;
+    card.replaceChildren(el("div", {
+      class: "cc-head"
+    }, el("span", {
+      class: "cand-id"
+    }, `${c.table}.${c.column} `, el("span", {
+      class: "rowid"
+    }, `#${c.rowid}`)), el("span", {
+      class: "score"
+    }, c.score.toFixed(3)), c.selected ? el("span", {
+      class: "pill pending"
+    }, "selected") : el("span", {
+      class: "pill bad"
+    }, (c.reject_reason || "rejected").replace(/_/g, " ")), el("span", {
+      class: "spacer"
+    }), el("button", {
+      class: "btn",
+      onclick: () => {
+        card.hidden = true;
+      }
+    }, "\u2715")), el("div", {
+      class: "cc-body"
+    }, c.is_doc && c.snippet ? snippetNode(c.snippet) : el("span", {
+      class: "mono"
+    }, `\u201C${c.value}\u201D`)), el("div", {
+      class: "cc-channels"
+    }, c.channels.map((ch) => el("span", {
+      class: "chip"
+    }, `${ch.channel} \xB7 rank ${ch.rank + 1} \xB7 ${ch.raw.toFixed(2)}`))), el("div", {
+      class: "cc-actions"
+    }, el("button", {
+      class: "btn accent",
+      onclick: () => {
+        location.hash = `#/data/${encodeURIComponent(c.table)}?after=${Number(c.rowid) - 1}`;
+      }
+    }, "open row in data \u2192"), c.is_doc ? null : el("button", {
+      class: "btn",
+      onclick: () => {
+        location.hash = "#/query?d=nl&q=" + encodeURIComponent(c.value);
+      }
+    }, "resolve this value \u2192"), el("span", {
+      class: "sql-caption"
+    }, `for mention \u201C${sp.text}\u201D`)));
+  }
   let openDetail = null;
   let openRow = null;
   for (const sp of mentionSpans) {
-    const strip = el("div", {
-      class: "sf-strip"
-    }, el("i", {
+    const rule = el("i", {
       class: "sf-rule"
-    }), el("i", {
+    });
+    const trule = el("i", {
       class: "sf-rule sf-rule-thresh",
       style: `left:${THRESHOLD * 100}%`
-    }));
+    });
+    threshRules.push(trule);
+    const strip = el("div", {
+      class: "sf-strip"
+    }, rule, trule);
     const topIdx = sp.candidates.findIndex((c) => c.selected);
     sp.candidates.forEach((c, i) => {
       const cls = "sf-dot" + (c.selected ? i === topIdx ? " top" : " sel" : " rej");
       const jitter = (i % 5 - 2) * 5;
       const dot = el("span", {
         class: cls,
-        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`
+        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`,
+        onclick: (e) => {
+          e.stopPropagation();
+          showCard(sp, c);
+        }
       });
-      hov(dot, `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \xB7 ${c.score.toFixed(2)}<br>${esc((c.snippet || c.value).slice(0, 120))}<br>` + c.channels.map((ch) => esc(ch.channel)).join(" \xB7 ") + (c.selected ? "" : ` \xB7 <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`));
+      hov(dot, `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \xB7 ${c.score.toFixed(2)}<br>${esc((c.snippet || c.value).slice(0, 120))}<br>` + c.channels.map((ch) => esc(ch.channel)).join(" \xB7 ") + (c.selected ? "" : ` \xB7 <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`) + "<br><i>click for the card</i>");
+      allDots.push({
+        dot,
+        c
+      });
       strip.append(dot);
     });
     const nSel = sp.candidates.filter((c) => c.selected).length;
@@ -908,7 +1029,10 @@ function renderTrace(out, trace) {
       class: "sf-label"
     }, el("span", {
       class: "sf-mention"
-    }, sp.text), el("span", {
+    }, sp.text), sp.kg_alias ? el("span", {
+      class: "chip sf-kgchip",
+      title: "matches a knowledge-graph entity"
+    }, "kg") : null, el("span", {
       class: "sf-count"
     }, `${nSel}/${sp.candidates.length}`)), strip);
     const detail = el("div", {
@@ -935,6 +1059,7 @@ function renderTrace(out, trace) {
       class: "empty"
     }, "\u2014 no mentions resolved; the considered spans are below"));
   }
+  field.append(card);
   const also = trace.spans.filter((s) => s.status !== "selected" && s.status !== "skipped").sort((a, b) => a.start - b.start);
   const alsoBox = el("details", {
     class: "alsoran section"
@@ -1266,8 +1391,9 @@ async function viewData(host, params, table) {
   }
   const limit = 50;
   const meta = tables.find((t) => t.name === name);
+  const afterParam = params.get("after");
   const cursors = [
-    null
+    afterParam !== null ? Number(afterParam) : null
   ];
   let lastRowid = null;
   let hasMore = false;
@@ -1299,7 +1425,7 @@ async function viewData(host, params, table) {
       load(null);
     }
   }, "filter")), body);
-  await load(null);
+  await load(cursors[0]);
   async function load(after) {
     body.replaceChildren(el("div", {
       class: "empty"

@@ -83,6 +83,10 @@ pub struct TraceSpan {
     pub status: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "6")]
     pub candidates: ::prost::alloc::vec::Vec<TraceCandidate>,
+    /// The span's text matches a knowledge-graph phrase/term entity — mention
+    /// detection used the KG, and selection favored this span.
+    #[prost(bool, tag = "7")]
+    pub kg_alias: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveRequest {
@@ -95,7 +99,7 @@ pub struct ResolveRequest {
     #[prost(message, optional, tag = "3")]
     pub options: ::core::option::Option<ResolveOptions>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveOptions {
     /// Maximum ranked candidates returned per mention (0 = server default).
     #[prost(uint32, tag = "1")]
@@ -107,6 +111,14 @@ pub struct ResolveOptions {
     /// Drop candidates below this confidence (0 = server default).
     #[prost(double, tag = "3")]
     pub min_confidence: f64,
+    /// Where the query came from ("console", "agent", "mcp", ...). Recorded in
+    /// the store's query history.
+    #[prost(string, tag = "4")]
+    pub source: ::prost::alloc::string::String,
+    /// Session/conversation identifier for history tagging (e.g. an agent
+    /// session id). Empty for one-off queries.
+    #[prost(string, tag = "5")]
+    pub session: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveResponse {

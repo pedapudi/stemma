@@ -96,6 +96,9 @@ pub struct Span {
     /// threshold; "skipped" — stopword-only or too short.
     pub status: String,
     pub candidates: Vec<Candidate>,
+    /// The span matches a knowledge-graph phrase/term entity: the KG
+    /// participated in mention detection, and selection favors this span.
+    pub kg_alias: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +129,28 @@ pub fn resolve_lexical(db: &StemmaDb, query: &str) -> Result<Trace> {
 
     let tokens = tokenize(query);
     let mut spans = enumerate_spans(query, &tokens);
+
+    // KG-assisted mention detection: spans matching a compiled phrase/term
+    // entity are marked and favored in selection — multi-word entities like
+    // "coastal development permit" beat their fragments.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_nodes'",
+        )?;
+        let has_kg: i64 = stmt.query_row([], |r| r.get(0))?;
+        if has_kg > 0 {
+            let mut q = conn.prepare_cached(
+                "SELECT count(*) FROM kg_nodes WHERE kind = 'term' AND lower(label) = ?1",
+            )?;
+            for span in spans.iter_mut() {
+                if span.status == "skipped" {
+                    continue;
+                }
+                let hit: i64 = q.query_row([span.text.to_lowercase()], |r| r.get(0))?;
+                span.kg_alias = hit > 0;
+            }
+        }
+    }
 
     for span in spans.iter_mut() {
         if span.status == "skipped" {
@@ -201,6 +226,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
                 end,
                 status: status.into(),
                 candidates: Vec::new(),
+                kg_alias: false,
             });
         }
     }
@@ -494,11 +520,15 @@ fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..spans.len())
         .filter(|&i| spans[i].status == "selected")
         .collect();
-    // Strongest candidate first; longer span wins ties (more specific).
+    // Strongest candidate first; KG-entity spans get a nudge (a compiled
+    // phrase is better evidence of mention-hood than raw match strength);
+    // longer span wins ties (more specific).
     order.sort_by(|&a, &b| {
-        let sa = spans[a].candidates.first().map(|c| c.score).unwrap_or(0.0);
-        let sb = spans[b].candidates.first().map(|c| c.score).unwrap_or(0.0);
-        sb.total_cmp(&sa)
+        let key = |i: usize| {
+            let s = spans[i].candidates.first().map(|c| c.score).unwrap_or(0.0);
+            if spans[i].kg_alias { s * 1.08 } else { s }
+        };
+        key(b).total_cmp(&key(a))
             .then((spans[b].end - spans[b].start).cmp(&(spans[a].end - spans[a].start)))
     });
 
@@ -602,6 +632,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
             .spans
             .iter()
             .map(|s| pb::TraceSpan {
+                kg_alias: s.kg_alias,
                 id: s.id as u32,
                 text: s.text.clone(),
                 start: s.start as u32,

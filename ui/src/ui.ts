@@ -37,6 +37,7 @@ interface TraceSpan {
   end: number;
   status: string;
   candidates: TraceCandidate[];
+  kg_alias: boolean;
 }
 
 interface Trace {
@@ -722,25 +723,121 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
   if (cursor < trace.query.length) qline.append(trace.query.slice(cursor));
 
   /* the score field: one row per mention, candidates as dots on a shared
-   * 0→1 score axis. Overview first — how contested, how confident — with
-   * the threshold as a dashed reference rule; click a row for the full
-   * candidate detail (one open at a time). */
+   * 0→1 score axis. Interactive: channel chips filter the dots, clicking the
+   * axis previews a different selection threshold, clicking a dot opens the
+   * candidate card, clicking a row expands full detail. */
   const THRESHOLD = 0.35; // mirrors the resolver's SELECT_THRESHOLD
+  let previewT: number | null = null;
+  const activeChannels = new Set<string>();
+  const allDots: { dot: HTMLElement; c: TraceCandidate }[] = [];
+
+  const card = el("div", { class: "cand-card", hidden: "" });
+
+  function restyle(): void {
+    const t = previewT ?? THRESHOLD;
+    for (const { dot, c } of allDots) {
+      const wouldSelect = c.score >= t;
+      dot.classList.toggle("rej", !wouldSelect);
+      dot.classList.toggle("sel", wouldSelect && !dot.classList.contains("top"));
+      if (previewT !== null) dot.classList.remove("top");
+      const dimmed = activeChannels.size > 0 &&
+        !c.channels.some((ch) => activeChannels.has(ch.channel));
+      dot.classList.toggle("dim", dimmed);
+    }
+    threshRules.forEach((r) => {
+      r.style.left = `${t * 100}%`;
+    });
+    threshTick.style.left = `${t * 100}%`;
+    threshTick.textContent = previewT === null ? "threshold" : `preview ${t.toFixed(2)}`;
+    threshTick.classList.toggle("preview", previewT !== null);
+  }
+
+  const threshRules: HTMLElement[] = [];
+  const threshTick = el("span", { class: "sf-tick sf-thresh", style: `left:${THRESHOLD * 100}%` }, "threshold");
+  const axis = el("div", { class: "sf-axis", title: "click to preview a different threshold" },
+    el("span", { class: "sf-tick", style: "left:0%" }, "0"),
+    threshTick,
+    el("span", { class: "sf-tick", style: "left:100%" }, "1"));
+  axis.addEventListener("click", (e) => {
+    const r = axis.getBoundingClientRect();
+    const t = Math.min(0.99, Math.max(0.01, (e.clientX - r.left) / r.width));
+    previewT = Math.abs(t - THRESHOLD) < 0.02 ? null : t;
+    restyle();
+  });
+
+  const channels = ["exact", "bm25", "trigram", "kg"];
+  const chanRow = el("span", { class: "sf-channels" },
+    channels.map((ch) => {
+      const chip = el("button", {
+        class: "chip",
+        onclick: (e: Event) => {
+          e.stopPropagation();
+          if (activeChannels.has(ch)) activeChannels.delete(ch);
+          else activeChannels.add(ch);
+          chip.classList.toggle("on-chan");
+          restyle();
+        },
+      }, ch);
+      return chip;
+    }),
+    el("button", {
+      class: "chip",
+      onclick: (e: Event) => {
+        e.stopPropagation();
+        previewT = null;
+        activeChannels.clear();
+        field.querySelectorAll(".on-chan").forEach((x) => x.classList.remove("on-chan"));
+        restyle();
+      },
+    }, "reset"));
+
   const field = el("div", { class: "scorefield" });
   field.append(el("div", { class: "sf-head" },
-    el("span", { class: "sf-label subhead", style: "margin:0" }, "mention"),
-    el("div", { class: "sf-axis" },
-      el("span", { class: "sf-tick", style: "left:0%" }, "0"),
-      el("span", { class: "sf-tick sf-thresh", style: `left:${THRESHOLD * 100}%` }, "threshold"),
-      el("span", { class: "sf-tick", style: "left:100%" }, "1"),
-    )));
+    el("span", null,
+      el("span", { class: "sf-label subhead", style: "margin:0" }, "mention"), chanRow),
+    axis));
+
+  function showCard(sp: TraceSpan, c: TraceCandidate): void {
+    hideHover();
+    card.hidden = false;
+    card.replaceChildren(
+      el("div", { class: "cc-head" },
+        el("span", { class: "cand-id" }, `${c.table}.${c.column} `,
+          el("span", { class: "rowid" }, `#${c.rowid}`)),
+        el("span", { class: "score" }, c.score.toFixed(3)),
+        c.selected ? el("span", { class: "pill pending" }, "selected")
+          : el("span", { class: "pill bad" }, (c.reject_reason || "rejected").replace(/_/g, " ")),
+        el("span", { class: "spacer" }),
+        el("button", { class: "btn", onclick: () => { card.hidden = true; } }, "✕")),
+      el("div", { class: "cc-body" },
+        c.is_doc && c.snippet ? snippetNode(c.snippet) : el("span", { class: "mono" }, `“${c.value}”`)),
+      el("div", { class: "cc-channels" },
+        c.channels.map((ch) =>
+          el("span", { class: "chip" }, `${ch.channel} · rank ${ch.rank + 1} · ${ch.raw.toFixed(2)}`))),
+      el("div", { class: "cc-actions" },
+        el("button", {
+          class: "btn accent",
+          onclick: () => {
+            location.hash = `#/data/${encodeURIComponent(c.table)}?after=${Number(c.rowid) - 1}`;
+          },
+        }, "open row in data →"),
+        c.is_doc ? null : el("button", {
+          class: "btn",
+          onclick: () => {
+            location.hash = "#/query?d=nl&q=" + encodeURIComponent(c.value);
+          },
+        }, "resolve this value →"),
+        el("span", { class: "sql-caption" }, `for mention “${sp.text}”`)),
+    );
+  }
 
   let openDetail: HTMLElement | null = null;
   let openRow: HTMLElement | null = null;
   for (const sp of mentionSpans) {
-    const strip = el("div", { class: "sf-strip" },
-      el("i", { class: "sf-rule" }),
-      el("i", { class: "sf-rule sf-rule-thresh", style: `left:${THRESHOLD * 100}%` }));
+    const rule = el("i", { class: "sf-rule" });
+    const trule = el("i", { class: "sf-rule sf-rule-thresh", style: `left:${THRESHOLD * 100}%` });
+    threshRules.push(trule);
+    const strip = el("div", { class: "sf-strip" }, rule, trule);
     const topIdx = sp.candidates.findIndex((c) => c.selected);
     sp.candidates.forEach((c, i) => {
       const cls = "sf-dot" + (c.selected ? (i === topIdx ? " top" : " sel") : " rej");
@@ -748,18 +845,25 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       const dot = el("span", {
         class: cls,
         style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`,
+        onclick: (e: Event) => {
+          e.stopPropagation();
+          showCard(sp, c);
+        },
       });
       hov(dot,
         `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} · ${c.score.toFixed(2)}<br>` +
         `${esc((c.snippet || c.value).slice(0, 120))}<br>` +
         c.channels.map((ch) => esc(ch.channel)).join(" · ") +
-        (c.selected ? "" : ` · <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`));
+        (c.selected ? "" : ` · <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`) +
+        "<br><i>click for the card</i>");
+      allDots.push({ dot, c });
       strip.append(dot);
     });
     const nSel = sp.candidates.filter((c) => c.selected).length;
     const row = el("div", { class: "sf-row" },
       el("span", { class: "sf-label" },
         el("span", { class: "sf-mention" }, sp.text),
+        sp.kg_alias ? el("span", { class: "chip sf-kgchip", title: "matches a knowledge-graph entity" }, "kg") : null,
         el("span", { class: "sf-count" },
           `${nSel}/${sp.candidates.length}`)),
       strip);
@@ -785,6 +889,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
     field.append(el("div", { class: "empty" },
       "— no mentions resolved; the considered spans are below"));
   }
+  field.append(card);
 
   /* the near-miss ledger, folded by default */
   const also = trace.spans
@@ -1072,8 +1177,10 @@ async function viewData(host: HTMLElement, params: URLSearchParams, table?: stri
   }
   const limit = 50;
   const meta = tables.find((t) => t.name === name);
-  // keyset pagination: a stack of page-start cursors; null = first page
-  const cursors: (number | null)[] = [null];
+  // keyset pagination: a stack of page-start cursors; null = first page.
+  // ?after= deep-links a page (e.g. the candidate card's "open row").
+  const afterParam = params.get("after");
+  const cursors: (number | null)[] = [afterParam !== null ? Number(afterParam) : null];
   let lastRowid: number | null = null;
   let hasMore = false;
   let filter = params.get("q") ?? "";
@@ -1109,7 +1216,7 @@ async function viewData(host: HTMLElement, params: URLSearchParams, table?: stri
       }, "filter")),
     body,
   );
-  await load(null);
+  await load(cursors[0]);
 
   async function load(after: number | null): Promise<void> {
     body.replaceChildren(el("div", { class: "empty" }, "loading…"));

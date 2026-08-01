@@ -16,7 +16,7 @@ use rusqlite::Connection;
 pub use rusqlite;
 
 /// Schema version of the .stemmadb store, kept in `PRAGMA user_version`.
-pub const STORE_SCHEMA_VERSION: i32 = 2;
+pub const STORE_SCHEMA_VERSION: i32 = 3;
 
 /// Name under which the user database is attached.
 pub const SRC_SCHEMA: &str = "src";
@@ -103,6 +103,14 @@ impl StemmaDb {
         // store from the FUTURE is an error.
         if found < STORE_SCHEMA_VERSION {
             self.conn.execute_batch(SCHEMA_SQL)?;
+            // v3: history attribution. ALTERs are not idempotent, so they are
+            // guarded per-version rather than living in SCHEMA_SQL.
+            if found == 2 {
+                self.conn.execute_batch(
+                    "ALTER TABLE query_log ADD COLUMN source TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE query_log ADD COLUMN session TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
             self.conn
                 .pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
         }
@@ -181,7 +189,9 @@ CREATE TABLE IF NOT EXISTS query_log (
     query      TEXT NOT NULL,
     mentions   INTEGER NOT NULL,
     elapsed_ms REAL NOT NULL,
-    asked_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    asked_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    source     TEXT NOT NULL DEFAULT '',
+    session    TEXT NOT NULL DEFAULT ''
 ) STRICT;
 CREATE INDEX IF NOT EXISTS query_log_at ON query_log(asked_at);
 CREATE TABLE IF NOT EXISTS chat_log (
