@@ -30,11 +30,12 @@ gRPC.
   the database's own knowledge graph. *sql*: read-only console over `main`
   (the store) + `src` (the user DB) — every query ships with its
   EXPLAIN QUERY PLAN tree (full scans flagged in caution).
-- **chat** — talk to the data by proxy: any OpenAI-compatible model
-  (`--lm-endpoint http://host:port/v1 --lm-model <name>`, bearer via
-  `LM_API_KEY`) is given resolve/sql/schema as tools and must pin every
-  mention through stemma before querying. every tool call renders in the
-  transcript, collapsible.
+- **chat** — a right-hand rail beside the work, not a page of its own: any
+  OpenAI-compatible model (`--lm-endpoint http://host:port/v1 --lm-model
+  <name>`, bearer via `LM_API_KEY`) is given resolve/sql/schema as tools and
+  must pin every mention through stemma before querying. tool calls render
+  collapsibly in the rail, and each resolution's trajectory opens in the main
+  query view — chat drives the visual.
 - **data** — table browser with keyset pagination (no OFFSET degradation on
   big tables) and a substring filter served by the store's trigram index.
 - **graph** — the compiled knowledge graph: schema layer, discovered
@@ -48,8 +49,9 @@ gRPC.
 
 Follows the zicato design language: sixteen terminal-derived themes over
 fixed semantic role tokens (default `paper`) and the twelve-face typeface
-picker (technical / editorial / display groups, default T9), both in the top
-bar; sans for prose and controls with mono reserved for data, hairline
+picker (technical / editorial / display groups, default T9, with the s/m/l
+text-size control), both in the top bar with the family's swatch-strip and
+true-specimen presentation; sans for prose and controls with mono reserved for data, hairline
 borders instead of shadows, one accent color earned by structure. All tokens live in
 `static/ui.css`; no hex anywhere else.
 

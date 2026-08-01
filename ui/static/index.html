@@ -35,24 +35,19 @@
     <span class="spacer"></span>
     <nav class="nav" id="nav">
       <a href="#/query" data-view="query">⌕ query</a>
-      <a href="#/chat" data-view="chat">◍ chat</a>
       <a href="#/data" data-view="data">▤ data</a>
       <a href="#/graph" data-view="graph">⬡ graph</a>
     </nav>
-    <span class="swatchbox">
-      <button class="btn" id="typebtn" aria-label="typeface">Aa</button>
-      <div class="typemenu" id="typemenu" role="menu"></div>
-    </span>
-    <span class="swatchbox">
-      <button class="btn" id="themebtn" aria-label="theme">◧</button>
-      <div class="swatches" id="swatches" role="menu"></div>
-    </span>
+    <button class="btn" id="chattoggle" aria-label="toggle chat rail">◍ chat</button>
+    <span id="typepicker"></span>
+    <span id="themepicker"></span>
     <span class="status" id="status"><span class="dot"></span><span id="statusword">connecting</span></span>
   </header>
 
-  <div class="body">
+  <div class="body" id="bodygrid">
     <aside class="sidebar" id="sidebar"></aside>
     <main class="viewhost" id="view"></main>
+    <aside class="chatrail" id="chatrail" hidden></aside>
   </div>
 
   <div class="hovercard" id="hovercard"></div>

@@ -59,6 +59,9 @@ function snippetNode(snippet) {
   return out;
 }
 var hovercard = document.getElementById("hovercard");
+function hideHover() {
+  hovercard.classList.remove("on");
+}
 function hov(node, html) {
   node.addEventListener("mouseenter", () => {
     hovercard.innerHTML = html;
@@ -84,151 +87,467 @@ var state = {
   view: "query"
 };
 var chatLog = /* @__PURE__ */ new Map();
-var THEMES = [
-  "paper",
-  "solarized-light",
-  "google-light",
-  "lunaria-light",
-  "belafonte-day",
-  "monokai",
-  "solarized-dark",
-  "google-dark",
-  "lunaria-eclipse",
-  "belafonte-night",
-  "zenburn",
-  "selenized-black",
-  "relaxed",
-  "espresso",
-  "dracula",
-  "ubuntu"
+var COLOR_THEMES = [
+  [
+    "monokai",
+    "monokai",
+    [
+      "#1e1f1c",
+      "#272822",
+      "#f8f8f2",
+      "#a6e22e",
+      "#f92672",
+      "#66d9ef"
+    ]
+  ],
+  [
+    "solarized-dark",
+    "solarized dark",
+    [
+      "#04222B",
+      "#0A2D38",
+      "#93A1A1",
+      "#8BB80E",
+      "#E0483C",
+      "#2AA198"
+    ]
+  ],
+  [
+    "solarized-light",
+    "solarized light",
+    [
+      "#FDF6E3",
+      "#FBF1D6",
+      "#586E75",
+      "#6B9B0B",
+      "#DC322F",
+      "#268BD2"
+    ]
+  ],
+  [
+    "google-light",
+    "google light",
+    [
+      "#FFFFFF",
+      "#F4F4F4",
+      "#474A4E",
+      "#34A853",
+      "#EA4335",
+      "#1B9CB8"
+    ]
+  ],
+  [
+    "google-dark",
+    "google dark",
+    [
+      "#202124",
+      "#2C2D30",
+      "#FFFFFF",
+      "#34A853",
+      "#EA4335",
+      "#24C1E0"
+    ]
+  ],
+  [
+    "lunaria-light",
+    "lunaria light",
+    [
+      "#EBE4E1",
+      "#E2DCD9",
+      "#363434",
+      "#497D46",
+      "#783C1F",
+      "#3778A9"
+    ]
+  ],
+  [
+    "lunaria-eclipse",
+    "lunaria eclipse",
+    [
+      "#323F46",
+      "#3B484F",
+      "#DFE2ED",
+      "#BEDBC1",
+      "#BA9088",
+      "#C8429F"
+    ]
+  ],
+  [
+    "belafonte-day",
+    "belafonte day",
+    [
+      "#D5CCBA",
+      "#CCC3B2",
+      "#34292D",
+      "#6E6A4E",
+      "#BE100E",
+      "#426A79"
+    ]
+  ],
+  [
+    "belafonte-night",
+    "belafonte night",
+    [
+      "#20111B",
+      "#271821",
+      "#D5CCBA",
+      "#A6A07A",
+      "#D6403E",
+      "#6F8E97"
+    ]
+  ],
+  [
+    "paper",
+    "paper",
+    [
+      "#F2EEDE",
+      "#E6E2D3",
+      "#1A1A1A",
+      "#216609",
+      "#CC3E28",
+      "#1E6FCC"
+    ]
+  ],
+  [
+    "zenburn",
+    "zenburn",
+    [
+      "#3A3A3A",
+      "#424241",
+      "#DCDCCC",
+      "#8FB28F",
+      "#CC9393",
+      "#8CD0D3"
+    ]
+  ],
+  [
+    "selenized-black",
+    "selenized black",
+    [
+      "#181818",
+      "#202020",
+      "#DEDEDE",
+      "#83C746",
+      "#FF5E56",
+      "#56D8C9"
+    ]
+  ],
+  [
+    "relaxed",
+    "relaxed",
+    [
+      "#353A44",
+      "#3D424B",
+      "#F7F7F7",
+      "#A0AC77",
+      "#BC5653",
+      "#7EAAC7"
+    ]
+  ],
+  [
+    "espresso",
+    "espresso",
+    [
+      "#323232",
+      "#3A3A3A",
+      "#FFFFFF",
+      "#A5C261",
+      "#D25252",
+      "#6C99BB"
+    ]
+  ],
+  [
+    "dracula",
+    "dracula",
+    [
+      "#282A36",
+      "#343746",
+      "#F8F8F2",
+      "#50FA7B",
+      "#FF5555",
+      "#BD93F9"
+    ]
+  ],
+  [
+    "ubuntu",
+    "ubuntu",
+    [
+      "#300A24",
+      "#3D1530",
+      "#EEEEEC",
+      "#8AE234",
+      "#CC0000",
+      "#34E2E2"
+    ]
+  ]
 ];
-var TYPEFACES = [
+var MONO_GSM = '"Google Sans Mono","Noto Sans Mono",ui-monospace,monospace';
+var SANS_GROTESK = '"Space Grotesk",system-ui,sans-serif';
+var TYPE_OPTIONS = [
   {
+    id: "T7",
+    label: "Google Sans Mono",
     group: "technical",
-    faces: [
-      [
-        "T7",
-        "google sans mono"
-      ],
-      [
-        "T9",
-        "source sans 3 + source code pro"
-      ],
-      [
-        "T12",
-        "inconsolata"
-      ],
-      [
-        "T14",
-        "ubuntu + ubuntu mono"
-      ]
-    ]
+    head: MONO_GSM,
+    body: MONO_GSM
   },
   {
+    id: "T9",
+    label: "Source Sans 3 + Source Code Pro",
+    group: "technical",
+    head: '"Source Sans 3",system-ui,sans-serif',
+    body: '"Source Sans 3",system-ui,sans-serif'
+  },
+  {
+    id: "T12",
+    label: "Inconsolata",
+    group: "technical",
+    head: '"Inconsolata",ui-monospace,monospace',
+    body: '"Inconsolata",ui-monospace,monospace'
+  },
+  {
+    id: "T14",
+    label: "Ubuntu + Ubuntu Mono",
+    group: "technical",
+    head: '"Ubuntu",system-ui,sans-serif',
+    body: '"Ubuntu",system-ui,sans-serif'
+  },
+  {
+    id: "E5",
+    label: "Fraunces",
     group: "editorial",
-    faces: [
-      [
-        "E5",
-        "fraunces"
-      ],
-      [
-        "E7",
-        "bitter"
-      ],
-      [
-        "E8",
-        "literata"
-      ],
-      [
-        "E15",
-        "domine"
-      ]
-    ]
+    head: '"Fraunces",Georgia,serif',
+    body: '"Fraunces",Georgia,serif'
   },
   {
+    id: "E7",
+    label: "Bitter",
+    group: "editorial",
+    head: '"Bitter",Georgia,serif',
+    body: '"Bitter",Georgia,serif'
+  },
+  {
+    id: "E8",
+    label: "Literata",
+    group: "editorial",
+    head: '"Literata",Georgia,serif',
+    body: '"Literata",Georgia,serif'
+  },
+  {
+    id: "E15",
+    label: "Domine",
+    group: "editorial",
+    head: '"Domine",Georgia,serif',
+    body: '"Domine",Georgia,serif'
+  },
+  {
+    id: "D2",
+    label: "Archivo Narrow + Space Grotesk",
     group: "display",
-    faces: [
-      [
-        "D2",
-        "archivo narrow + space grotesk"
-      ],
-      [
-        "D12",
-        "hanken grotesk"
-      ],
-      [
-        "D14",
-        "barlow condensed + space grotesk"
-      ],
-      [
-        "D5",
-        "bricolage grotesque"
-      ]
-    ]
+    head: `"Archivo Narrow",${SANS_GROTESK}`,
+    body: SANS_GROTESK
+  },
+  {
+    id: "D12",
+    label: "Hanken Grotesk",
+    group: "display",
+    head: '"Hanken Grotesk",system-ui,sans-serif',
+    body: '"Hanken Grotesk",system-ui,sans-serif'
+  },
+  {
+    id: "D14",
+    label: "Barlow Condensed + Space Grotesk",
+    group: "display",
+    head: '"Barlow Condensed","Archivo Narrow",system-ui,sans-serif',
+    body: SANS_GROTESK
+  },
+  {
+    id: "D5",
+    label: "Bricolage Grotesque",
+    group: "display",
+    head: '"Bricolage Grotesque",system-ui,sans-serif',
+    body: '"Bricolage Grotesque",system-ui,sans-serif'
   }
 ];
-function initPickers() {
-  const savedTheme = localStorage.getItem("stemma.theme") ?? "paper";
-  document.documentElement.dataset.theme = savedTheme;
-  const box = document.getElementById("swatches");
-  for (const t of THEMES) {
-    const b = el("button", {
-      class: "swatch" + (t === savedTheme ? " on" : ""),
-      "data-swatch": t,
-      "aria-label": t,
+var SAMPLE_LINE = "the quick brown fox 0123";
+var FONT_SIZES = [
+  [
+    "s",
+    1
+  ],
+  [
+    "m",
+    1.15
+  ],
+  [
+    "l",
+    1.3
+  ]
+];
+var openMenus = [];
+function closeAllMenus(except) {
+  for (const m of openMenus) {
+    if (m !== except) m.classList.remove("open");
+  }
+}
+function swatchStrip(colors) {
+  const strip = el("span", {
+    class: "swatch-strip",
+    "aria-hidden": "true"
+  });
+  for (const c of colors) {
+    const chip = el("i");
+    chip.style.background = c;
+    strip.append(chip);
+  }
+  return strip;
+}
+function buildThemePicker() {
+  const mount = document.getElementById("themepicker");
+  const saved = localStorage.getItem("stemma.theme") ?? "paper";
+  document.documentElement.dataset.theme = saved;
+  const current = COLOR_THEMES.find((t) => t[0] === saved) ?? COLOR_THEMES[9];
+  const trigName = el("span", {
+    class: "cd-name"
+  }, current[1]);
+  const trigStrip = el("span", null, swatchStrip(current[2]));
+  const list = el("div", {
+    class: "cd-list",
+    role: "listbox"
+  });
+  const cd = el("span", {
+    class: "cd"
+  }, el("button", {
+    class: "cd-trigger",
+    onclick: (e) => {
+      e.stopPropagation();
+      hideHover();
+      closeAllMenus(cd);
+      cd.classList.toggle("open");
+    }
+  }, trigStrip, trigName, el("span", {
+    class: "cd-caret"
+  }, "\u25BE")), list);
+  for (const [id, label, colors] of COLOR_THEMES) {
+    const opt = el("div", {
+      class: "cd-option",
+      role: "option",
+      "aria-selected": id === saved ? "true" : "false",
       onclick: () => {
-        document.documentElement.dataset.theme = t;
-        localStorage.setItem("stemma.theme", t);
-        box.querySelectorAll(".swatch").forEach((s) => s.classList.remove("on"));
+        document.documentElement.dataset.theme = id;
+        localStorage.setItem("stemma.theme", id);
+        list.querySelectorAll(".cd-option").forEach((o) => o.setAttribute("aria-selected", "false"));
+        opt.setAttribute("aria-selected", "true");
+        trigName.textContent = label;
+        trigStrip.replaceChildren(swatchStrip(colors));
+        cd.classList.remove("open");
+      }
+    }, swatchStrip(colors), el("span", {
+      class: "cd-name"
+    }, label));
+    list.append(opt);
+  }
+  openMenus.push(cd);
+  mount.append(cd);
+}
+function buildTypePicker() {
+  const mount = document.getElementById("typepicker");
+  const saved = localStorage.getItem("stemma.type") ?? "T9";
+  if (saved !== "T9") document.documentElement.dataset.type = saved;
+  const savedSize = localStorage.getItem("stemma.fontsize") ?? "s";
+  const sizeVal = FONT_SIZES.find(([k]) => k === savedSize)?.[1] ?? 1;
+  if (sizeVal !== 1) document.documentElement.style.setProperty("--fs", String(sizeVal));
+  const current = TYPE_OPTIONS.find((o) => o.id === saved) ?? TYPE_OPTIONS[1];
+  const trigName = el("span", {
+    class: "cd-name"
+  }, current.label);
+  const trigSpec = el("span", {
+    class: "tf-spec"
+  }, "Ag");
+  trigSpec.style.fontFamily = current.head;
+  const listBox = el("div", {
+    class: "tf-list"
+  });
+  const pop = el("div", {
+    class: "tf-pop"
+  }, listBox);
+  const cd = el("span", {
+    class: "cd"
+  }, el("button", {
+    class: "cd-trigger",
+    onclick: (e) => {
+      e.stopPropagation();
+      hideHover();
+      closeAllMenus(cd);
+      cd.classList.toggle("open");
+    }
+  }, trigSpec, trigName, el("span", {
+    class: "cd-caret"
+  }, "\u25BE")), pop);
+  for (const group of [
+    "technical",
+    "editorial",
+    "display"
+  ]) {
+    listBox.append(el("div", {
+      class: "tf-group"
+    }, el("div", {
+      class: "subhead"
+    }, group)));
+    for (const o of TYPE_OPTIONS.filter((x) => x.group === group)) {
+      const name = el("span", {
+        class: "tf-name"
+      }, o.label);
+      name.style.fontFamily = o.head;
+      const sample = el("span", {
+        class: "tf-sample",
+        "aria-hidden": "true"
+      }, SAMPLE_LINE);
+      sample.style.fontFamily = o.body;
+      const opt = el("div", {
+        class: "tf-option",
+        role: "option",
+        "aria-selected": o.id === saved ? "true" : "false",
+        onclick: () => {
+          if (o.id === "T9") delete document.documentElement.dataset.type;
+          else document.documentElement.dataset.type = o.id;
+          localStorage.setItem("stemma.type", o.id);
+          pop.querySelectorAll(".tf-option").forEach((x) => x.setAttribute("aria-selected", "false"));
+          opt.setAttribute("aria-selected", "true");
+          trigName.textContent = o.label;
+          trigSpec.style.fontFamily = o.head;
+        }
+      }, name, sample);
+      listBox.append(opt);
+    }
+  }
+  const seg = el("span", {
+    class: "seg"
+  });
+  for (const [k, v] of FONT_SIZES) {
+    const b = el("button", {
+      class: k === savedSize ? "on" : "",
+      onclick: () => {
+        document.documentElement.style.setProperty("--fs", String(v));
+        localStorage.setItem("stemma.fontsize", k);
+        seg.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
         b.classList.add("on");
       }
-    });
-    b.style.background = "linear-gradient(135deg, var(--paper) 55%, var(--accent) 55%)";
-    hov(b, esc(t));
-    box.append(b);
+    }, k);
+    seg.append(b);
   }
-  const themeBtn = document.getElementById("themebtn");
-  themeBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    closeMenus(box);
-    box.classList.toggle("open");
-  });
-  const savedType = localStorage.getItem("stemma.type") ?? "T9";
-  if (savedType !== "T9") document.documentElement.dataset.type = savedType;
-  const menu = document.getElementById("typemenu");
-  for (const g of TYPEFACES) {
-    menu.append(el("div", {
-      class: "tm-group"
-    }, g.group));
-    for (const [id, label] of g.faces) {
-      const b = el("button", {
-        class: id === savedType ? "on" : "",
-        onclick: () => {
-          if (id === "T9") delete document.documentElement.dataset.type;
-          else document.documentElement.dataset.type = id;
-          localStorage.setItem("stemma.type", id);
-          menu.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
-          b.classList.add("on");
-        }
-      }, label);
-      menu.append(b);
-    }
-  }
-  const typeBtn = document.getElementById("typebtn");
-  typeBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    closeMenus(menu);
-    menu.classList.toggle("open");
-  });
-  document.addEventListener("click", () => closeMenus());
-  function closeMenus(except) {
-    for (const m of [
-      box,
-      menu
-    ]) {
-      if (m !== except) m.classList.remove("open");
-    }
-  }
+  pop.append(el("div", {
+    class: "tf-foot"
+  }, el("span", {
+    class: "k"
+  }, "text size"), seg));
+  openMenus.push(cd);
+  mount.append(cd);
+}
+function initPickers() {
+  buildThemePicker();
+  buildTypePicker();
+  document.addEventListener("click", () => closeAllMenus());
 }
 async function pollHealth() {
   const s = document.getElementById("status");
@@ -257,6 +576,7 @@ function renderSidebar() {
           state.db = d;
           state.schema = null;
           route();
+          if (chatRailOpen()) renderChatRail();
         }
       }, el("span", {
         class: "tree-icon"
@@ -412,6 +732,12 @@ function queryNatural(host, q) {
       class: "empty"
     }, "resolving\u2026"));
     let trace;
+    if (pendingTrace && pendingTrace.query === query) {
+      trace = pendingTrace;
+      pendingTrace = null;
+      renderTrace(out, trace);
+      return;
+    }
     try {
       trace = await getJSON(`/api/db/${state.db}/resolve?q=` + encodeURIComponent(query));
     } catch (e) {
@@ -642,24 +968,51 @@ function renderCandidate(c, rank) {
   hov(row, c.channels.map((ch) => ch.channel === "kg" ? `<b>kg</b> co-occurring terms matched: ${ch.raw}` : `<b>${esc(ch.channel)}</b> rank ${ch.rank + 1} \xB7 raw ${ch.raw.toFixed(3)}`).join("<br>") + (c.selected ? "" : `<hr>${esc(c.reject_reason.replace(/_/g, " "))}`));
   return row;
 }
-function viewChat(host) {
-  setCrumbs("chat");
-  host.append(el("h1", {
-    class: "h1"
-  }, "chat"), el("p", {
-    class: "lede"
-  }, "talk to the data by proxy: the model must pin every mention through resolve before it may query, so answers stay grounded in actual records. every tool call is shown."));
+var pendingTrace = null;
+function showTraceInMain(trace) {
+  pendingTrace = trace;
+  const target = "#/query?d=nl&q=" + encodeURIComponent(trace.query);
+  if (location.hash === target) route();
+  else location.hash = target;
+}
+function chatRailOpen() {
+  return localStorage.getItem("stemma.chatrail") === "open";
+}
+function setChatRail(open) {
+  localStorage.setItem("stemma.chatrail", open ? "open" : "closed");
+  const rail = document.getElementById("chatrail");
+  const grid = document.getElementById("bodygrid");
+  const btn = document.getElementById("chattoggle");
+  rail.hidden = !open;
+  grid.classList.toggle("chat-open", open);
+  btn.classList.toggle("accent", open);
+  hideHover();
+  if (open) renderChatRail();
+}
+function renderChatRail() {
+  const rail = document.getElementById("chatrail");
+  rail.replaceChildren();
+  rail.append(el("div", {
+    class: "rail-head"
+  }, el("span", {
+    class: "subhead",
+    style: "margin:0"
+  }, "chat"), el("span", {
+    class: "sql-caption"
+  }, state.cfg?.lm ? `${state.db} \xB7 ${state.cfg.lm.model}` : "no model configured")));
   if (!state.cfg?.lm) {
-    host.append(el("div", {
+    rail.append(el("div", {
+      class: "rail-transcript"
+    }, el("div", {
       class: "empty"
-    }, "\u2014 no language model configured. start the console with --lm-endpoint http://host:port/v1 --lm-model <name> (any openai-compatible server: vllm, llama.cpp, litellm; bearer token via LM_API_KEY)"));
+    }, "\u2014 talk to the data by proxy needs a model: restart the console with --lm-endpoint http://host:port/v1 --lm-model <name> (any openai-compatible server: vllm, llama.cpp, litellm; bearer token via LM_API_KEY)")));
     return;
   }
   const db = state.db;
   if (!chatLog.has(db)) chatLog.set(db, []);
   const log = chatLog.get(db);
   const transcript = el("div", {
-    class: "chat"
+    class: "rail-transcript"
   });
   const input = el("input", {
     class: "input",
@@ -672,21 +1025,20 @@ function viewChat(host) {
     class: "btn accent",
     onclick: () => send()
   }, "send");
-  host.append(transcript, el("div", {
-    class: "chat-inputrow"
-  }, input, sendBtn), el("div", {
-    class: "sql-caption",
-    style: "margin-top:6px"
-  }, `model: ${state.cfg.lm.model} \xB7 every mention resolved before use`));
+  rail.append(transcript, el("div", {
+    class: "rail-inputrow"
+  }, input, sendBtn));
   redraw();
   function redraw() {
     transcript.replaceChildren();
+    if (!log.length) {
+      transcript.append(el("div", {
+        class: "empty"
+      }, "\u2014 every mention the model uses is pinned through resolve first; tool calls appear here, trajectories open in the main view"));
+    }
     for (const m of log) {
-      const turn = el("div", {
-        class: "chat-turn"
-      });
       if (m.role === "user") {
-        turn.append(el("div", {
+        transcript.append(el("div", {
           class: "chat-msg user"
         }, el("div", {
           class: "who"
@@ -694,8 +1046,8 @@ function viewChat(host) {
           class: "md"
         }, m.content)));
       } else {
-        for (const t of m.trail ?? []) turn.append(renderTrailItem(t));
-        turn.append(el("div", {
+        for (const t of m.trail ?? []) transcript.append(renderTrailItem(t));
+        transcript.append(el("div", {
           class: "chat-msg"
         }, el("div", {
           class: "who"
@@ -703,20 +1055,30 @@ function viewChat(host) {
           class: "md"
         }, m.content)));
       }
-      transcript.append(turn);
     }
+    transcript.scrollTop = transcript.scrollHeight;
   }
   function renderTrailItem(t) {
     const d = el("details", {
       class: "chat-tool"
     });
-    const label = t.tool === "resolve" ? `resolve \xB7 \u201C${t.args.query ?? ""}\u201D` : t.tool === "sql" ? `sql \xB7 ${(t.args.query ?? "").slice(0, 80)}` : "schema";
+    const label = t.tool === "resolve" ? `resolve \xB7 \u201C${t.args.query ?? ""}\u201D` : t.tool === "sql" ? `sql \xB7 ${(t.args.query ?? "").slice(0, 60)}` : "schema";
     d.append(el("summary", null, el("span", {
       class: "chip"
     }, t.tool), label));
-    d.append(el("div", {
+    const body = el("div", {
       class: "tool-body"
-    }, JSON.stringify(t.result, null, 2)));
+    }, JSON.stringify(t.result, null, 2));
+    if (t.tool === "resolve" && t.trace) {
+      const trace = t.trace;
+      d.append(el("div", {
+        style: "margin:4px 0 2px"
+      }, el("button", {
+        class: "rail-showtraj",
+        onclick: () => showTraceInMain(trace)
+      }, "show trajectory in main view \u2192")));
+    }
+    d.append(body);
     return d;
   }
   async function send() {
@@ -753,6 +1115,10 @@ function viewChat(host) {
         content: d.message,
         trail: d.trail
       });
+      const lastResolve = [
+        ...d.trail
+      ].reverse().find((t) => t.tool === "resolve" && t.trace);
+      if (lastResolve?.trace) showTraceInMain(lastResolve.trace);
     } catch (e) {
       log.push({
         role: "assistant",
@@ -763,9 +1129,6 @@ function viewChat(host) {
       wait.remove();
       sendBtn.removeAttribute("disabled");
       redraw();
-      transcript.scrollIntoView({
-        block: "end"
-      });
     }
   }
 }
@@ -870,6 +1233,11 @@ async function viewGraph(host) {
   }, "knowledge graph"), el("p", {
     class: "lede"
   }, g.layer === "compiled" ? "compiled from the data: schema (tables, columns, declared keys), discovered relations (dashed \u2014 inclusion-mined joins with confidence), and the profile layer (frequent values, characteristic terms, term co-occurrence). instance-layer entities arrive with collective disambiguation." : "schema layer only \u2014 run stemma-server against this database once to compile the full graph."));
+  const detail = el("div", {
+    class: "graph-detail",
+    hidden: ""
+  });
+  let selectedKey = null;
   const shown = /* @__PURE__ */ new Set([
     "table",
     ...KIND_TOGGLES
@@ -897,10 +1265,11 @@ async function viewGraph(host) {
   }
   legend.append(el("span", {
     class: "sql-caption"
-  }, "solid = declared \xB7 dashed amber = inferred \xB7 click a table for data, a term to query"));
-  host.append(legend, panel);
+  }, "solid = declared \xB7 dashed amber = inferred \xB7 click a node to inspect it"));
+  host.append(legend, detail, panel);
   draw();
   function draw() {
+    hideHover();
     panel.replaceChildren();
     const nodes = g.nodes.filter((n) => shown.has(n.kind));
     const keys = new Set(nodes.map((n) => n.key));
@@ -972,6 +1341,7 @@ async function viewGraph(host) {
       d: "M 0 0 L 8 4 L 0 8 z",
       fill: "var(--flat)"
     }))));
+    const edgeEls = [];
     for (const e of edges) {
       const a = pos.get(e.source), b = pos.get(e.target);
       if (!a || !b) continue;
@@ -989,6 +1359,10 @@ async function viewGraph(host) {
         const conf = e.props.confidence;
         hov(path, `<b>${esc(e.kind)}</b> ${esc(e.label)}` + (conf !== void 0 ? ` \xB7 confidence ${conf}` : ""));
       }
+      edgeEls.push({
+        el: path,
+        e
+      });
       svg.append(path);
       if (e.kind === "fk" || e.kind === "inferred_fk") {
         svg.append(svgEl("text", {
@@ -999,49 +1373,121 @@ async function viewGraph(host) {
         }, e.label));
       }
     }
+    const nodeEls = /* @__PURE__ */ new Map();
     for (const n of nodes) {
       const p = pos.get(n.key);
       if (!p) continue;
-      const small = n.kind === "value" || n.kind === "term";
-      const w = Math.max(small ? 54 : 90, n.label.length * (small ? 6.4 : 8) + 22);
-      const h = small ? 22 : n.kind === "column" ? 26 : 40;
-      const grp = svgEl("g", {
-        class: `gnode kind-${n.kind}`,
-        transform: `translate(${p.x - w / 2}, ${p.y - h / 2})`,
-        cursor: "pointer"
-      }, svgEl("rect", {
-        width: w,
-        height: h,
-        rx: 4
-      }));
-      if (n.kind === "table") {
-        grp.append(svgEl("text", {
-          x: w / 2,
-          y: 17,
-          "text-anchor": "middle"
-        }, n.label), svgEl("text", {
-          class: "grows",
-          x: w / 2,
-          y: 31,
-          "text-anchor": "middle"
-        }, `~${Number(n.props.rows ?? 0).toLocaleString()} rows`));
+      const boxed = n.kind === "table" || n.kind === "column";
+      let grp;
+      if (boxed) {
+        const w = Math.max(90, n.label.length * 8 + 22);
+        const h = n.kind === "column" ? 26 : 40;
+        grp = svgEl("g", {
+          class: `gnode kind-${n.kind}`,
+          transform: `translate(${p.x - w / 2}, ${p.y - h / 2})`,
+          cursor: "pointer"
+        }, svgEl("rect", {
+          width: w,
+          height: h,
+          rx: 4
+        }));
+        if (n.kind === "table") {
+          grp.append(svgEl("text", {
+            x: w / 2,
+            y: 17,
+            "text-anchor": "middle"
+          }, n.label), svgEl("text", {
+            class: "grows",
+            x: w / 2,
+            y: 31,
+            "text-anchor": "middle"
+          }, `~${Number(n.props.rows ?? 0).toLocaleString()} rows`));
+        } else {
+          grp.append(svgEl("text", {
+            x: w / 2,
+            y: h / 2 + 3.5,
+            "text-anchor": "middle"
+          }, n.label));
+        }
       } else {
-        grp.append(svgEl("text", {
-          x: w / 2,
-          y: h / 2 + 3.5,
+        grp = svgEl("g", {
+          class: `gnode kind-${n.kind}`,
+          transform: `translate(${p.x}, ${p.y})`,
+          cursor: "pointer"
+        }, svgEl("circle", {
+          r: 2.6,
+          cx: 0,
+          cy: 0
+        }), svgEl("text", {
+          x: 0,
+          y: 15,
           "text-anchor": "middle"
         }, n.label));
       }
-      grp.addEventListener("click", () => {
-        if (n.kind === "table") location.hash = "#/data/" + encodeURIComponent(n.label);
-        else if (n.kind === "term" || n.kind === "value") {
-          location.hash = "#/query?d=nl&q=" + encodeURIComponent(n.label);
-        }
+      grp.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        select(n, grp);
       });
-      hov(grp, `<b>${esc(n.label)}</b> \xB7 ${esc(n.kind)}<br>` + esc(JSON.stringify(n.props)));
+      hov(grp, `<b>${esc(n.label)}</b> \xB7 ${esc(n.kind)}`);
+      nodeEls.set(n.key, grp);
       svg.append(grp);
     }
+    svg.addEventListener("click", () => select(null, null));
     panel.append(svg);
+    if (selectedKey) {
+      const n = nodes.find((x) => x.key === selectedKey);
+      const gel = n && nodeEls.get(selectedKey);
+      if (n && gel) select(n, gel);
+      else select(null, null);
+    }
+    function select(n, gel) {
+      hideHover();
+      nodeEls.forEach((x) => x.classList.remove("sel"));
+      edgeEls.forEach(({ el: x }) => x.classList.remove("hot"));
+      if (!n || !gel) {
+        selectedKey = null;
+        detail.hidden = true;
+        return;
+      }
+      selectedKey = n.key;
+      gel.classList.add("sel");
+      const touching = edgeEls.filter(({ e }) => e.source === n.key || e.target === n.key);
+      touching.forEach(({ el: x }) => x.classList.add("hot"));
+      detail.hidden = false;
+      detail.replaceChildren(el("span", {
+        class: "kindtag"
+      }, n.kind), el("span", {
+        class: "name"
+      }, n.label), el("span", {
+        class: "props"
+      }, Object.entries(n.props).map(([k, v]) => `${k} ${v}`).join(" \xB7 ") || "\u2014"), el("span", {
+        class: "props"
+      }, `${touching.length} edge${touching.length === 1 ? "" : "s"}`));
+      if (n.kind === "table") {
+        detail.append(el("button", {
+          class: "btn accent",
+          onclick: () => {
+            location.hash = "#/data/" + encodeURIComponent(n.label);
+          }
+        }, "browse data \u2192"));
+      } else if (n.kind === "term" || n.kind === "value") {
+        const neighbors = touching.filter(({ e }) => e.kind === "cooccurs").map(({ e }) => {
+          const other = e.source === n.key ? e.target : e.source;
+          return g.nodes.find((x) => x.key === other)?.label ?? "";
+        }).filter(Boolean);
+        if (neighbors.length) {
+          detail.append(el("span", {
+            class: "props"
+          }, `co-occurs: ${neighbors.join(" \xB7 ")}`));
+        }
+        detail.append(el("button", {
+          class: "btn accent",
+          onclick: () => {
+            location.hash = "#/query?d=nl&q=" + encodeURIComponent(n.label);
+          }
+        }, `resolve \u201C${n.label}\u201D \u2192`));
+      }
+    }
   }
 }
 async function route() {
@@ -1049,6 +1495,13 @@ async function route() {
   const [path, qs] = hash.slice(2).split("?");
   const [view, arg] = path.split("/");
   const params = new URLSearchParams(qs ?? "");
+  hideHover();
+  closeAllMenus();
+  if (view === "chat") {
+    setChatRail(true);
+    location.hash = "#/query";
+    return;
+  }
   const mapped = view === "resolve" ? "query" : view === "sql" ? "query" : view || "query";
   if (view === "sql") params.set("d", "sql");
   state.view = mapped;
@@ -1068,7 +1521,6 @@ async function route() {
   try {
     if (state.view === "data") await viewData(host, params, arg ? decodeURIComponent(arg) : void 0);
     else if (state.view === "graph") await viewGraph(host);
-    else if (state.view === "chat") viewChat(host);
     else viewQuery(host, params);
   } catch (e) {
     host.append(el("div", {
@@ -1089,6 +1541,8 @@ async function route() {
       location.hash = "#/query?d=nl&q=" + encodeURIComponent(target.value);
     }
   });
+  document.getElementById("chattoggle").addEventListener("click", () => setChatRail(Boolean(document.getElementById("chatrail").hidden)));
+  if (chatRailOpen()) setChatRail(true);
   globalThis.addEventListener("hashchange", route);
   pollHealth();
   route();
