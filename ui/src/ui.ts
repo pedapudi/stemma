@@ -780,6 +780,54 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
   });
 }
 
+/* The compact in-conversation trajectory: query line with mentions marked,
+ * then each mention's selected candidates with meters — the same story as
+ * the full view at rail width. */
+function renderMiniTrace(trace: Trace): HTMLElement {
+  const box = el("div", { class: "minitraj" });
+  const mentionSpans = trace.mentions.map((i) => trace.spans[i]);
+  const covered = (pos: number) => mentionSpans.some((s) => pos >= s.start && pos < s.end);
+  const qline = el("div", { class: "mini-qline" });
+  let cursor = 0;
+  for (const t of trace.tokens) {
+    if (t.start > cursor) qline.append(trace.query.slice(cursor, t.start));
+    qline.append(el("span", {
+      class: "qtok" + (covered(t.start) ? " mention" : t.stopword ? " stop" : ""),
+    }, t.text));
+    cursor = t.end;
+  }
+  if (cursor < trace.query.length) qline.append(trace.query.slice(cursor));
+  box.append(qline);
+
+  for (const sp of mentionSpans) {
+    const sel = sp.candidates.filter((c) => c.selected);
+    const missed = sp.candidates.length - sel.length;
+    const lane = el("div", { class: "mini-lane" },
+      el("div", { class: "mini-span" }, sp.text));
+    for (const c of sel.slice(0, 3)) {
+      lane.append(el("div", { class: "mini-cand" },
+        el("span", { class: "mini-ref" }, `${c.table}.${c.column} #${c.rowid}`),
+        c.is_doc && c.snippet
+          ? snippetNode(c.snippet)
+          : el("span", { class: "mini-val" }, `“${c.value}”`),
+        el("span", { class: "meter" },
+          el("span", { style: `width:${Math.round(c.score * 100)}%` })),
+      ));
+    }
+    if (sel.length > 3 || missed > 0) {
+      lane.append(el("div", { class: "mini-more" },
+        [sel.length > 3 ? `+${sel.length - 3} more` : "",
+          missed > 0 ? `${missed} near-miss${missed === 1 ? "" : "es"}` : ""]
+          .filter(Boolean).join(" · ")));
+    }
+    box.append(lane);
+  }
+  if (!mentionSpans.length) {
+    box.append(el("div", { class: "empty" }, "— nothing resolved"));
+  }
+  return box;
+}
+
 function renderCandidate(c: TraceCandidate, rank: number): HTMLElement {
   const mid = c.is_doc && c.snippet
     ? snippetNode(c.snippet)
@@ -792,7 +840,7 @@ function renderCandidate(c: TraceCandidate, rank: number): HTMLElement {
     el("span", { class: "cand-right" },
       el("span", { class: "cand-chips" },
         c.channels.map((ch) => el("span", { class: "chip" },
-          ch.channel === "kg" ? `kg +${ch.raw}` : `${ch.channel} №${ch.rank + 1}`)),
+          ch.channel === "kg" ? `kg +${ch.raw}` : ch.channel)),
         c.selected ? null : el("span", { class: "pill bad" },
           (c.reject_reason || "rejected").replace(/_/g, " "))),
       el("span", { style: "display:flex; gap:6px; align-items:center" },
@@ -897,23 +945,27 @@ function renderChatRail(): void {
   }
 
   function renderTrailItem(t: ChatTrailItem): HTMLElement {
-    const d = el("details", { class: "chat-tool" });
-    const label = t.tool === "resolve"
-      ? `resolve · “${(t.args as { query?: string }).query ?? ""}”`
-      : t.tool === "sql"
-        ? `sql · ${((t.args as { query?: string }).query ?? "").slice(0, 60)}`
-        : "schema";
-    d.append(el("summary", null, el("span", { class: "chip" }, t.tool), label));
-    const body = el("div", { class: "tool-body" }, JSON.stringify(t.result, null, 2));
+    // resolutions render like reasoning blocks: inline, visual, collapsible
     if (t.tool === "resolve" && t.trace) {
       const trace = t.trace;
-      d.append(el("div", { style: "margin:4px 0 2px" },
+      const d = el("details", { class: "chat-tool", open: "" });
+      d.append(el("summary", null,
+        el("span", { class: "chip" }, "resolve"),
+        `“${trace.query}” · ${trace.mentions.length} mention${trace.mentions.length === 1 ? "" : "s"}`));
+      d.append(renderMiniTrace(trace));
+      d.append(el("div", { style: "margin:3px 0 2px" },
         el("button", {
           class: "rail-showtraj",
           onclick: () => showTraceInMain(trace),
-        }, "show trajectory in main view →")));
+        }, "full trajectory →")));
+      return d;
     }
-    d.append(body);
+    const d = el("details", { class: "chat-tool" });
+    const label = t.tool === "sql"
+      ? `sql · ${((t.args as { query?: string }).query ?? "").slice(0, 60)}`
+      : t.tool;
+    d.append(el("summary", null, el("span", { class: "chip" }, t.tool), label));
+    d.append(el("div", { class: "tool-body" }, JSON.stringify(t.result, null, 2)));
     return d;
   }
 
@@ -1093,10 +1145,11 @@ async function viewGraph(host: HTMLElement): Promise<void> {
 
     // radial tree: tables inner, their children fanned around them
     const tables = nodes.filter((n) => n.kind === "table");
-    const W = 1000, H = Math.max(560, 200 + 44 * Math.sqrt(nodes.length) * 2);
+    const W = tables.length > 1 ? 1560 : 1100;
+    const H = tables.length > 1 ? 1150 : 900;
     const cx = W / 2, cy = H / 2;
     const pos = new Map<string, { x: number; y: number }>();
-    const R1 = tables.length > 1 ? Math.min(cx, cy) * 0.42 : 0;
+    const R1 = tables.length > 1 ? 300 : 0;
     tables.forEach((n, i) => {
       const a = (2 * Math.PI * i) / tables.length - Math.PI / 2;
       pos.set(n.key, { x: cx + R1 * Math.cos(a), y: cy + R1 * Math.sin(a) });
@@ -1115,21 +1168,32 @@ async function viewGraph(host: HTMLElement): Promise<void> {
         ...childrenOf(t.key, ["column"]),
         ...childrenOf(t.key, ["term"]),
       ];
-      kids.forEach((k, i) => {
-        const spread = tables.length === 1
-          ? 2 * Math.PI * (1 - 1 / Math.max(2, kids.length))
-          : Math.min(2.4, 0.42 * kids.length);
-        const a = base + (kids.length === 1 ? 0 : (i / (kids.length - 1) - 0.5) * spread);
-        const r = (tables.length > 1 ? 150 : 210);
-        pos.set(k, { x: p.x + r * Math.cos(a), y: p.y + r * Math.sin(a) });
-        // grandchildren: values under columns
-        for (const [j, v] of childrenOf(k, ["value"]).entries()) {
-          pos.set(v, {
-            x: p.x + (r + 110) * Math.cos(a + (j - 0.5) * 0.18),
-            y: p.y + (r + 110) * Math.sin(a + (j - 0.5) * 0.18),
-          });
-        }
-      });
+      // children fill concentric sub-rings of the fan: each ring holds as
+      // many ~90px label slots as its arc affords, overflow steps outward —
+      // bounded radius no matter the brood size.
+      const spread = tables.length === 1
+        ? 2 * Math.PI * (1 - 1 / Math.max(2, kids.length))
+        : Math.min(3.0, 0.5 * kids.length);
+      let placed = 0, ring = 0;
+      while (placed < kids.length) {
+        const r = (tables.length > 1 ? 175 : 215) + ring * 62;
+        const cap = Math.max(6, Math.floor((spread * r) / 92));
+        const batch = kids.slice(placed, placed + cap);
+        batch.forEach((k, i) => {
+          const a = base + (batch.length === 1
+            ? 0
+            : (i / (batch.length - 1) - 0.5) * spread);
+          pos.set(k, { x: p.x + r * Math.cos(a), y: p.y + r * Math.sin(a) });
+          for (const [j, v] of childrenOf(k, ["value"]).entries()) {
+            pos.set(v, {
+              x: p.x + (r + 105) * Math.cos(a + (j - 0.5) * 0.16),
+              y: p.y + (r + 105) * Math.sin(a + (j - 0.5) * 0.16),
+            });
+          }
+        });
+        placed += batch.length;
+        ring += 1;
+      }
     }
 
     const svg = svgEl("svg", {

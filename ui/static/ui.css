@@ -642,3 +642,20 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .graph-detail .kindtag { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-faint); }
 .graph-detail .name { font-family: var(--mono); font-weight: 700; font-size: calc(13px * var(--fs)); }
 .graph-detail .props { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); color: var(--ink-soft); }
+
+/* ============ in-chat mini trajectory (the reasoning-block idiom) ======== */
+.minitraj { margin: 6px 0 4px; border-left: 2px solid var(--rule); padding-left: 10px; }
+.mini-qline {
+  font-family: var(--mono); font-size: calc(11px * var(--fs)); line-height: 1.9;
+  overflow-wrap: anywhere; margin-bottom: 4px;
+}
+.mini-lane { margin: 5px 0; }
+.mini-span { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); font-weight: 700; color: var(--accent); }
+.mini-cand {
+  display: flex; align-items: center; gap: 7px; padding: 2px 0;
+  font-family: var(--mono); font-size: calc(10px * var(--fs));
+}
+.mini-ref { color: var(--ink-soft); white-space: nowrap; }
+.mini-val, .mini-cand .snippet { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.mini-cand .meter { width: 46px; flex: none; }
+.mini-more { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); color: var(--ink-faint); font-style: italic; }
