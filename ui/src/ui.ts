@@ -1194,14 +1194,17 @@ async function viewGraph(host: HTMLElement): Promise<void> {
         }
       } else {
         // profile nodes are data-ink, not chrome: a dot and a mono label,
-        // no box (values italic, terms roman)
+        // no box (values italic, terms roman). The dot's area carries the
+        // node's PageRank centrality — importance you can see.
+        const c = Number((n.props as { centrality?: number }).centrality ?? 0);
+        const r = Math.min(6, 2.2 + Math.sqrt(c) * 14);
         grp = svgEl("g", {
           class: `gnode kind-${n.kind}`,
           transform: `translate(${p.x}, ${p.y})`,
           cursor: "pointer",
         },
-          svgEl("circle", { r: 2.6, cx: 0, cy: 0 }),
-          svgEl("text", { x: 0, y: 15, "text-anchor": "middle" }, n.label));
+          svgEl("circle", { r, cx: 0, cy: 0 }),
+          svgEl("text", { x: 0, y: 15 + r, "text-anchor": "middle" }, n.label));
       }
       grp.addEventListener("click", (ev) => {
         ev.stopPropagation();

@@ -1410,17 +1410,19 @@ async function viewGraph(host) {
           }, n.label));
         }
       } else {
+        const c = Number(n.props.centrality ?? 0);
+        const r = Math.min(6, 2.2 + Math.sqrt(c) * 14);
         grp = svgEl("g", {
           class: `gnode kind-${n.kind}`,
           transform: `translate(${p.x}, ${p.y})`,
           cursor: "pointer"
         }, svgEl("circle", {
-          r: 2.6,
+          r,
           cx: 0,
           cy: 0
         }), svgEl("text", {
           x: 0,
-          y: 15,
+          y: 15 + r,
           "text-anchor": "middle"
         }, n.label));
       }

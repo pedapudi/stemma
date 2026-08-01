@@ -8,3 +8,4 @@
 /eval/careg/data/
 __pycache__/
 *.egg-info/
+/eval/ecfr/data/

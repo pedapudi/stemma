@@ -209,6 +209,20 @@ const MIN_VALUE_COUNT: i64 = 2;
 const TOP_TERMS_PER_TABLE: usize = 24;
 /// Terms shorter than this are noise.
 const MIN_TERM_LEN: usize = 4;
+/// A term must appear in at least this many documents to matter…
+const MIN_TERM_DOCS: i64 = 5;
+/// …and in at most this fraction of them: beyond that it is a corpus
+/// stopword ("within", "shall") no matter how common. High DF is the
+/// *least* distinctive signal in a single-domain corpus.
+const MAX_TERM_DF_RATIO: f64 = 0.25;
+/// Documents sampled for capitalized-phrase mining.
+const PHRASE_SAMPLE_DOCS: usize = 1500;
+/// A phrase must recur at least this often across the sample.
+const MIN_PHRASE_COUNT: usize = 5;
+/// Phrase-entity nodes kept per table.
+const TOP_PHRASES_PER_TABLE: usize = 20;
+/// Candidate pool fed into TextRank (top of the burstiness shortlist).
+const PAGERANK_CANDIDATES: usize = 200;
 /// Containment ratio at which an undeclared join is proposed.
 const INFERRED_FK_MIN_CONTAINMENT: f64 = 0.95;
 /// Skip inclusion mining on columns with more distinct values than this.
@@ -231,7 +245,9 @@ fn fingerprint(db: &StemmaDb, table: &str) -> Result<String> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    Ok(format!("{n}:{mx}:{sum}"))
+    // The leading tag versions the COMPILER, not the data: bumping it
+    // invalidates every stored fingerprint so algorithm upgrades recompile.
+    Ok(format!("kg2:{n}:{mx}:{sum}"))
 }
 
 /// Compiles (or incrementally refreshes) the schema, discovered-relation and
@@ -306,6 +322,8 @@ pub fn compile(db: &StemmaDb, force: bool) -> Result<KgStats> {
             stemmadb::rusqlite::params![t, fp],
         )?;
     }
+
+    compute_centrality(db)?;
 
     let mut s = store.stats()?;
     s.recompiled_tables = dirty.len();
@@ -465,68 +483,290 @@ fn compile_term_profile(
         if doc_values == 0 {
             continue;
         }
-        // Corpus-wide document frequency (fts5vocab cannot split by source
-        // table; single-doc-table stores — the common case — are exact).
+        // Candidate terms from corpus-wide statistics (fts5vocab cannot
+        // split by source table; single-doc-table stores — the common case —
+        // are exact). Two filters kill function words without any list:
+        // a DF *ceiling* — beyond MAX_TERM_DF_RATIO of docs a term is a
+        // corpus stopword ("within", "shall") no matter how common — and a
+        // burstiness prior (occurrences-per-containing-doc × log coverage)
+        // to shortlist candidates worth graphing.
+        let df_ceiling = ((doc_values as f64) * MAX_TERM_DF_RATIO).ceil() as i64;
         let mut stmt = conn.prepare(
-            "SELECT term, doc FROM lex_vocab
-             WHERE length(term) >= ?1 AND term NOT IN (
-                'that','this','with','from','have','been','were','will','which',
-                'shall','must','such','other','than','their','there','these',
-                'those','when','where','under','upon','into','each','also',
-                'more','less','only','some','same','then','they','them')
-             ORDER BY doc DESC LIMIT ?2",
+            "SELECT term, doc, cnt FROM lex_vocab
+             WHERE length(term) >= ?1 AND doc >= ?2 AND doc <= ?3
+               AND term NOT GLOB '*[0-9]*'
+             ORDER BY doc DESC LIMIT 4000",
         )?;
-        let terms: Vec<(String, i64)> = stmt
+        let mut candidates: Vec<(String, i64, i64)> = stmt
             .query_map(
-                stemmadb::rusqlite::params![MIN_TERM_LEN as i64, TOP_TERMS_PER_TABLE as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                stemmadb::rusqlite::params![MIN_TERM_LEN as i64, MIN_TERM_DOCS, df_ceiling],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?
             .collect::<std::result::Result<_, _>>()?;
-        for (term, doc) in &terms {
+        let burstiness = |doc: i64, cnt: i64| (cnt as f64 / doc as f64) * (1.0 + (doc as f64).ln());
+        candidates.sort_by(|a, b| burstiness(b.1, b.2).total_cmp(&burstiness(a.1, a.2)));
+        candidates.truncate(PAGERANK_CANDIDATES);
+
+        // One pass over a document sample powers everything downstream:
+        // the term co-occurrence graph, TextRank, and phrase mining.
+        let mut stmt = conn.prepare(
+            "SELECT value FROM lex_values WHERE is_doc = 1 AND src_table = ?1
+             ORDER BY id LIMIT ?2",
+        )?;
+        let docs: Vec<String> = stmt
+            .query_map(
+                stemmadb::rusqlite::params![t, PHRASE_SAMPLE_DOCS as i64],
+                |r| r.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?;
+
+        // Per-document presence of each candidate term.
+        use std::collections::{HashMap, HashSet};
+        let index_of: HashMap<&str, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, (term, _, _))| (term.as_str(), i))
+            .collect();
+        let n = candidates.len();
+        let mut sample_df = vec![0u32; n];
+        let mut cooccur: HashMap<(usize, usize), u32> = HashMap::new();
+        for doc in &docs {
+            let mut present: HashSet<usize> = HashSet::new();
+            for w in doc.split(|c: char| !c.is_alphanumeric()) {
+                if w.len() >= MIN_TERM_LEN {
+                    if let Some(&i) = index_of.get(w.to_lowercase().as_str()) {
+                        present.insert(i);
+                    }
+                }
+            }
+            let mut ids: Vec<usize> = present.into_iter().collect();
+            ids.sort_unstable();
+            for (a, &i) in ids.iter().enumerate() {
+                sample_df[i] += 1;
+                for &j in &ids[a + 1..] {
+                    *cooccur.entry((i, j)).or_default() += 1;
+                }
+            }
+        }
+
+        // TextRank: weighted PageRank over the co-occurrence graph. A term
+        // matters when it co-occurs with other terms that matter — the
+        // centrality signal frequency ranking cannot see.
+        let rank = pagerank(n, &cooccur);
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| rank[b].total_cmp(&rank[a]));
+        let kept: Vec<usize> = order
+            .into_iter()
+            .filter(|&i| sample_df[i] > 0)
+            .take(TOP_TERMS_PER_TABLE)
+            .collect();
+
+        for &i in &kept {
+            let (term, doc, _) = &candidates[i];
             let key = format!("term:{t}:{term}");
             store.upsert_node(&Node {
                 key: key.clone(),
                 kind: KIND_TERM.into(),
                 label: term.clone(),
-                props: format!("{{\"docs\":{doc}}}"),
+                props: format!("{{\"docs\":{doc},\"textrank\":{:.4}}}", rank[i]),
             })?;
             store.upsert_edge(&Edge {
                 src_key: format!("table:{t}"),
                 dst_key: key,
                 kind: "term".into(),
                 label: format!("{doc} docs"),
-                props: format!("{{\"method\":\"profiled\",\"docs\":{doc}}}"),
+                props: format!("{{\"method\":\"textrank\",\"docs\":{doc}}}"),
             })?;
         }
-        // Co-occurrence: how often two characteristic terms share a document.
-        let mut pairs: Vec<(String, String, i64, f64)> = Vec::new();
-        for i in 0..terms.len() {
-            for j in (i + 1)..terms.len() {
-                let (a, da) = &terms[i];
-                let (b, db_) = &terms[j];
-                let both: i64 = conn.query_row(
-                    "SELECT count(*) FROM lex_fts WHERE lex_fts MATCH ?1",
-                    [format!("\"{a}\" AND \"{b}\"")],
-                    |r| r.get(0),
-                )?;
-                let ratio = both as f64 / (*da.min(db_)) as f64;
-                if ratio >= MIN_COOCCUR_RATIO && both > 0 {
-                    pairs.push((a.clone(), b.clone(), both, ratio));
-                }
-            }
-        }
+
+        // Co-occurrence edges among the kept terms, from the same sample.
+        let kept_set: HashSet<usize> = kept.iter().copied().collect();
+        let mut pairs: Vec<(usize, usize, u32)> = cooccur
+            .iter()
+            .filter(|((a, b), _)| kept_set.contains(a) && kept_set.contains(b))
+            .map(|(&(a, b), &c)| (a, b, c))
+            .collect();
         pairs.sort_by(|x, y| y.2.cmp(&x.2));
-        for (a, b, both, ratio) in pairs.into_iter().take(TOP_COOCCUR_PAIRS) {
+        let mut kept_pairs = 0usize;
+        for (a, b, both) in pairs {
+            let ratio = both as f64 / sample_df[a].min(sample_df[b]).max(1) as f64;
+            if ratio < MIN_COOCCUR_RATIO {
+                continue;
+            }
             store.upsert_edge(&Edge {
-                src_key: format!("term:{t}:{a}"),
-                dst_key: format!("term:{t}:{b}"),
+                src_key: format!("term:{t}:{}", candidates[a].0),
+                dst_key: format!("term:{t}:{}", candidates[b].0),
                 kind: "cooccurs".into(),
                 label: format!("{both} docs"),
                 props: format!(
                     "{{\"method\":\"profiled\",\"confidence\":{ratio:.2},\"docs\":{both}}}"
                 ),
             })?;
+            kept_pairs += 1;
+            if kept_pairs >= TOP_COOCCUR_PAIRS {
+                break;
+            }
         }
+
+        compile_phrase_entities(store, t, &docs)?;
+    }
+    Ok(())
+}
+
+/// Weighted PageRank by power iteration; treats edges as undirected
+/// (co-occurrence is symmetric). Damping 0.85, fixed iteration budget —
+/// convergence tolerance is irrelevant at these sizes.
+fn pagerank(n: usize, edges: &std::collections::HashMap<(usize, usize), u32>) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    const DAMPING: f64 = 0.85;
+    const ITERS: usize = 40;
+    let mut weight_sum = vec![0f64; n];
+    for (&(a, b), &w) in edges {
+        weight_sum[a] += w as f64;
+        weight_sum[b] += w as f64;
+    }
+    let mut rank = vec![1.0 / n as f64; n];
+    let mut next = vec![0f64; n];
+    for _ in 0..ITERS {
+        next.fill((1.0 - DAMPING) / n as f64);
+        let mut dangling = 0.0;
+        for i in 0..n {
+            if weight_sum[i] == 0.0 {
+                dangling += rank[i];
+            }
+        }
+        for i in 0..n {
+            next[i] += DAMPING * dangling / n as f64;
+        }
+        for (&(a, b), &w) in edges {
+            let w = w as f64;
+            next[b] += DAMPING * rank[a] * w / weight_sum[a];
+            next[a] += DAMPING * rank[b] * w / weight_sum[b];
+        }
+        std::mem::swap(&mut rank, &mut next);
+    }
+    rank
+}
+
+/// PageRank over the compiled graph itself, stored as `centrality` on every
+/// node — the UI reads it to size marks by importance.
+fn compute_centrality(db: &StemmaDb) -> Result<()> {
+    let conn = db.conn();
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM kg_nodes ORDER BY id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let index: std::collections::HashMap<i64, usize> =
+        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let mut edges: std::collections::HashMap<(usize, usize), u32> =
+        std::collections::HashMap::new();
+    let rows: Vec<(i64, i64)> = conn
+        .prepare("SELECT src, dst FROM kg_edges")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (s, d) in rows {
+        if let (Some(&a), Some(&b)) = (index.get(&s), index.get(&d)) {
+            *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let rank = pagerank(ids.len(), &edges);
+    for (i, &id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE kg_nodes SET props = json_set(props, '$.centrality', ?1) WHERE id = ?2",
+            stemmadb::rusqlite::params![format!("{:.5}", rank[i]).parse::<f64>().unwrap_or(0.0), id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Named entities in prose are multi-word and capitalized ("California
+/// Coastal Commission", "Fish and Game Code"): mine recurring capitalized
+/// phrases from a document sample. Deterministic, LLM-free; the LLM-based
+/// extraction pass of the instance layer supersedes, not replaces, this.
+fn compile_phrase_entities(
+    store: &SqliteKnowledgeStore,
+    table: &str,
+    docs: &[String],
+) -> Result<()> {
+    use std::collections::HashMap;
+    const CONNECTORS: &[&str] = &["of", "and", "the", "for"];
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for doc in docs {
+        let words: Vec<&str> = doc
+            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let is_cap = |w: &str| {
+            w.chars().next().is_some_and(|c| c.is_uppercase())
+                && w.len() >= 2
+                && w.chars().all(|c| c.is_alphabetic() || c == '\'')
+        };
+        let mut i = 0;
+        while i < words.len() {
+            if !is_cap(words[i]) {
+                i += 1;
+                continue;
+            }
+            // Extend through capitalized words with lowercase connectors
+            // allowed between them; the phrase must end capitalized.
+            let mut j = i + 1;
+            let mut last_cap = i;
+            while j < words.len() && j - i < 6 {
+                if is_cap(words[j]) {
+                    last_cap = j;
+                    j += 1;
+                } else if CONNECTORS.contains(&words[j]) && last_cap == j - 1 {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if last_cap > i {
+                let phrase = words[i..=last_cap].join(" ");
+                if phrase.len() <= 60 {
+                    *counts.entry(phrase).or_default() += 1;
+                }
+            }
+            i = last_cap.max(i) + 1;
+        }
+    }
+
+    // Drop phrases that are strict prefixes of a more complete phrase with
+    // comparable support ("California Coastal" vs "California Coastal
+    // Commission") — keep the most informative form.
+    let mut phrases: Vec<(String, usize)> = counts
+        .iter()
+        .filter(|(_, &n)| n >= MIN_PHRASE_COUNT)
+        .map(|(p, &n)| (p.clone(), n))
+        .collect();
+    phrases.retain(|(p, n)| {
+        !counts.iter().any(|(longer, &ln)| {
+            longer != p && longer.starts_with(p.as_str()) && ln * 2 >= *n
+        })
+    });
+    phrases.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (phrase, n) in phrases.into_iter().take(TOP_PHRASES_PER_TABLE) {
+        let key = format!("phrase:{table}:{}", phrase.to_lowercase());
+        store.upsert_node(&Node {
+            key: key.clone(),
+            kind: KIND_TERM.into(),
+            label: phrase,
+            props: format!("{{\"count\":{n},\"phrase\":true,\"sampled\":{}}}", docs.len()),
+        })?;
+        store.upsert_edge(&Edge {
+            src_key: format!("table:{table}"),
+            dst_key: key,
+            kind: "term".into(),
+            label: format!("×{n}"),
+            props: format!("{{\"method\":\"profiled\",\"count\":{n}}}"),
+        })?;
     }
     Ok(())
 }
@@ -701,6 +941,78 @@ mod tests {
         assert_eq!(c.recompiled_tables, 1, "only the dirty table recompiles");
         assert_eq!(a.nodes, c.nodes, "recompile converges to the same graph");
         assert_eq!(a.edges, c.edges);
+    }
+
+    #[test]
+    fn textrank_terms_exclude_corpus_stopwords() {
+        let dir = std::env::temp_dir().join(format!("stemma-kg-{}-terms", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let storef = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&storef);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)", [])
+                .unwrap();
+            // "whereof" rides in EVERY doc (a corpus stopword); the topical
+            // vocabulary rotates per theme and co-occurs within themes.
+            let themes = [
+                "coastal permit commission coastal permit commission shoreline",
+                "insurance filing commissioner insurance filing premium",
+                "housing development council housing development zoning",
+                "fisheries license quota fisheries harvest quota vessel",
+                "pesticide registration applicator pesticide residue tolerance",
+                "vehicle emission inspection vehicle smog certificate",
+            ];
+            for i in 0..30 {
+                let theme = themes[i % 6];
+                let body = format!(
+                    "whereof the {theme} whereof provisions apply {theme} whereof. {}",
+                    "Additional procedural language follows to reach document length                      comfortably past the classification threshold for documents."
+                );
+                c.execute("INSERT INTO docs(body) VALUES (?1)", [body]).unwrap();
+            }
+        }
+        let db = StemmaDb::open(&storef, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        compile(&db, false).unwrap();
+        let labels: Vec<String> = db
+            .conn()
+            .prepare("SELECT label FROM kg_nodes WHERE kind = 'term'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        assert!(
+            !labels.iter().any(|l| l == "whereof"),
+            "df-ceiling must kill corpus stopwords, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "coastal" || l == "commission"),
+            "topical terms must survive, got {labels:?}"
+        );
+        // every term node carries its TextRank score
+        let unranked: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM kg_nodes WHERE kind = 'term'                  AND props NOT LIKE '%textrank%' AND props NOT LIKE '%phrase%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unranked, 0);
+        // and every node got a centrality from the graph-wide PageRank
+        let uncentral: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM kg_nodes WHERE json_extract(props, '$.centrality') IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uncentral, 0);
     }
 
     #[test]
