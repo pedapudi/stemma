@@ -24,6 +24,10 @@
 
 - [stemmadb](../crates/stemmadb/README.md) — the storage layer: file layout,
   store schema, invariants.
+- [stemma console](../ui/README.md) — the optional web UI: data/metadata/KG
+  navigation, read-only SQL, and the visual resolution trajectory.
+- [Python client](../clients/python/README.md) — `StemmaClient` (gRPC
+  resolve/explain) and `StoreBrowser` (read-only file access).
 
 ## For LLM agents
 

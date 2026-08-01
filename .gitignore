@@ -6,3 +6,5 @@
 *.stemmadb-wal
 *.stemmadb-shm
 /eval/careg/data/
+__pycache__/
+*.egg-info/

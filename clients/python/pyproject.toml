@@ -1,0 +1,17 @@
+[project]
+name = "stemmadb"
+version = "0.1.0"
+description = "Client library for stemma: resolve natural-language mentions to database records"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "grpcio>=1.60",
+    "protobuf>=4.25",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["stemmadb*"]

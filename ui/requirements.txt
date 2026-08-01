@@ -1,0 +1,6 @@
+# The console's Python dependencies. The stemmadb client library is the
+# sibling package: pip install -e clients/python
+fastapi>=0.115
+uvicorn>=0.30
+grpcio>=1.60
+protobuf>=4.25
