@@ -53,10 +53,19 @@ impl Resolver {
             .get(&req.database)
             .ok_or_else(|| Status::not_found(format!("unknown database {:?}", req.database)))?;
         let db = db.lock().expect("stemmadb lock poisoned");
-        stemma_resolve::resolve_lexical(&db, &req.query).map_err(|e| match e {
+        let trace = stemma_resolve::resolve_lexical(&db, &req.query).map_err(|e| match e {
             stemma_resolve::Error::IndexMissing => Status::failed_precondition(e.to_string()),
             other => Status::internal(other.to_string()),
-        })
+        })?;
+        // Query history is store working memory; a failed write must never
+        // fail the resolution.
+        if !req.query.trim().is_empty() {
+            let _ = db.conn().execute(
+                "INSERT INTO query_log (query, mentions, elapsed_ms) VALUES (?1, ?2, ?3)",
+                stemmadb::rusqlite::params![req.query, trace.mentions.len() as i64, trace.elapsed_ms],
+            );
+        }
+        Ok(trace)
     }
 }
 

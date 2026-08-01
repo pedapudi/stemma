@@ -46,9 +46,7 @@ def main() -> None:
 
     lm_cfg = None
     if args.lm_endpoint and args.lm_model:
-        from lm import LmConfig
-
-        lm_cfg = LmConfig(args.lm_endpoint, args.lm_model)
+        lm_cfg = (args.lm_endpoint, args.lm_model)
 
     host, _, port = args.listen.partition(":")
     uvicorn.run(

@@ -16,7 +16,7 @@ use rusqlite::Connection;
 pub use rusqlite;
 
 /// Schema version of the .stemmadb store, kept in `PRAGMA user_version`.
-pub const STORE_SCHEMA_VERSION: i32 = 1;
+pub const STORE_SCHEMA_VERSION: i32 = 2;
 
 /// Name under which the user database is attached.
 pub const SRC_SCHEMA: &str = "src";
@@ -92,15 +92,19 @@ impl StemmaDb {
         let found: i32 = self
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if found == 0 {
-            self.conn.execute_batch(SCHEMA_SQL)?;
-            self.conn
-                .pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
-        } else if found != STORE_SCHEMA_VERSION {
+        if found > STORE_SCHEMA_VERSION {
             return Err(Error::StoreVersionMismatch {
                 found,
                 supported: STORE_SCHEMA_VERSION,
             });
+        }
+        // Additive migrations: every DDL block is idempotent, so upgrading
+        // is applying the full schema and stamping the new version. Only a
+        // store from the FUTURE is an error.
+        if found < STORE_SCHEMA_VERSION {
+            self.conn.execute_batch(SCHEMA_SQL)?;
+            self.conn
+                .pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
         }
         Ok(())
     }
@@ -168,6 +172,27 @@ CREATE TABLE IF NOT EXISTS embed_queue (
     enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (src_table, src_rowid)
 ) STRICT;
+
+-- v2: operational history. Query history is written by the resolution
+-- server; chat history by the console/agents. Both are per-database working
+-- memory — queryable like everything else in the store.
+CREATE TABLE IF NOT EXISTS query_log (
+    id         INTEGER PRIMARY KEY,
+    query      TEXT NOT NULL,
+    mentions   INTEGER NOT NULL,
+    elapsed_ms REAL NOT NULL,
+    asked_at   TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+CREATE INDEX IF NOT EXISTS query_log_at ON query_log(asked_at);
+CREATE TABLE IF NOT EXISTS chat_log (
+    id           INTEGER PRIMARY KEY,
+    conversation TEXT NOT NULL DEFAULT 'default',
+    role         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    trail        TEXT NOT NULL DEFAULT '[]',
+    said_at      TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+CREATE INDEX IF NOT EXISTS chat_log_conv ON chat_log(conversation, id);
 "#;
 
 #[cfg(test)]

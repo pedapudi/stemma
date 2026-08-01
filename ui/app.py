@@ -20,8 +20,6 @@ from pydantic import BaseModel
 
 from stemmadb import StemmaClient, StoreBrowser
 
-import lm as lm_mod
-
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
@@ -36,11 +34,16 @@ class ChatRequest(BaseModel):
 def create_app(
     dbs: dict[str, str],
     grpc_target: str,
-    lm_cfg: lm_mod.LmConfig | None = None,
+    lm_cfg: tuple[str, str] | None = None,  # (endpoint, model)
 ) -> FastAPI:
     app = FastAPI(title="stemma console", docs_url=None, redoc_url=None)
     browsers = {name: StoreBrowser(path) for name, path in dbs.items()}
     client = StemmaClient(grpc_target)
+    agent_chat = None
+    if lm_cfg:
+        from agent_backend import AgentChat
+
+        agent_chat = AgentChat(dbs, grpc_target, lm_cfg[0], lm_cfg[1])
 
     def browser(name: str) -> StoreBrowser:
         b = browsers.get(name)
@@ -53,7 +56,7 @@ def create_app(
         return {
             "databases": sorted(dbs),
             "grpc": grpc_target,
-            "lm": {"endpoint": lm_cfg.endpoint, "model": lm_cfg.model} if lm_cfg else None,
+            "lm": {"endpoint": lm_cfg[0], "model": lm_cfg[1]} if lm_cfg else None,
         }
 
     @app.get("/api/health")
@@ -128,37 +131,45 @@ def create_app(
             raise HTTPException(502, f"stemma-server: {e.code().name}: {e.details()}") from e
 
     @app.post("/api/db/{name}/chat")
-    def chat(name: str, req: ChatRequest):
-        if lm_cfg is None:
+    async def chat(name: str, req: ChatRequest):
+        if agent_chat is None:
             raise HTTPException(
                 503,
                 "no LM configured — start the console with --lm-endpoint/--lm-model "
                 "(any OpenAI-compatible endpoint: vLLM, llama.cpp, LiteLLM, …)",
             )
-        b = browser(name)
+        browser(name)
+        text = next(
+            (m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"),
+            "",
+        )
+        if not text:
+            raise HTTPException(400, "no user message")
         try:
-            return lm_mod.chat(
-                lm_cfg,
-                name,
-                req.messages,
-                resolve_fn=lambda q: client.explain_dict(q, database=name),
-                sql_fn=lambda s: b.query(s),
-                schema_fn=lambda: {
-                    "tables": [
-                        {
-                            "name": t.name,
-                            "columns": [c.name for c in t.columns],
-                            "foreign_keys": [
-                                f"{fk.from_column} -> {fk.to_table}.{fk.to_column or 'id'}"
-                                for fk in t.foreign_keys
-                            ],
-                        }
-                        for t in b.schema()
-                    ]
-                },
+            return await agent_chat.send(
+                name, text,
+                explain_fn=lambda q, database: client.explain_dict(q, database=database),
             )
         except Exception as e:
-            raise HTTPException(502, f"LM endpoint: {e}") from e
+            raise HTTPException(502, f"agent: {e}") from e
+
+    @app.get("/api/db/{name}/chat")
+    def chat_transcript(name: str):
+        browser(name)
+        if agent_chat is None:
+            return {"messages": []}
+        return {"messages": agent_chat.transcript(name)}
+
+    @app.get("/api/db/{name}/history")
+    def history(name: str, limit: int = 8):
+        try:
+            r = browser(name).query(
+                "SELECT query, max(asked_at) AS at FROM query_log "
+                f"GROUP BY query ORDER BY at DESC LIMIT {min(int(limit), 30)}"
+            )
+            return {"queries": [row[0] for row in r["rows"]]}
+        except Exception:
+            return {"queries": []}
 
     @app.get("/")
     def index():

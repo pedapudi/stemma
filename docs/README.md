@@ -28,6 +28,10 @@
   navigation, read-only SQL, and the visual resolution trajectory.
 - [Python client](../clients/python/README.md) — `StemmaClient` (gRPC
   resolve/explain) and `StoreBrowser` (read-only file access).
+- [MCP server](../integrations/mcp/README.md) — stemma's tools for any MCP
+  client, trajectories included.
+- [Reference agent](../agents/stemma_agent/README.md) — the ADK example the
+  console's chat is built on.
 
 ## Design
 

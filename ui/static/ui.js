@@ -704,6 +704,25 @@ function queryNatural(host, q) {
     class: "btn accent",
     onclick: () => run(input.value)
   }, "resolve")), examplesRow, out);
+  getJSON(`/api/db/${state.db}/history`).then((r) => {
+    if (!r.queries.length) return;
+    const row = el("div", null, el("span", {
+      class: "sql-caption",
+      style: "margin-right:8px"
+    }, "recent:"));
+    for (const x of r.queries.slice(0, 6)) {
+      row.append(el("button", {
+        class: "chip",
+        style: "margin-right:6px; cursor:pointer",
+        onclick: () => {
+          input.value = x;
+          run(x);
+        }
+      }, x.length > 60 ? x.slice(0, 60) + "\u2026" : x));
+    }
+    examplesRow.after(row);
+  }).catch(() => {
+  });
   getJSON(`/api/db/${state.db}/examples`).then((r) => {
     for (const x of r.examples) {
       examplesRow.append(el("button", {
@@ -823,62 +842,105 @@ function renderPlan(plan) {
 }
 function renderTrace(out, trace) {
   out.replaceChildren();
+  hideHover();
   const mentionSpans = trace.mentions.map((i) => trace.spans[i]);
   const qline = el("div", {
     class: "qline"
   });
   const covered = (pos) => mentionSpans.find((s) => pos >= s.start && pos < s.end);
   let cursor = 0;
-  const tokenNodes = /* @__PURE__ */ new Map();
   for (const t of trace.tokens) {
     if (t.start > cursor) qline.append(trace.query.slice(cursor, t.start));
     const m = covered(t.start);
-    const cls = "qtok" + (m ? " mention" : t.stopword ? " stop" : "");
-    const node = el("span", {
-      class: cls
-    }, t.text);
-    if (m && !tokenNodes.has(m.id)) tokenNodes.set(m.id, node);
-    qline.append(node);
+    qline.append(el("span", {
+      class: "qtok" + (m ? " mention" : t.stopword ? " stop" : "")
+    }, t.text));
     cursor = t.end;
   }
   if (cursor < trace.query.length) qline.append(trace.query.slice(cursor));
-  const lanes = el("div", {
-    class: "lanes"
+  const THRESHOLD = 0.35;
+  const field = el("div", {
+    class: "scorefield"
   });
-  const laneNodes = /* @__PURE__ */ new Map();
-  for (const s of mentionSpans) {
-    const lane = el("div", {
-      class: "lane"
-    }, el("div", {
-      class: "lane-head"
+  field.append(el("div", {
+    class: "sf-head"
+  }, el("span", {
+    class: "sf-label subhead",
+    style: "margin:0"
+  }, "mention"), el("div", {
+    class: "sf-axis"
+  }, el("span", {
+    class: "sf-tick",
+    style: "left:0%"
+  }, "0"), el("span", {
+    class: "sf-tick sf-thresh",
+    style: `left:${THRESHOLD * 100}%`
+  }, "threshold"), el("span", {
+    class: "sf-tick",
+    style: "left:100%"
+  }, "1"))));
+  let openDetail = null;
+  let openRow = null;
+  for (const sp of mentionSpans) {
+    const strip = el("div", {
+      class: "sf-strip"
+    }, el("i", {
+      class: "sf-rule"
+    }), el("i", {
+      class: "sf-rule sf-rule-thresh",
+      style: `left:${THRESHOLD * 100}%`
+    }));
+    const topIdx = sp.candidates.findIndex((c) => c.selected);
+    sp.candidates.forEach((c, i) => {
+      const cls = "sf-dot" + (c.selected ? i === topIdx ? " top" : " sel" : " rej");
+      const jitter = (i % 5 - 2) * 5;
+      const dot = el("span", {
+        class: cls,
+        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`
+      });
+      hov(dot, `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \xB7 ${c.score.toFixed(2)}<br>${esc((c.snippet || c.value).slice(0, 120))}<br>` + c.channels.map((ch) => esc(ch.channel)).join(" \xB7 ") + (c.selected ? "" : ` \xB7 <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`));
+      strip.append(dot);
+    });
+    const nSel = sp.candidates.filter((c) => c.selected).length;
+    const row = el("div", {
+      class: "sf-row"
     }, el("span", {
-      class: "lane-span"
-    }, s.text), el("span", {
-      class: "lane-pos"
-    }, `bytes ${s.start}\u2013${s.end}`), el("span", {
-      class: "lane-pos"
-    }, `${s.candidates.length} candidate${s.candidates.length === 1 ? "" : "s"}`)), s.candidates.map((c, i) => renderCandidate(c, i)));
-    laneNodes.set(s.id, lane);
-    lanes.append(lane);
+      class: "sf-label"
+    }, el("span", {
+      class: "sf-mention"
+    }, sp.text), el("span", {
+      class: "sf-count"
+    }, `${nSel}/${sp.candidates.length}`)), strip);
+    const detail = el("div", {
+      class: "sf-detail"
+    }, sp.candidates.map((c, i) => renderCandidate(c, i)));
+    row.addEventListener("click", () => {
+      hideHover();
+      const isOpen = openDetail === detail;
+      openDetail?.remove();
+      openRow?.classList.remove("open");
+      openDetail = null;
+      openRow = null;
+      if (!isOpen) {
+        row.after(detail);
+        row.classList.add("open");
+        openDetail = detail;
+        openRow = row;
+      }
+    });
+    field.append(row);
   }
   if (!mentionSpans.length) {
-    lanes.append(el("div", {
+    field.append(el("div", {
       class: "empty"
-    }, "\u2014 no mentions resolved; every span is in the considered list below"));
+    }, "\u2014 no mentions resolved; the considered spans are below"));
   }
-  const traj = el("div", {
-    class: "traj"
-  }, qline, lanes);
-  const wires = svgEl("svg", {
-    class: "wires",
-    "aria-hidden": "true"
-  });
-  traj.prepend(wires);
   const also = trace.spans.filter((s) => s.status !== "selected" && s.status !== "skipped").sort((a, b) => a.start - b.start);
-  const alsoBox = el("div", {
+  const alsoBox = el("details", {
     class: "alsoran section"
-  }, el("div", {
-    class: "subhead"
+  }, el("summary", {
+    class: "subhead",
+    style: "cursor:pointer; display:inline-block"
   }, `spans considered \xB7 ${also.length}`));
   const statusPill = {
     overlapped: [
@@ -920,22 +982,7 @@ function renderTrace(out, trace) {
   }
   out.append(el("div", {
     class: "sql-caption"
-  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, kg`), traj, alsoBox);
-  requestAnimationFrame(() => {
-    const box = traj.getBoundingClientRect();
-    wires.setAttribute("viewBox", `0 0 ${box.width} ${box.height}`);
-    for (const s of mentionSpans) {
-      const tok = tokenNodes.get(s.id), lane = laneNodes.get(s.id);
-      if (!tok || !lane) continue;
-      const a = tok.getBoundingClientRect(), b = lane.getBoundingClientRect();
-      const x1 = a.left - box.left + a.width / 2, y1 = a.bottom - box.top + 2;
-      const x2 = b.left - box.left + 22, y2 = b.top - box.top;
-      wires.append(svgEl("path", {
-        class: "wire",
-        d: `M ${x1} ${y1} C ${x1} ${y1 + 28}, ${x2} ${y2 - 28}, ${x2} ${y2}`
-      }));
-    }
-  });
+  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, kg \xB7 click a mention row for detail`), qline, field, alsoBox);
 }
 function renderMiniTrace(trace) {
   const box = el("div", {
@@ -1066,7 +1113,17 @@ function renderChatRail() {
     return;
   }
   const db = state.db;
-  if (!chatLog.has(db)) chatLog.set(db, []);
+  if (!chatLog.has(db)) {
+    chatLog.set(db, []);
+    getJSON(`/api/db/${db}/chat`).then((r) => {
+      const cur = chatLog.get(db);
+      if (cur.length === 0 && r.messages.length) {
+        cur.push(...r.messages);
+        if (chatRailOpen()) renderChatRail();
+      }
+    }).catch(() => {
+    });
+  }
   const log = chatLog.get(db);
   const transcript = el("div", {
     class: "rail-transcript"

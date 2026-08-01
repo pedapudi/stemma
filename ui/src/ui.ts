@@ -581,6 +581,24 @@ function queryNatural(host: HTMLElement, q: string): void {
     out,
   );
 
+  // recent queries from the store's query_log
+  getJSON<{ queries: string[] }>(`/api/db/${state.db}/history`).then((r) => {
+    if (!r.queries.length) return;
+    const row = el("div", null,
+      el("span", { class: "sql-caption", style: "margin-right:8px" }, "recent:"));
+    for (const x of r.queries.slice(0, 6)) {
+      row.append(el("button", {
+        class: "chip",
+        style: "margin-right:6px; cursor:pointer",
+        onclick: () => {
+          input.value = x;
+          run(x);
+        },
+      }, x.length > 60 ? x.slice(0, 60) + "…" : x));
+    }
+    examplesRow.after(row);
+  }).catch(() => { /* history is a nicety */ });
+
   // examples mined from this database's knowledge graph
   getJSON<{ examples: string[] }>(`/api/db/${state.db}/examples`).then((r) => {
     for (const x of r.examples) {
@@ -686,50 +704,95 @@ function renderPlan(plan: PlanRow[]): HTMLElement {
 
 function renderTrace(out: HTMLElement, trace: Trace): void {
   out.replaceChildren();
+  hideHover();
   const mentionSpans = trace.mentions.map((i) => trace.spans[i]);
 
+  /* the query line: tokens, mentions marked */
   const qline = el("div", { class: "qline" });
   const covered = (pos: number) => mentionSpans.find((s) => pos >= s.start && pos < s.end);
   let cursor = 0;
-  const tokenNodes = new Map<number, HTMLElement>();
   for (const t of trace.tokens) {
     if (t.start > cursor) qline.append(trace.query.slice(cursor, t.start));
     const m = covered(t.start);
-    const cls = "qtok" + (m ? " mention" : t.stopword ? " stop" : "");
-    const node = el("span", { class: cls }, t.text);
-    if (m && !tokenNodes.has(m.id)) tokenNodes.set(m.id, node);
-    qline.append(node);
+    qline.append(el("span", {
+      class: "qtok" + (m ? " mention" : t.stopword ? " stop" : ""),
+    }, t.text));
     cursor = t.end;
   }
   if (cursor < trace.query.length) qline.append(trace.query.slice(cursor));
 
-  const lanes = el("div", { class: "lanes" });
-  const laneNodes = new Map<number, HTMLElement>();
-  for (const s of mentionSpans) {
-    const lane = el("div", { class: "lane" },
-      el("div", { class: "lane-head" },
-        el("span", { class: "lane-span" }, s.text),
-        el("span", { class: "lane-pos" }, `bytes ${s.start}–${s.end}`),
-        el("span", { class: "lane-pos" },
-          `${s.candidates.length} candidate${s.candidates.length === 1 ? "" : "s"}`)),
-      s.candidates.map((c, i) => renderCandidate(c, i)));
-    laneNodes.set(s.id, lane);
-    lanes.append(lane);
+  /* the score field: one row per mention, candidates as dots on a shared
+   * 0→1 score axis. Overview first — how contested, how confident — with
+   * the threshold as a dashed reference rule; click a row for the full
+   * candidate detail (one open at a time). */
+  const THRESHOLD = 0.35; // mirrors the resolver's SELECT_THRESHOLD
+  const field = el("div", { class: "scorefield" });
+  field.append(el("div", { class: "sf-head" },
+    el("span", { class: "sf-label subhead", style: "margin:0" }, "mention"),
+    el("div", { class: "sf-axis" },
+      el("span", { class: "sf-tick", style: "left:0%" }, "0"),
+      el("span", { class: "sf-tick sf-thresh", style: `left:${THRESHOLD * 100}%` }, "threshold"),
+      el("span", { class: "sf-tick", style: "left:100%" }, "1"),
+    )));
+
+  let openDetail: HTMLElement | null = null;
+  let openRow: HTMLElement | null = null;
+  for (const sp of mentionSpans) {
+    const strip = el("div", { class: "sf-strip" },
+      el("i", { class: "sf-rule" }),
+      el("i", { class: "sf-rule sf-rule-thresh", style: `left:${THRESHOLD * 100}%` }));
+    const topIdx = sp.candidates.findIndex((c) => c.selected);
+    sp.candidates.forEach((c, i) => {
+      const cls = "sf-dot" + (c.selected ? (i === topIdx ? " top" : " sel") : " rej");
+      const jitter = ((i % 5) - 2) * 5;
+      const dot = el("span", {
+        class: cls,
+        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`,
+      });
+      hov(dot,
+        `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} · ${c.score.toFixed(2)}<br>` +
+        `${esc((c.snippet || c.value).slice(0, 120))}<br>` +
+        c.channels.map((ch) => esc(ch.channel)).join(" · ") +
+        (c.selected ? "" : ` · <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`));
+      strip.append(dot);
+    });
+    const nSel = sp.candidates.filter((c) => c.selected).length;
+    const row = el("div", { class: "sf-row" },
+      el("span", { class: "sf-label" },
+        el("span", { class: "sf-mention" }, sp.text),
+        el("span", { class: "sf-count" },
+          `${nSel}/${sp.candidates.length}`)),
+      strip);
+    const detail = el("div", { class: "sf-detail" },
+      sp.candidates.map((c, i) => renderCandidate(c, i)));
+    row.addEventListener("click", () => {
+      hideHover();
+      const isOpen = openDetail === detail;
+      openDetail?.remove();
+      openRow?.classList.remove("open");
+      openDetail = null;
+      openRow = null;
+      if (!isOpen) {
+        row.after(detail);
+        row.classList.add("open");
+        openDetail = detail;
+        openRow = row;
+      }
+    });
+    field.append(row);
   }
   if (!mentionSpans.length) {
-    lanes.append(el("div", { class: "empty" },
-      "— no mentions resolved; every span is in the considered list below"));
+    field.append(el("div", { class: "empty" },
+      "— no mentions resolved; the considered spans are below"));
   }
 
-  const traj = el("div", { class: "traj" }, qline, lanes);
-  const wires = svgEl("svg", { class: "wires", "aria-hidden": "true" });
-  traj.prepend(wires);
-
+  /* the near-miss ledger, folded by default */
   const also = trace.spans
     .filter((s) => s.status !== "selected" && s.status !== "skipped")
     .sort((a, b) => a.start - b.start);
-  const alsoBox = el("div", { class: "alsoran section" },
-    el("div", { class: "subhead" }, `spans considered · ${also.length}`));
+  const alsoBox = el("details", { class: "alsoran section" },
+    el("summary", { class: "subhead", style: "cursor:pointer; display:inline-block" },
+      `spans considered · ${also.length}`));
   const statusPill: Record<string, [string, string]> = {
     overlapped: ["neutral", "overlapped"],
     weak: ["caution", "weak"],
@@ -738,7 +801,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
   for (const s of also) {
     const [tone, label] = statusPill[s.status] ?? ["neutral", s.status];
     const row = el("div", { class: "alsoran-row" },
-      el("span", { class: "spantext" }, `“${s.text}”`),
+      el("span", { class: "spantext" }, `\u201c${s.text}\u201d`),
       el("span", { class: "pill " + tone }, label),
       el("span", { class: "alsoran-cands" },
         s.candidates.length
@@ -747,7 +810,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
           : "—"));
     if (s.candidates.length) {
       hov(row, s.candidates.map((c) =>
-        `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} “${esc(c.snippet || c.value)}”<br>` +
+        `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \u201c${esc(c.snippet || c.value)}\u201d<br>` +
         `score ${c.score.toFixed(3)} · ${esc(c.reject_reason)}`).join("<hr>"));
     }
     alsoBox.append(row);
@@ -758,26 +821,11 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
 
   out.append(
     el("div", { class: "sql-caption" },
-      `resolved in ${trace.elapsed_ms.toFixed(1)} ms · ${trace.spans.length} spans enumerated · channels: exact, bm25, trigram, kg`),
-    traj,
+      `resolved in ${trace.elapsed_ms.toFixed(1)} ms · ${trace.spans.length} spans enumerated · channels: exact, bm25, trigram, kg · click a mention row for detail`),
+    qline,
+    field,
     alsoBox,
   );
-
-  requestAnimationFrame(() => {
-    const box = traj.getBoundingClientRect();
-    wires.setAttribute("viewBox", `0 0 ${box.width} ${box.height}`);
-    for (const s of mentionSpans) {
-      const tok = tokenNodes.get(s.id), lane = laneNodes.get(s.id);
-      if (!tok || !lane) continue;
-      const a = tok.getBoundingClientRect(), b = lane.getBoundingClientRect();
-      const x1 = a.left - box.left + a.width / 2, y1 = a.bottom - box.top + 2;
-      const x2 = b.left - box.left + 22, y2 = b.top - box.top;
-      wires.append(svgEl("path", {
-        class: "wire",
-        d: `M ${x1} ${y1} C ${x1} ${y1 + 28}, ${x2} ${y2 - 28}, ${x2} ${y2}`,
-      }));
-    }
-  });
 }
 
 /* The compact in-conversation trajectory: query line with mentions marked,
@@ -907,7 +955,17 @@ function renderChatRail(): void {
   }
 
   const db = state.db as string;
-  if (!chatLog.has(db)) chatLog.set(db, []);
+  if (!chatLog.has(db)) {
+    chatLog.set(db, []);
+    // history lives in the store's chat_log; restore it once per session
+    getJSON<{ messages: ChatMsg[] }>(`/api/db/${db}/chat`).then((r) => {
+      const cur = chatLog.get(db) as ChatMsg[];
+      if (cur.length === 0 && r.messages.length) {
+        cur.push(...r.messages);
+        if (chatRailOpen()) renderChatRail();
+      }
+    }).catch(() => { /* absent history is fine */ });
+  }
   const log = chatLog.get(db) as ChatMsg[];
 
   const transcript = el("div", { class: "rail-transcript" });

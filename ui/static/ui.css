@@ -700,3 +700,30 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .kg-label.sel { color: var(--accent); font-weight: 700; }
 .kg-label.hood { color: var(--accent); }
 .kg-label.hood.kg-col, .kg-col.sel { border-color: var(--accent); }
+
+/* ============ the score field: mention rows on a shared 0-1 axis ========= */
+.scorefield { border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); padding: 10px 16px 14px; }
+.sf-head, .sf-row { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 16px; align-items: center; }
+.sf-head { margin-bottom: 8px; }
+.sf-axis { position: relative; height: 16px; }
+.sf-tick {
+  position: absolute; transform: translateX(-50%);
+  font-family: var(--mono); font-size: calc(9px * var(--fs)); color: var(--ink-faint);
+  text-transform: uppercase; letter-spacing: .05em;
+}
+.sf-row { padding: 7px 0; border-top: 1px solid var(--rule-soft); cursor: pointer; border-radius: 3px; }
+.sf-row:hover .sf-mention, .sf-row.open .sf-mention { color: var(--accent); }
+.sf-mention { font-family: var(--mono); font-weight: 700; font-size: calc(12.5px * var(--fs)); color: var(--ink); transition: color .12s; }
+.sf-count { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); color: var(--ink-faint); margin-left: 8px; font-variant-numeric: tabular-nums; }
+.sf-strip { position: relative; height: 26px; }
+.sf-rule { position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: var(--rule); }
+.sf-rule-thresh { left: auto; width: 1px; height: 100%; top: 0; background: transparent; border-left: 1px dashed var(--ink-faint); opacity: .55; }
+.sf-dot {
+  position: absolute; top: 50%; width: 8px; height: 8px; border-radius: 50%;
+  transform: translate(-50%, -50%); transition: transform .12s;
+}
+.sf-dot.top { background: var(--accent); width: 10px; height: 10px; }
+.sf-dot.sel { background: var(--ink-soft); }
+.sf-dot.rej { background: transparent; border: 1px solid var(--flat); opacity: .7; }
+.sf-dot:hover { transform: translate(-50%, -50%) scale(1.5); }
+.sf-detail { padding: 4px 0 10px; }
