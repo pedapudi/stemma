@@ -279,7 +279,10 @@ table.grid td { font-family: var(--mono); font-size: calc(11.5px * var(--fs)); }
   font-family: var(--mono); font-size: calc(9.5px * var(--fs)); padding: 1px 6px;
   border-radius: 8px; border: 1px solid var(--rule); color: var(--ink-soft);
   text-transform: lowercase; white-space: nowrap;
+  /* chips are sometimes <button>s — never let UA button chrome through */
+  background: transparent; appearance: none;
 }
+button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 
 .hovercard {
   position: fixed; z-index: 100; max-width: 320px;
@@ -630,6 +633,7 @@ table.grid td { font-family: var(--mono); font-size: calc(11.5px * var(--fs)); }
 .gnode.sel circle { fill: var(--accent); }
 .gedge { transition: stroke .12s, opacity .12s; }
 .gedge.hot { stroke: var(--accent) !important; opacity: 1 !important; stroke-width: 1.6; }
+.graph-detail[hidden] { display: none; }
 .graph-detail {
   margin: 10px 0; border: 1px solid var(--rule); border-radius: 5px;
   background: var(--panel); padding: 10px 14px;
