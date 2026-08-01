@@ -45,6 +45,19 @@ function esc(s) {
     "'": "&#39;"
   })[c]);
 }
+function snippetNode(snippet) {
+  const out = el("span", {
+    class: "snippet"
+  });
+  const parts = snippet.split(/⟨([^⟩]*)⟩/);
+  parts.forEach((p, i) => {
+    if (i % 2 === 1) out.append(el("span", {
+      class: "hit"
+    }, p));
+    else if (p) out.append(p);
+  });
+  return out;
+}
 var hovercard = document.getElementById("hovercard");
 function hov(node, html) {
   node.addEventListener("mouseenter", () => {
@@ -64,11 +77,13 @@ function hov(node, html) {
   node.addEventListener("mouseleave", () => hovercard.classList.remove("on"));
 }
 var state = {
+  cfg: null,
   dbs: [],
   db: null,
   schema: null,
-  view: "resolve"
+  view: "query"
 };
+var chatLog = /* @__PURE__ */ new Map();
 var THEMES = [
   "paper",
   "solarized-light",
@@ -87,13 +102,78 @@ var THEMES = [
   "dracula",
   "ubuntu"
 ];
-function initTheme() {
-  const saved = localStorage.getItem("stemma.theme") ?? "paper";
-  document.documentElement.dataset.theme = saved;
+var TYPEFACES = [
+  {
+    group: "technical",
+    faces: [
+      [
+        "T7",
+        "google sans mono"
+      ],
+      [
+        "T9",
+        "source sans 3 + source code pro"
+      ],
+      [
+        "T12",
+        "inconsolata"
+      ],
+      [
+        "T14",
+        "ubuntu + ubuntu mono"
+      ]
+    ]
+  },
+  {
+    group: "editorial",
+    faces: [
+      [
+        "E5",
+        "fraunces"
+      ],
+      [
+        "E7",
+        "bitter"
+      ],
+      [
+        "E8",
+        "literata"
+      ],
+      [
+        "E15",
+        "domine"
+      ]
+    ]
+  },
+  {
+    group: "display",
+    faces: [
+      [
+        "D2",
+        "archivo narrow + space grotesk"
+      ],
+      [
+        "D12",
+        "hanken grotesk"
+      ],
+      [
+        "D14",
+        "barlow condensed + space grotesk"
+      ],
+      [
+        "D5",
+        "bricolage grotesque"
+      ]
+    ]
+  }
+];
+function initPickers() {
+  const savedTheme = localStorage.getItem("stemma.theme") ?? "paper";
+  document.documentElement.dataset.theme = savedTheme;
   const box = document.getElementById("swatches");
   for (const t of THEMES) {
     const b = el("button", {
-      class: "swatch" + (t === saved ? " on" : ""),
+      class: "swatch" + (t === savedTheme ? " on" : ""),
       "data-swatch": t,
       "aria-label": t,
       onclick: () => {
@@ -107,11 +187,48 @@ function initTheme() {
     hov(b, esc(t));
     box.append(b);
   }
-  document.getElementById("themebtn").addEventListener("click", (e) => {
+  const themeBtn = document.getElementById("themebtn");
+  themeBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    closeMenus(box);
     box.classList.toggle("open");
   });
-  document.addEventListener("click", () => box.classList.remove("open"));
+  const savedType = localStorage.getItem("stemma.type") ?? "T9";
+  if (savedType !== "T9") document.documentElement.dataset.type = savedType;
+  const menu = document.getElementById("typemenu");
+  for (const g of TYPEFACES) {
+    menu.append(el("div", {
+      class: "tm-group"
+    }, g.group));
+    for (const [id, label] of g.faces) {
+      const b = el("button", {
+        class: id === savedType ? "on" : "",
+        onclick: () => {
+          if (id === "T9") delete document.documentElement.dataset.type;
+          else document.documentElement.dataset.type = id;
+          localStorage.setItem("stemma.type", id);
+          menu.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+          b.classList.add("on");
+        }
+      }, label);
+      menu.append(b);
+    }
+  }
+  const typeBtn = document.getElementById("typebtn");
+  typeBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeMenus(menu);
+    menu.classList.toggle("open");
+  });
+  document.addEventListener("click", () => closeMenus());
+  function closeMenus(except) {
+    for (const m of [
+      box,
+      menu
+    ]) {
+      if (m !== except) m.classList.remove("open");
+    }
+  }
 }
 async function pollHealth() {
   const s = document.getElementById("status");
@@ -166,8 +283,56 @@ function renderSidebar() {
       class: "tree-icon round"
     }), t.name, el("span", {
       class: "count"
-    }, t.row_count.toLocaleString())));
+    }, "~" + t.row_count.toLocaleString())));
   }
+  const storeBox = el("div", {
+    class: "side-store"
+  }, el("div", {
+    class: "tree-group"
+  }, "store"));
+  side.append(storeBox);
+  getJSON(`/api/db/${state.db}/store`).then((m) => {
+    if (!m.exists) {
+      storeBox.append(el("div", {
+        class: "empty"
+      }, "\u2014 not created yet"));
+      return;
+    }
+    const pairs = [
+      [
+        "size",
+        ((m.size_bytes ?? 0) / 1e6).toFixed(1) + " mb"
+      ],
+      [
+        "lexical",
+        m.lexical ? m.lexical.values.toLocaleString() + " values" : "\u2014"
+      ],
+      [
+        "kg",
+        m.kg ? `${m.kg.nodes} nodes \xB7 ${m.kg.edges} edges` : "\u2014"
+      ],
+      [
+        "embed queue",
+        String(m.embed_queue ?? 0)
+      ],
+      [
+        "vectors",
+        (m.model_registry ?? []).length ? `${(m.model_registry ?? []).length} tables` : "none \xB7 m3"
+      ]
+    ];
+    storeBox.append(el("div", {
+      class: "kv"
+    }, pairs.map(([k, v]) => [
+      el("span", {
+        class: "k"
+      }, k),
+      el("span", {
+        class: "v"
+      }, v)
+    ])));
+  }).catch(() => storeBox.append(el("div", {
+    class: "empty"
+  }, "\u2014 unavailable")));
 }
 function setCrumbs(...parts) {
   document.getElementById("crumbs").textContent = [
@@ -175,14 +340,34 @@ function setCrumbs(...parts) {
     ...parts
   ].filter(Boolean).join(" \xB7 ");
 }
-var EXAMPLES = [
-  "the Q3 numbers for the Seattle office",
-  "what did Chen's team ship",
-  "revenue at Northgate"
-];
-function viewResolve(host, params) {
+function viewQuery(host, params) {
+  const dialect = params.get("d") === "sql" ? "sql" : "nl";
   const q = params.get("q") ?? "";
-  setCrumbs("resolve");
+  setCrumbs("query", dialect === "sql" ? "sql" : "natural");
+  const seg = el("span", {
+    class: "seg"
+  }, el("button", {
+    class: dialect === "nl" ? "on" : "",
+    onclick: () => {
+      location.hash = "#/query?d=nl" + (q ? "&q=" + encodeURIComponent(q) : "");
+    }
+  }, "natural"), el("button", {
+    class: dialect === "sql" ? "on" : "",
+    onclick: () => {
+      location.hash = "#/query?d=sql";
+    }
+  }, "sql"));
+  host.append(el("div", {
+    style: "display:flex; align-items:baseline; gap:14px"
+  }, el("h1", {
+    class: "h1"
+  }, "query"), seg), el("p", {
+    class: "lede"
+  }, dialect === "nl" ? "the dialect is natural language: mentions resolve to records, and the trajectory shows every span considered, every channel fired, and every candidate \u2014 chosen and near-miss alike." : "the dialect is sql, read-only: main is the .stemmadb store, src is the user database. every query ships with its plan."));
+  if (dialect === "nl") queryNatural(host, q);
+  else querySql(host);
+}
+function queryNatural(host, q) {
   const input = el("input", {
     class: "input",
     value: q,
@@ -192,27 +377,36 @@ function viewResolve(host, params) {
     }
   });
   const out = el("div", null);
-  host.append(el("h1", {
-    class: "h1"
-  }, "resolve"), el("p", {
-    class: "lede"
-  }, "a query names things obliquely \u2014 the trajectory below shows how each span of the query was considered, which retrieval channels fired, and every candidate record: chosen and near-miss alike."), el("div", {
+  const examplesRow = el("div", null);
+  host.append(el("div", {
     class: "queryrow"
   }, input, el("button", {
     class: "btn accent",
     onclick: () => run(input.value)
-  }, "resolve")), el("div", null, EXAMPLES.map((x) => el("button", {
-    class: "chip",
-    style: "margin-right:6px; cursor:pointer",
-    onclick: () => {
-      input.value = x;
-      run(x);
+  }, "resolve")), examplesRow, out);
+  getJSON(`/api/db/${state.db}/examples`).then((r) => {
+    for (const x of r.examples) {
+      examplesRow.append(el("button", {
+        class: "chip",
+        style: "margin-right:6px; cursor:pointer",
+        onclick: () => {
+          input.value = x;
+          run(x);
+        }
+      }, x));
     }
-  }, x))), out);
+    if (r.examples.length) {
+      examplesRow.prepend(el("span", {
+        class: "sql-caption",
+        style: "margin-right:8px"
+      }, "from the kg:"));
+    }
+  }).catch(() => {
+  });
   if (q) run(q);
   async function run(query) {
     if (!query.trim()) return;
-    history.replaceState(null, "", "#/resolve?q=" + encodeURIComponent(query));
+    history.replaceState(null, "", "#/query?d=nl&q=" + encodeURIComponent(query));
     document.getElementById("topsearch").value = query;
     out.replaceChildren(el("div", {
       class: "empty"
@@ -228,6 +422,78 @@ function viewResolve(host, params) {
     }
     renderTrace(out, trace);
   }
+}
+function querySql(host) {
+  const box = el("textarea", {
+    class: "input sqlbox mono",
+    placeholder: "SELECT \u2026"
+  }, "SELECT src_table, src_column, count(*) AS n\nFROM lex_values GROUP BY 1, 2 ORDER BY n DESC");
+  const out = el("div", null);
+  const run = async () => {
+    out.replaceChildren(el("div", {
+      class: "empty"
+    }, "running\u2026"));
+    try {
+      const r = await fetch(`/api/db/${state.db}/sql`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          sql: box.value
+        })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail ?? r.statusText);
+      out.replaceChildren(el("div", {
+        class: "sql-caption"
+      }, `${d.rows.length} row${d.rows.length === 1 ? "" : "s"}${d.truncated ? " (truncated)" : ""} \xB7 ${d.elapsed_ms} ms`), renderPlan(d.plan), el("div", {
+        class: "table-scroll"
+      }, el("table", {
+        class: "grid"
+      }, el("thead", null, el("tr", null, d.columns.map((c) => el("th", null, c)))), el("tbody", null, d.rows.map((row) => el("tr", null, row.map((v) => el("td", null, v === null ? "\u2205" : v))))))));
+    } catch (e) {
+      out.replaceChildren(el("div", {
+        class: "sql-error"
+      }, e.message));
+    }
+  };
+  box.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") run();
+  });
+  host.append(box, el("div", {
+    style: "margin-top:8px"
+  }, el("button", {
+    class: "btn accent",
+    onclick: run
+  }, "run"), el("span", {
+    class: "sql-caption",
+    style: "margin-left:10px"
+  }, "ctrl-enter runs")), out);
+}
+function renderPlan(plan) {
+  const box = el("div", {
+    class: "plan panel"
+  }, el("div", {
+    class: "subhead"
+  }, "query plan"));
+  if (!plan.length) {
+    box.append(el("div", {
+      class: "empty"
+    }, "\u2014 trivial plan"));
+    return box;
+  }
+  for (const p of plan) {
+    const opClass = /^SCAN/.test(p.detail) ? "scan" : /^SEARCH/.test(p.detail) ? "search" : "";
+    box.append(el("div", {
+      class: "plan-row"
+    }, el("span", {
+      class: "tick"
+    }, "\u2502 ".repeat(p.depth) + "\u251C\u2500"), el("span", {
+      class: `op ${opClass}`
+    }, p.detail)));
+  }
+  return box;
 }
 function renderTrace(out, trace) {
   out.replaceChildren();
@@ -315,9 +581,9 @@ function renderTrace(out, trace) {
       class: "pill " + tone
     }, label), el("span", {
       class: "alsoran-cands"
-    }, s.candidates.length ? s.candidates.map((c) => `${c.table}.${c.column} #${c.rowid} \u201C${c.value}\u201D (${c.score.toFixed(2)})`).join(" \xB7 ") : "\u2014"));
+    }, s.candidates.length ? s.candidates.map((c) => `${c.table}.${c.column} #${c.rowid} (${c.score.toFixed(2)})`).join(" \xB7 ") : "\u2014"));
     if (s.candidates.length) {
-      hov(row, s.candidates.map((c) => `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \u201C${esc(c.value)}\u201D<br>score ${c.score.toFixed(3)} \xB7 ${esc(c.reject_reason)}`).join("<hr>"));
+      hov(row, s.candidates.map((c) => `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \u201C${esc(c.snippet || c.value)}\u201D<br>score ${c.score.toFixed(3)} \xB7 ${esc(c.reject_reason)}`).join("<hr>"));
     }
     alsoBox.append(row);
   }
@@ -328,7 +594,7 @@ function renderTrace(out, trace) {
   }
   out.append(el("div", {
     class: "sql-caption"
-  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram`), traj, alsoBox);
+  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, kg`), traj, alsoBox);
   requestAnimationFrame(() => {
     const box = traj.getBoundingClientRect();
     wires.setAttribute("viewBox", `0 0 ${box.width} ${box.height}`);
@@ -346,22 +612,23 @@ function renderTrace(out, trace) {
   });
 }
 function renderCandidate(c, rank) {
+  const mid = c.is_doc && c.snippet ? snippetNode(c.snippet) : el("span", {
+    class: "cand-val",
+    title: c.value
+  }, `\u201C${c.value}${c.value_truncated ? "\u2026" : ""}\u201D`);
   const row = el("div", {
     class: "cand " + (c.selected ? rank === 0 ? "sel-0" : "sel" : "rej")
   }, el("span", {
     class: "cand-id"
   }, `${c.table}.${c.column} `, el("span", {
     class: "rowid"
-  }, `#${c.rowid}`)), el("span", {
-    class: "cand-val",
-    title: c.value
-  }, `\u201C${c.value}${c.value_truncated ? "\u2026" : ""}\u201D`), el("span", {
+  }, `#${c.rowid}`)), mid, el("span", {
     class: "cand-right"
   }, el("span", {
     class: "cand-chips"
   }, c.channels.map((ch) => el("span", {
     class: "chip"
-  }, `${ch.channel} \u2116${ch.rank + 1}`)), c.selected ? null : el("span", {
+  }, ch.channel === "kg" ? `kg +${ch.raw}` : `${ch.channel} \u2116${ch.rank + 1}`)), c.selected ? null : el("span", {
     class: "pill bad"
   }, (c.reject_reason || "rejected").replace(/_/g, " "))), el("span", {
     style: "display:flex; gap:6px; align-items:center"
@@ -372,8 +639,135 @@ function renderCandidate(c, rank) {
   })), el("span", {
     class: "score"
   }, c.score.toFixed(2)))));
-  hov(row, c.channels.map((ch) => `<b>${esc(ch.channel)}</b> rank ${ch.rank + 1} \xB7 raw ${ch.raw.toFixed(3)}`).join("<br>") + (c.selected ? "" : `<hr>${esc(c.reject_reason.replace(/_/g, " "))}`));
+  hov(row, c.channels.map((ch) => ch.channel === "kg" ? `<b>kg</b> co-occurring terms matched: ${ch.raw}` : `<b>${esc(ch.channel)}</b> rank ${ch.rank + 1} \xB7 raw ${ch.raw.toFixed(3)}`).join("<br>") + (c.selected ? "" : `<hr>${esc(c.reject_reason.replace(/_/g, " "))}`));
   return row;
+}
+function viewChat(host) {
+  setCrumbs("chat");
+  host.append(el("h1", {
+    class: "h1"
+  }, "chat"), el("p", {
+    class: "lede"
+  }, "talk to the data by proxy: the model must pin every mention through resolve before it may query, so answers stay grounded in actual records. every tool call is shown."));
+  if (!state.cfg?.lm) {
+    host.append(el("div", {
+      class: "empty"
+    }, "\u2014 no language model configured. start the console with --lm-endpoint http://host:port/v1 --lm-model <name> (any openai-compatible server: vllm, llama.cpp, litellm; bearer token via LM_API_KEY)"));
+    return;
+  }
+  const db = state.db;
+  if (!chatLog.has(db)) chatLog.set(db, []);
+  const log = chatLog.get(db);
+  const transcript = el("div", {
+    class: "chat"
+  });
+  const input = el("input", {
+    class: "input",
+    placeholder: `ask ${db} anything\u2026`,
+    onkeydown: (e) => {
+      if (e.key === "Enter") send();
+    }
+  });
+  const sendBtn = el("button", {
+    class: "btn accent",
+    onclick: () => send()
+  }, "send");
+  host.append(transcript, el("div", {
+    class: "chat-inputrow"
+  }, input, sendBtn), el("div", {
+    class: "sql-caption",
+    style: "margin-top:6px"
+  }, `model: ${state.cfg.lm.model} \xB7 every mention resolved before use`));
+  redraw();
+  function redraw() {
+    transcript.replaceChildren();
+    for (const m of log) {
+      const turn = el("div", {
+        class: "chat-turn"
+      });
+      if (m.role === "user") {
+        turn.append(el("div", {
+          class: "chat-msg user"
+        }, el("div", {
+          class: "who"
+        }, "you"), el("div", {
+          class: "md"
+        }, m.content)));
+      } else {
+        for (const t of m.trail ?? []) turn.append(renderTrailItem(t));
+        turn.append(el("div", {
+          class: "chat-msg"
+        }, el("div", {
+          class: "who"
+        }, "stemma"), el("div", {
+          class: "md"
+        }, m.content)));
+      }
+      transcript.append(turn);
+    }
+  }
+  function renderTrailItem(t) {
+    const d = el("details", {
+      class: "chat-tool"
+    });
+    const label = t.tool === "resolve" ? `resolve \xB7 \u201C${t.args.query ?? ""}\u201D` : t.tool === "sql" ? `sql \xB7 ${(t.args.query ?? "").slice(0, 80)}` : "schema";
+    d.append(el("summary", null, el("span", {
+      class: "chip"
+    }, t.tool), label));
+    d.append(el("div", {
+      class: "tool-body"
+    }, JSON.stringify(t.result, null, 2)));
+    return d;
+  }
+  async function send() {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    log.push({
+      role: "user",
+      content: text
+    });
+    redraw();
+    const wait = el("div", {
+      class: "chat-wait"
+    }, el("i"), el("i"), el("i"));
+    transcript.append(wait);
+    sendBtn.setAttribute("disabled", "");
+    try {
+      const r = await fetch(`/api/db/${db}/chat`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          messages: log.map((m) => ({
+            role: m.role,
+            content: m.content
+          }))
+        })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail ?? r.statusText);
+      log.push({
+        role: "assistant",
+        content: d.message,
+        trail: d.trail
+      });
+    } catch (e) {
+      log.push({
+        role: "assistant",
+        content: "\u2014 " + e.message,
+        trail: []
+      });
+    } finally {
+      wait.remove();
+      sendBtn.removeAttribute("disabled");
+      redraw();
+      transcript.scrollIntoView({
+        block: "end"
+      });
+    }
+  }
 }
 async function viewData(host, params, table) {
   const tables = state.schema?.tables ?? [];
@@ -386,20 +780,54 @@ async function viewData(host, params, table) {
     return;
   }
   const limit = 50;
-  let offset = Number(params.get("offset") ?? 0);
   const meta = tables.find((t) => t.name === name);
+  const cursors = [
+    null
+  ];
+  let lastRowid = null;
+  let hasMore = false;
+  let filter = params.get("q") ?? "";
+  const filterInput = el("input", {
+    class: "input",
+    value: filter,
+    placeholder: "filter \u2014 substring across text columns (trigram-served)\u2026",
+    onkeydown: (e) => {
+      if (e.key === "Enter") {
+        filter = filterInput.value.trim();
+        cursors.length = 1;
+        load(null);
+      }
+    }
+  });
   const body = el("div", null);
   host.append(el("h1", {
     class: "h1"
   }, name), el("p", {
     class: "sql-caption"
-  }, meta ? meta.columns.map((c) => `${c.name} ${c.type.toLowerCase()}${c.pk ? " \xB7pk" : ""}`).join(" \xB7 ") : ""), body);
-  await load();
-  async function load() {
+  }, meta ? `~${meta.row_count.toLocaleString()} rows \xB7 ` + meta.columns.map((c) => `${c.name} ${c.type.toLowerCase()}${c.pk ? " \xB7pk" : ""}`).join(" \xB7 ") : ""), el("div", {
+    class: "data-tools"
+  }, filterInput, el("button", {
+    class: "btn",
+    onclick: () => {
+      filter = filterInput.value.trim();
+      cursors.length = 1;
+      load(null);
+    }
+  }, "filter")), body);
+  await load(null);
+  async function load(after) {
     body.replaceChildren(el("div", {
       class: "empty"
     }, "loading\u2026"));
-    const d = await getJSON(`/api/db/${state.db}/rows/${encodeURIComponent(name)}?limit=${limit}&offset=${offset}`);
+    const qs = new URLSearchParams({
+      limit: String(limit)
+    });
+    if (after !== null) qs.set("after", String(after));
+    if (filter) qs.set("q", filter);
+    const d = await getJSON(`/api/db/${state.db}/rows/${encodeURIComponent(name)}?${qs}`);
+    hasMore = d.has_more;
+    const ridIdx = d.columns.indexOf("_rowid");
+    lastRowid = d.rows.length ? Number(d.rows[d.rows.length - 1][ridIdx]) : null;
     const tbl = el("table", {
       class: "grid"
     }, el("thead", null, el("tr", null, d.columns.map((c) => el("th", null, c)))), el("tbody", null, d.rows.map((r) => el("tr", null, r.map((v) => el("td", {
@@ -409,265 +837,221 @@ async function viewData(host, params, table) {
       class: "pager"
     }, el("button", {
       class: "btn",
-      disabled: offset === 0 ? "" : null,
+      disabled: cursors.length <= 1 ? "" : null,
       onclick: () => {
-        offset = Math.max(0, offset - limit);
-        load();
+        cursors.pop();
+        load(cursors[cursors.length - 1]);
       }
     }, "\u2039 prev"), el("button", {
       class: "btn",
-      disabled: offset + limit >= d.total ? "" : null,
+      disabled: hasMore ? null : "",
       onclick: () => {
-        offset += limit;
-        load();
+        cursors.push(lastRowid);
+        load(lastRowid);
       }
     }, "next \u203A"), el("span", {
       class: "where"
-    }, `rows ${d.total ? offset + 1 : 0}\u2013${Math.min(offset + limit, d.total)} of ${d.total.toLocaleString()}`));
+    }, d.rows.length ? `page ${cursors.length} \xB7 ${d.rows.length} rows${filter ? ` \xB7 filtered \u201C${filter}\u201D` : ""}` : "\u2014 nothing matches"));
     body.replaceChildren(el("div", {
       class: "table-scroll"
     }, tbl), pager);
   }
 }
+var KIND_TOGGLES = [
+  "column",
+  "value",
+  "term"
+];
 async function viewGraph(host) {
   setCrumbs("graph");
+  const g = await getJSON(`/api/db/${state.db}/graph`);
   host.append(el("h1", {
     class: "h1"
   }, "knowledge graph"), el("p", {
     class: "lede"
-  }, "the schema layer: tables as entities, declared foreign keys as relations. the instance layer (records, aliases, cross-row links) arrives with the knowledge store."));
-  const g = await getJSON(`/api/db/${state.db}/graph`);
-  if (!g.nodes.length) {
-    host.append(el("div", {
-      class: "empty"
-    }, "\u2014 no tables"));
-    return;
-  }
-  const W = 900, H = Math.max(420, 90 * Math.ceil(g.nodes.length / 2));
-  const cx = W / 2, cy = H / 2, R = Math.min(cx, cy) - 90;
-  const pos = /* @__PURE__ */ new Map();
-  g.nodes.forEach((n, i) => {
-    const a = 2 * Math.PI * i / g.nodes.length - Math.PI / 2;
-    pos.set(n.id, {
-      x: cx + R * Math.cos(a),
-      y: cy + R * Math.sin(a)
-    });
+  }, g.layer === "compiled" ? "compiled from the data: schema (tables, columns, declared keys), discovered relations (dashed \u2014 inclusion-mined joins with confidence), and the profile layer (frequent values, characteristic terms, term co-occurrence). instance-layer entities arrive with collective disambiguation." : "schema layer only \u2014 run stemma-server against this database once to compile the full graph."));
+  const shown = /* @__PURE__ */ new Set([
+    "table",
+    ...KIND_TOGGLES
+  ]);
+  if (g.nodes.length > 160) shown.delete("column");
+  const legend = el("div", {
+    class: "graph-legend"
   });
-  const svg = svgEl("svg", {
-    class: "graph-svg",
-    viewBox: `0 0 ${W} ${H}`,
-    role: "img",
-    "aria-label": "schema graph"
-  });
-  svg.append(svgEl("defs", null, svgEl("marker", {
-    id: "arrow",
-    viewBox: "0 0 8 8",
-    refX: 7,
-    refY: 4,
-    markerWidth: 6,
-    markerHeight: 6,
-    orient: "auto"
-  }, svgEl("path", {
-    d: "M 0 0 L 8 4 L 0 8 z",
-    fill: "var(--flat)"
-  }))));
-  for (const e of g.edges) {
-    const a = pos.get(e.source), b = pos.get(e.target);
-    if (!a || !b) continue;
-    const mx = (a.x + b.x) / 2 + (a.y - b.y) * 0.12, my = (a.y + b.y) / 2 + (b.x - a.x) * 0.12;
-    svg.append(svgEl("path", {
-      class: "gedge",
-      d: `M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}`,
-      "marker-end": "url(#arrow)"
-    }), svgEl("text", {
-      class: "gedge-label",
-      x: mx,
-      y: my,
-      "text-anchor": "middle"
-    }, e.label));
-  }
-  for (const n of g.nodes) {
-    const p = pos.get(n.id);
-    const w = Math.max(90, n.id.length * 8 + 26);
-    const grp = svgEl("g", {
-      class: "gnode",
-      transform: `translate(${p.x - w / 2}, ${p.y - 20})`,
-      cursor: "pointer"
-    }, svgEl("rect", {
-      width: w,
-      height: 40,
-      rx: 4
-    }), svgEl("text", {
-      x: w / 2,
-      y: 17,
-      "text-anchor": "middle"
-    }, n.id), svgEl("text", {
-      class: "grows",
-      x: w / 2,
-      y: 31,
-      "text-anchor": "middle"
-    }, `${n.rows.toLocaleString()} rows`));
-    grp.addEventListener("click", () => {
-      location.hash = "#/data/" + encodeURIComponent(n.id);
-    });
-    hov(grp, `<b>${esc(n.id)}</b><br>${n.columns.map(esc).join("<br>")}`);
-    svg.append(grp);
-  }
-  host.append(el("div", {
+  const panel = el("div", {
     class: "panel"
-  }, svg));
-}
-async function viewStore(host) {
-  setCrumbs("store");
-  host.append(el("h1", {
-    class: "h1"
-  }, "store"), el("p", {
-    class: "lede"
-  }, "the .stemmadb sidecar: every derived artifact, all disposable. the user database is attached read-only and never touched."));
-  const m = await getJSON(`/api/db/${state.db}/store`);
-  if (!m.exists) {
-    host.append(el("div", {
-      class: "empty"
-    }, "\u2014 no store yet; it is created when stemma-server registers the database"));
-    return;
-  }
-  const kv = (pairs) => el("div", {
-    class: "kv"
-  }, pairs.map(([k, v]) => [
-    el("span", {
-      class: "k"
-    }, k),
-    el("span", {
-      class: "v"
-    }, v)
-  ]));
-  host.append(el("div", {
-    class: "section panel"
-  }, el("div", {
-    class: "subhead"
-  }, "store file"), kv([
-    [
-      "path",
-      m.path ?? ""
-    ],
-    [
-      "size",
-      ((m.size_bytes ?? 0) / 1e6).toFixed(1) + " MB"
-    ],
-    [
-      "schema version",
-      m.schema_version ?? 0
-    ]
-  ])));
-  host.append(el("div", {
-    class: "section panel"
-  }, el("div", {
-    class: "subhead"
-  }, "lexical index"), m.lexical ? kv([
-    [
-      "values",
-      m.lexical.values.toLocaleString()
-    ],
-    [
-      "tables",
-      m.lexical.tables
-    ],
-    [
-      "indexed columns",
-      m.lexical.columns
-    ],
-    [
-      "channels",
-      "exact \xB7 bm25 \xB7 trigram"
-    ]
-  ]) : el("div", {
-    class: "empty"
-  }, "\u2014 not built; starts with stemma-server registration")));
-  const reg = el("div", {
-    class: "section panel"
-  }, el("div", {
-    class: "subhead"
-  }, "model registry"));
-  const registry = m.model_registry ?? [];
-  if (registry.length) {
-    reg.append(el("div", {
-      class: "table-scroll"
-    }, el("table", {
-      class: "grid"
-    }, el("thead", null, el("tr", null, Object.keys(registry[0]).map((c) => el("th", null, c)))), el("tbody", null, registry.map((r) => el("tr", null, Object.values(r).map((v) => el("td", null, v))))))));
-  } else {
-    reg.append(el("div", {
-      class: "empty"
-    }, "\u2014 no vector tables yet \xB7 the dense channel lands in milestone 3"));
-  }
-  host.append(reg);
-  host.append(el("div", {
-    class: "section panel"
-  }, el("div", {
-    class: "subhead"
-  }, "embed queue"), kv([
-    [
-      "pending",
-      m.embed_queue ?? 0
-    ]
-  ])));
-}
-function viewSql(host) {
-  setCrumbs("sql");
-  const box = el("textarea", {
-    class: "input sqlbox mono",
-    placeholder: "SELECT \u2026"
-  }, "SELECT src_table, src_column, count(*) AS n\nFROM lex_values GROUP BY 1, 2 ORDER BY n DESC");
-  const out = el("div", null);
-  const run = async () => {
-    out.replaceChildren(el("div", {
-      class: "empty"
-    }, "running\u2026"));
-    try {
-      const r = await fetch(`/api/db/${state.db}/sql`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          sql: box.value
-        })
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail ?? r.statusText);
-      out.replaceChildren(el("div", {
-        class: "sql-caption"
-      }, `${d.rows.length} row${d.rows.length === 1 ? "" : "s"}${d.truncated ? " (truncated)" : ""} \xB7 ${d.elapsed_ms} ms`), el("div", {
-        class: "table-scroll"
-      }, el("table", {
-        class: "grid"
-      }, el("thead", null, el("tr", null, d.columns.map((c) => el("th", null, c)))), el("tbody", null, d.rows.map((row) => el("tr", null, row.map((v) => el("td", null, v === null ? "\u2205" : v))))))));
-    } catch (e) {
-      out.replaceChildren(el("div", {
-        class: "sql-error"
-      }, e.message));
-    }
-  };
-  box.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") run();
   });
-  host.append(el("h1", {
-    class: "h1"
-  }, "sql"), el("div", {
+  for (const k of KIND_TOGGLES) {
+    const n = g.nodes.filter((x) => x.kind === k).length;
+    if (!n) continue;
+    const chip = el("button", {
+      class: "chip" + (shown.has(k) ? "" : " off"),
+      onclick: () => {
+        if (shown.has(k)) shown.delete(k);
+        else shown.add(k);
+        chip.classList.toggle("off");
+        draw();
+      }
+    }, `${k}s \xB7 ${n}`);
+    legend.append(chip);
+  }
+  legend.append(el("span", {
     class: "sql-caption"
-  }, "read-only \xB7 main = the .stemmadb store \xB7 src = the user database \xB7 ctrl-enter runs"), box, el("div", {
-    style: "margin-top:8px"
-  }, el("button", {
-    class: "btn accent",
-    onclick: run
-  }, "run")), out);
+  }, "solid = declared \xB7 dashed amber = inferred \xB7 click a table for data, a term to query"));
+  host.append(legend, panel);
+  draw();
+  function draw() {
+    panel.replaceChildren();
+    const nodes = g.nodes.filter((n) => shown.has(n.kind));
+    const keys = new Set(nodes.map((n) => n.key));
+    const edges = g.edges.filter((e) => keys.has(e.source) && keys.has(e.target));
+    if (!nodes.length) {
+      panel.append(el("div", {
+        class: "empty"
+      }, "\u2014 nothing to show"));
+      return;
+    }
+    const tables = nodes.filter((n) => n.kind === "table");
+    const W = 1e3, H = Math.max(560, 200 + 44 * Math.sqrt(nodes.length) * 2);
+    const cx = W / 2, cy = H / 2;
+    const pos = /* @__PURE__ */ new Map();
+    const R1 = tables.length > 1 ? Math.min(cx, cy) * 0.42 : 0;
+    tables.forEach((n, i) => {
+      const a = 2 * Math.PI * i / tables.length - Math.PI / 2;
+      pos.set(n.key, {
+        x: cx + R1 * Math.cos(a),
+        y: cy + R1 * Math.sin(a)
+      });
+    });
+    const childrenOf = (parentKey, kinds) => edges.filter((e) => e.source === parentKey && kinds.includes(nodes.find((n) => n.key === e.target)?.kind ?? "")).map((e) => e.target);
+    for (const t of tables) {
+      const p = pos.get(t.key);
+      const away = Math.atan2(p.y - cy, p.x - cx);
+      const base = tables.length > 1 ? away : -Math.PI / 2;
+      const kids = [
+        ...childrenOf(t.key, [
+          "column"
+        ]),
+        ...childrenOf(t.key, [
+          "term"
+        ])
+      ];
+      kids.forEach((k, i) => {
+        const spread = tables.length === 1 ? 2 * Math.PI * (1 - 1 / Math.max(2, kids.length)) : Math.min(2.4, 0.42 * kids.length);
+        const a = base + (kids.length === 1 ? 0 : (i / (kids.length - 1) - 0.5) * spread);
+        const r = tables.length > 1 ? 150 : 210;
+        pos.set(k, {
+          x: p.x + r * Math.cos(a),
+          y: p.y + r * Math.sin(a)
+        });
+        for (const [j, v] of childrenOf(k, [
+          "value"
+        ]).entries()) {
+          pos.set(v, {
+            x: p.x + (r + 110) * Math.cos(a + (j - 0.5) * 0.18),
+            y: p.y + (r + 110) * Math.sin(a + (j - 0.5) * 0.18)
+          });
+        }
+      });
+    }
+    const svg = svgEl("svg", {
+      class: "graph-svg",
+      viewBox: `0 0 ${W} ${H}`,
+      role: "img",
+      "aria-label": "knowledge graph"
+    });
+    svg.append(svgEl("defs", null, svgEl("marker", {
+      id: "arrow",
+      viewBox: "0 0 8 8",
+      refX: 7,
+      refY: 4,
+      markerWidth: 6,
+      markerHeight: 6,
+      orient: "auto"
+    }, svgEl("path", {
+      d: "M 0 0 L 8 4 L 0 8 z",
+      fill: "var(--flat)"
+    }))));
+    for (const e of edges) {
+      const a = pos.get(e.source), b = pos.get(e.target);
+      if (!a || !b) continue;
+      const bend = e.kind === "fk" || e.kind === "inferred_fk" ? 0.12 : 0.02;
+      const mx = (a.x + b.x) / 2 + (a.y - b.y) * bend;
+      const my = (a.y + b.y) / 2 + (b.x - a.x) * bend;
+      const path = svgEl("path", {
+        class: `gedge kind-${e.kind}`,
+        d: `M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}`,
+        ...e.kind === "fk" || e.kind === "inferred_fk" ? {
+          "marker-end": "url(#arrow)"
+        } : {}
+      });
+      if (e.label || e.kind === "inferred_fk") {
+        const conf = e.props.confidence;
+        hov(path, `<b>${esc(e.kind)}</b> ${esc(e.label)}` + (conf !== void 0 ? ` \xB7 confidence ${conf}` : ""));
+      }
+      svg.append(path);
+      if (e.kind === "fk" || e.kind === "inferred_fk") {
+        svg.append(svgEl("text", {
+          class: "gedge-label",
+          x: mx,
+          y: my,
+          "text-anchor": "middle"
+        }, e.label));
+      }
+    }
+    for (const n of nodes) {
+      const p = pos.get(n.key);
+      if (!p) continue;
+      const small = n.kind === "value" || n.kind === "term";
+      const w = Math.max(small ? 54 : 90, n.label.length * (small ? 6.4 : 8) + 22);
+      const h = small ? 22 : n.kind === "column" ? 26 : 40;
+      const grp = svgEl("g", {
+        class: `gnode kind-${n.kind}`,
+        transform: `translate(${p.x - w / 2}, ${p.y - h / 2})`,
+        cursor: "pointer"
+      }, svgEl("rect", {
+        width: w,
+        height: h,
+        rx: 4
+      }));
+      if (n.kind === "table") {
+        grp.append(svgEl("text", {
+          x: w / 2,
+          y: 17,
+          "text-anchor": "middle"
+        }, n.label), svgEl("text", {
+          class: "grows",
+          x: w / 2,
+          y: 31,
+          "text-anchor": "middle"
+        }, `~${Number(n.props.rows ?? 0).toLocaleString()} rows`));
+      } else {
+        grp.append(svgEl("text", {
+          x: w / 2,
+          y: h / 2 + 3.5,
+          "text-anchor": "middle"
+        }, n.label));
+      }
+      grp.addEventListener("click", () => {
+        if (n.kind === "table") location.hash = "#/data/" + encodeURIComponent(n.label);
+        else if (n.kind === "term" || n.kind === "value") {
+          location.hash = "#/query?d=nl&q=" + encodeURIComponent(n.label);
+        }
+      });
+      hov(grp, `<b>${esc(n.label)}</b> \xB7 ${esc(n.kind)}<br>` + esc(JSON.stringify(n.props)));
+      svg.append(grp);
+    }
+    panel.append(svg);
+  }
 }
 async function route() {
-  const hash = location.hash || "#/resolve";
+  const hash = location.hash || "#/query";
   const [path, qs] = hash.slice(2).split("?");
   const [view, arg] = path.split("/");
   const params = new URLSearchParams(qs ?? "");
-  state.view = view || "resolve";
+  const mapped = view === "resolve" ? "query" : view === "sql" ? "query" : view || "query";
+  if (view === "sql") params.set("d", "sql");
+  state.view = mapped;
   document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("on", a.dataset.view === state.view));
   if (!state.schema && state.db) {
     try {
@@ -684,9 +1068,8 @@ async function route() {
   try {
     if (state.view === "data") await viewData(host, params, arg ? decodeURIComponent(arg) : void 0);
     else if (state.view === "graph") await viewGraph(host);
-    else if (state.view === "store") await viewStore(host);
-    else if (state.view === "sql") viewSql(host);
-    else viewResolve(host, params);
+    else if (state.view === "chat") viewChat(host);
+    else viewQuery(host, params);
   } catch (e) {
     host.append(el("div", {
       class: "sql-error"
@@ -694,15 +1077,16 @@ async function route() {
   }
 }
 (async function boot() {
-  initTheme();
+  initPickers();
   const cfg = await getJSON("/api/config");
+  state.cfg = cfg;
   state.dbs = cfg.databases;
   state.db = cfg.databases[0] ?? null;
   document.getElementById("topsearch").addEventListener("keydown", (ev) => {
     const e = ev;
     const target = ev.target;
     if (e.key === "Enter" && target.value.trim()) {
-      location.hash = "#/resolve?q=" + encodeURIComponent(target.value);
+      location.hash = "#/query?d=nl&q=" + encodeURIComponent(target.value);
     }
   });
   globalThis.addEventListener("hashchange", route);

@@ -22,23 +22,35 @@ gRPC.
 
 ## Views
 
-- **resolve** — the search bar + trajectory: query line with mention spans
-  wired to candidate lanes; per-channel chips (exact / bm25 / trigram) with
-  ranks; score meters; rejected candidates stay visible with their reject
-  reason; the "spans considered" ledger lists everything else that was tried.
-- **data** — table browser with pagination, straight from the user DB.
-- **graph** — the knowledge graph, schema layer: tables as entities, declared
-  foreign keys as relations (the instance layer arrives with stemma-kg).
-- **store** — inside the `.stemmadb` sidecar: lexical index stats, model
-  registry, embed queue.
-- **sql** — read-only console over `main` (the store) + `src` (the user DB).
+- **query** — one view, two dialects behind a toggle. *natural*: the top-center
+  search bar + trajectory — query line with mention spans wired to candidate
+  lanes, per-channel chips (exact / bm25 / trigram / kg), score meters, marked
+  document snippets, rejected candidates kept visible with their reject
+  reason, and the "spans considered" ledger. example queries are mined from
+  the database's own knowledge graph. *sql*: read-only console over `main`
+  (the store) + `src` (the user DB) — every query ships with its
+  EXPLAIN QUERY PLAN tree (full scans flagged in caution).
+- **chat** — talk to the data by proxy: any OpenAI-compatible model
+  (`--lm-endpoint http://host:port/v1 --lm-model <name>`, bearer via
+  `LM_API_KEY`) is given resolve/sql/schema as tools and must pin every
+  mention through stemma before querying. every tool call renders in the
+  transcript, collapsible.
+- **data** — table browser with keyset pagination (no OFFSET degradation on
+  big tables) and a substring filter served by the store's trigram index.
+- **graph** — the compiled knowledge graph: schema layer, discovered
+  relations (inclusion-mined joins, dashed with confidence), and the profile
+  layer (frequent values, characteristic terms, co-occurrence). tables click
+  through to data; terms and values click through to a query.
+- the former store tab lives in the sidebar: size, lexical values, kg
+  nodes/edges, embed queue, vector tables — always in view.
 
 ## Design
 
 Follows the zicato design language: sixteen terminal-derived themes over
-fixed semantic role tokens (default `paper`; picker in the top bar), sans
-for prose and controls with mono reserved for data, hairline borders instead
-of shadows, one accent color earned by structure. All tokens live in
+fixed semantic role tokens (default `paper`) and the twelve-face typeface
+picker (technical / editorial / display groups, default T9), both in the top
+bar; sans for prose and controls with mono reserved for data, hairline
+borders instead of shadows, one accent color earned by structure. All tokens live in
 `static/ui.css`; no hex anywhere else.
 
 ## Development

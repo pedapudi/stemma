@@ -25,6 +25,14 @@ def main() -> None:
         metavar="NAME=PATH",
         help="database registration, matching stemma-server (repeatable)",
     )
+    ap.add_argument(
+        "--lm-endpoint",
+        default="",
+        help="OpenAI-compatible base URL for the chat view, e.g. http://host:8000/v1 "
+        "(vLLM, llama.cpp, LiteLLM, hosted compatibility endpoints). "
+        "Bearer token via env LM_API_KEY.",
+    )
+    ap.add_argument("--lm-model", default="", help="model name for --lm-endpoint")
     args = ap.parse_args()
 
     dbs = {}
@@ -36,8 +44,19 @@ def main() -> None:
     if not dbs:
         ap.error("at least one --db name=path is required")
 
+    lm_cfg = None
+    if args.lm_endpoint and args.lm_model:
+        from lm import LmConfig
+
+        lm_cfg = LmConfig(args.lm_endpoint, args.lm_model)
+
     host, _, port = args.listen.partition(":")
-    uvicorn.run(create_app(dbs, args.grpc), host=host, port=int(port or 8600), log_level="info")
+    uvicorn.run(
+        create_app(dbs, args.grpc, lm_cfg),
+        host=host,
+        port=int(port or 8600),
+        log_level="info",
+    )
 
 
 if __name__ == "__main__":

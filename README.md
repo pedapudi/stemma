@@ -1,3 +1,13 @@
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/mark-dark.svg">
+    <img alt="stemma" src="assets/brand/mark.svg" width="48">
+  </picture>
+</p>
+
+<sub>witness branches fanning from one stem, converging on the lost archetype —
+the accent dot is the referent. <a href="docs/brand.md">brand</a></sub>
+
 # stemma
 
 Extract the entities referenced in a natural-language query and resolve them to

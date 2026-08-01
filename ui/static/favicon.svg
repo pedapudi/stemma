@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+     class="stemma-favicon" role="img" aria-label="stemma">
+  <title>stemma</title>
+  <!-- the 16px form. the contamination ticks are dropped (they collapse into the
+       branches below ~20px), the three strokes thicken to 2.4, the branches are
+       pulled wider and the apex drops to y=9 so the enlarged dot sits tangent to
+       it rather than merging with the stem. one dot, still the only color. -->
+  <style>
+    .stemma-favicon { color: #15181C; --brand-accent: #2FA46A; }
+    @media (prefers-color-scheme: dark) {
+      .stemma-favicon { color: #EDEFEA; --brand-accent: #3FB87A; }
+    }
+  </style>
+  <g fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 21 C3 13.5 8.5 13 12 9"/>
+    <path d="M12 21 L12 9"/>
+    <path d="M21 21 C21 13.5 15.5 13 12 9"/>
+  </g>
+  <circle cx="12" cy="4.8" r="3" fill="var(--brand-accent, #2FA46A)"/>
+</svg>

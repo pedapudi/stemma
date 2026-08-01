@@ -2,8 +2,9 @@
 
 A thin FastAPI layer over the stemmadb client library: browsing and metadata
 come from StoreBrowser (direct read-only SQLite), resolution and the query
-trajectory come from StemmaClient (gRPC to stemma-server). Nothing in the
-core depends on this process; run it only when you want the console.
+trajectory come from StemmaClient (gRPC to stemma-server), and the
+conversational layer drives any OpenAI-compatible LM through resolve/sql/schema
+tools. Nothing in the core depends on this process.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from pydantic import BaseModel
 
 from stemmadb import StemmaClient, StoreBrowser
 
+import lm as lm_mod
+
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
@@ -26,7 +29,15 @@ class SqlRequest(BaseModel):
     sql: str
 
 
-def create_app(dbs: dict[str, str], grpc_target: str) -> FastAPI:
+class ChatRequest(BaseModel):
+    messages: list[dict]
+
+
+def create_app(
+    dbs: dict[str, str],
+    grpc_target: str,
+    lm_cfg: lm_mod.LmConfig | None = None,
+) -> FastAPI:
     app = FastAPI(title="stemma console", docs_url=None, redoc_url=None)
     browsers = {name: StoreBrowser(path) for name, path in dbs.items()}
     client = StemmaClient(grpc_target)
@@ -39,7 +50,11 @@ def create_app(dbs: dict[str, str], grpc_target: str) -> FastAPI:
 
     @app.get("/api/config")
     def config():
-        return {"databases": sorted(dbs), "grpc": grpc_target}
+        return {
+            "databases": sorted(dbs),
+            "grpc": grpc_target,
+            "lm": {"endpoint": lm_cfg.endpoint, "model": lm_cfg.model} if lm_cfg else None,
+        }
 
     @app.get("/api/health")
     def health():
@@ -48,8 +63,6 @@ def create_app(dbs: dict[str, str], grpc_target: str) -> FastAPI:
             client.explain("", database=next(iter(sorted(dbs)), ""))
             ok = True
         except grpc.RpcError as e:
-            # NOT_FOUND means the server answered; anything transport-shaped
-            # means it didn't.
             ok = e.code() in (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.FAILED_PRECONDITION)
         return {"grpc": ok, "latency_ms": round((time.monotonic() - t0) * 1e3, 1)}
 
@@ -68,28 +81,40 @@ def create_app(dbs: dict[str, str], grpc_target: str) -> FastAPI:
         }
 
     @app.get("/api/db/{name}/rows/{table}")
-    def rows(name: str, table: str, limit: int = 50, offset: int = 0):
+    def rows(name: str, table: str, limit: int = 50, after: int | None = None, q: str = ""):
         try:
-            return browser(name).rows(table, limit=min(limit, 500), offset=max(offset, 0))
+            return browser(name).rows(table, limit=min(limit, 500), after=after, q=q)
         except ValueError as e:
             raise HTTPException(404, str(e)) from e
 
     @app.get("/api/db/{name}/graph")
     def graph(name: str):
-        return browser(name).schema_graph()
+        return browser(name).knowledge_graph()
 
     @app.get("/api/db/{name}/store")
     def store(name: str):
-        return browser(name).store_meta()
+        meta = browser(name).store_meta()
+        # KG stats ride along for the sidebar block.
+        try:
+            g = browser(name).knowledge_graph()
+            meta["kg"] = {"layer": g["layer"], "nodes": len(g["nodes"]), "edges": len(g["edges"])}
+        except Exception:
+            meta["kg"] = None
+        return meta
+
+    @app.get("/api/db/{name}/examples")
+    def examples(name: str):
+        return {"examples": browser(name).examples()}
 
     @app.post("/api/db/{name}/sql")
     def sql(name: str, req: SqlRequest):
         t0 = time.monotonic()
         try:
             out = browser(name).query(req.sql)
+            out["plan"] = browser(name).query_plan(req.sql)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
-        except Exception as e:  # sqlite errors -> readable message
+        except Exception as e:
             raise HTTPException(400, str(e)) from e
         out["elapsed_ms"] = round((time.monotonic() - t0) * 1e3, 1)
         return out
@@ -101,6 +126,39 @@ def create_app(dbs: dict[str, str], grpc_target: str) -> FastAPI:
             return client.explain_dict(q, database=name)
         except grpc.RpcError as e:
             raise HTTPException(502, f"stemma-server: {e.code().name}: {e.details()}") from e
+
+    @app.post("/api/db/{name}/chat")
+    def chat(name: str, req: ChatRequest):
+        if lm_cfg is None:
+            raise HTTPException(
+                503,
+                "no LM configured — start the console with --lm-endpoint/--lm-model "
+                "(any OpenAI-compatible endpoint: vLLM, llama.cpp, LiteLLM, …)",
+            )
+        b = browser(name)
+        try:
+            return lm_mod.chat(
+                lm_cfg,
+                name,
+                req.messages,
+                resolve_fn=lambda q: client.explain_dict(q, database=name),
+                sql_fn=lambda s: b.query(s),
+                schema_fn=lambda: {
+                    "tables": [
+                        {
+                            "name": t.name,
+                            "columns": [c.name for c in t.columns],
+                            "foreign_keys": [
+                                f"{fk.from_column} -> {fk.to_table}.{fk.to_column or 'id'}"
+                                for fk in t.foreign_keys
+                            ],
+                        }
+                        for t in b.schema()
+                    ]
+                },
+            )
+        except Exception as e:
+            raise HTTPException(502, f"LM endpoint: {e}") from e
 
     @app.get("/")
     def index():

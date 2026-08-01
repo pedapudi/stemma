@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 9 120 116" width="240" height="232"
+     role="img" aria-label="stemma" color="#15181C">
+  <title>stemma</title>
+  <!-- the display variant, for docs headers and covers. the same grammar
+       elaborated: seven witnesses instead of three, four contamination ticks
+       instead of two, hairline 1.2 strokes instead of 1.6. the base of each
+       branch steps up toward the outside, so the lower silhouette closes like a
+       leaf; every branch still converges on the one apex at (60, 42), and there
+       is still exactly one accent dot.
+       the color="" above is a FALLBACK for <img> use on light grounds; inline
+       hosts should drop it (or set `svg { color: inherit }`). -->
+  <g fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- seven witness branches, fanning from the stem like the veins of a leaf -->
+    <path d="M10 100 C10 66 41.2 61 60 42"/>
+    <path d="M26 108 C26 70 47.2 64 60 42"/>
+    <path d="M43 112 C43 71 53.6 65 60 42"/>
+    <path d="M60 114 C60 92 60 64 60 42"/>
+    <path d="M77 112 C77 71 66.4 65 60 42"/>
+    <path d="M94 108 C94 70 72.8 64 60 42"/>
+    <path d="M110 100 C110 66 78.8 61 60 42"/>
+    <!-- contamination: readings carried across between witnesses -->
+    <path d="M33 90 L39 97"/>
+    <path d="M49 86 L55 93"/>
+    <path d="M71 86 L65 93"/>
+    <path d="M87 90 L81 97"/>
+  </g>
+  <circle cx="60" cy="32" r="9" fill="var(--brand-accent, #2FA46A)"/>
+</svg>

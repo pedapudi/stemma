@@ -29,6 +29,13 @@
 - [Python client](../clients/python/README.md) — `StemmaClient` (gRPC
   resolve/explain) and `StoreBrowser` (read-only file access).
 
+## Design
+
+- [Brand](brand.md) — the mark and its grammar, the wordmark, the one color
+  rule (`currentColor` strokes, the dot is the only colored element), clear
+  space and minimum sizes, and the voice/microcopy conventions. Assets live in
+  [`assets/brand/`](../assets/brand).
+
 ## For LLM agents
 
 The [skills/](../skills) directory contains task-oriented guides written for
