@@ -1104,242 +1104,265 @@ async function viewGraph(host: HTMLElement): Promise<void> {
     el("h1", { class: "h1" }, "knowledge graph"),
     el("p", { class: "lede" },
       g.layer === "compiled"
-        ? "compiled from the data: schema (tables, columns, declared keys), discovered relations (dashed — inclusion-mined joins with confidence), and the profile layer (frequent values, characteristic terms, term co-occurrence). instance-layer entities arrive with collective disambiguation."
+        ? "a map, not a scatter: each table anchors its columns, frequent values, characteristic terms (sized by pagerank centrality) and named entities. joins draw between tables — solid declared, dashed amber inferred. select anything to light its neighborhood; drag to pan, wheel to zoom."
         : "schema layer only — run stemma-server against this database once to compile the full graph."));
 
-  const detail = el("div", { class: "graph-detail", hidden: "" });
-  let selectedKey: string | null = null;
-  const shown = new Set<string>(["table", ...KIND_TOGGLES]);
-  if (g.nodes.length > 160) shown.delete("column"); // big graphs start quieter
+  if (!g.nodes.length) {
+    host.append(el("div", { class: "empty" }, "— nothing compiled"));
+    return;
+  }
+
+  const byKey = new Map(g.nodes.map((n) => [n.key, n]));
+  const touching = (key: string) => g.edges.filter((e) => e.source === key || e.target === key);
+  const cent = (n: GraphNode) => Number((n.props as { centrality?: number }).centrality ?? 0);
+
+  const shown = new Set<string>(["column", "value", "term"]);
   const legend = el("div", { class: "graph-legend" });
-  const panel = el("div", { class: "panel" });
-  for (const k of KIND_TOGGLES) {
-    const n = g.nodes.filter((x) => x.kind === k).length;
-    if (!n) continue;
+  for (const k of ["column", "value", "term"]) {
+    const count = g.nodes.filter((x) => x.kind === k).length;
+    if (!count) continue;
     const chip = el("button", {
-      class: "chip" + (shown.has(k) ? "" : " off"),
+      class: "chip",
       onclick: () => {
         if (shown.has(k)) shown.delete(k);
         else shown.add(k);
         chip.classList.toggle("off");
-        draw();
+        render();
       },
-    }, `${k}s · ${n}`);
+    }, `${k}s · ${count}`);
     legend.append(chip);
   }
-  legend.append(el("span", { class: "sql-caption" },
-    "solid = declared · dashed amber = inferred · click a node to inspect it"));
-  host.append(legend, detail, panel);
-  draw();
+  const zoomSeg = el("span", { class: "seg", style: "margin-left:auto" },
+    el("button", { onclick: () => zoomBy(1 / 1.25) }, "−"),
+    el("button", { onclick: () => fit() }, "fit"),
+    el("button", { onclick: () => zoomBy(1.25) }, "+"));
+  legend.append(zoomSeg);
 
-  function draw(): void {
+  const detail = el("div", { class: "graph-detail", hidden: "" });
+  const wires = svgEl("svg", { class: "kg-wires", "aria-hidden": "true" });
+  const map = el("div", { class: "kg-map" });
+  const canvas = el("div", { class: "kg-canvas" }, wires, map);
+  const viewport = el("div", { class: "kg-viewport" }, canvas);
+  host.append(legend, detail, viewport);
+
+  let scale = 1, tx = 0, ty = 0;
+  let selectedKey: string | null = null;
+  const labelEls = new Map<string, HTMLElement>();
+
+  function applyTransform(): void {
+    canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  }
+
+  function zoomBy(f: number, cxv?: number, cyv?: number): void {
+    const rect = viewport.getBoundingClientRect();
+    const px = cxv ?? rect.width / 2, py = cyv ?? rect.height / 2;
+    const ns = Math.min(3, Math.max(0.35, scale * f));
+    // keep the point under the cursor stationary
+    tx = px - ((px - tx) / scale) * ns;
+    ty = py - ((py - ty) / scale) * ns;
+    scale = ns;
+    applyTransform();
+  }
+
+  function fit(): void {
+    scale = Math.min(1, (viewport.clientWidth - 24) / Math.max(1, canvas.scrollWidth));
+    tx = 0;
+    ty = 0;
+    applyTransform();
+  }
+
+  viewport.addEventListener("wheel", (e) => {
+    e.preventDefault();
     hideHover();
-    panel.replaceChildren();
-    const nodes = g.nodes.filter((n) => shown.has(n.kind));
-    const keys = new Set(nodes.map((n) => n.key));
-    const edges = g.edges.filter((e) => keys.has(e.source) && keys.has(e.target));
-    if (!nodes.length) {
-      panel.append(el("div", { class: "empty" }, "— nothing to show"));
-      return;
-    }
+    const rect = viewport.getBoundingClientRect();
+    zoomBy(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX - rect.left, e.clientY - rect.top);
+  }, { passive: false });
 
-    // radial tree: tables inner, their children fanned around them
-    const tables = nodes.filter((n) => n.kind === "table");
-    const W = tables.length > 1 ? 1560 : 1100;
-    const H = tables.length > 1 ? 1150 : 900;
-    const cx = W / 2, cy = H / 2;
-    const pos = new Map<string, { x: number; y: number }>();
-    const R1 = tables.length > 1 ? 300 : 0;
-    tables.forEach((n, i) => {
-      const a = (2 * Math.PI * i) / tables.length - Math.PI / 2;
-      pos.set(n.key, { x: cx + R1 * Math.cos(a), y: cy + R1 * Math.sin(a) });
-    });
-    // children fan out from their parent (leaf-vein layout)
-    const childrenOf = (parentKey: string, kinds: string[]) =>
-      edges
-        .filter((e) => e.source === parentKey &&
-          kinds.includes(nodes.find((n) => n.key === e.target)?.kind ?? ""))
-        .map((e) => e.target);
+  let drag: { x: number; y: number; tx: number; ty: number } | null = null;
+  viewport.addEventListener("pointerdown", (e) => {
+    if ((e.target as HTMLElement).closest(".kg-label, .kg-tablebox, button")) return;
+    drag = { x: e.clientX, y: e.clientY, tx, ty };
+    viewport.classList.add("dragging");
+    viewport.setPointerCapture(e.pointerId);
+  });
+  viewport.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    hideHover();
+    tx = drag.tx + (e.clientX - drag.x);
+    ty = drag.ty + (e.clientY - drag.y);
+    applyTransform();
+  });
+  viewport.addEventListener("pointerup", () => {
+    drag = null;
+    viewport.classList.remove("dragging");
+  });
+
+  function render(): void {
+    hideHover();
+    labelEls.clear();
+    map.replaceChildren();
+    const tables = g.nodes.filter((n) => n.kind === "table");
     for (const t of tables) {
-      const p = pos.get(t.key)!;
-      const away = Math.atan2(p.y - cy, p.x - cx);
-      const base = tables.length > 1 ? away : -Math.PI / 2;
-      const kids = [
-        ...childrenOf(t.key, ["column"]),
-        ...childrenOf(t.key, ["term"]),
-      ];
-      // children fill concentric sub-rings of the fan: each ring holds as
-      // many ~90px label slots as its arc affords, overflow steps outward —
-      // bounded radius no matter the brood size.
-      const spread = tables.length === 1
-        ? 2 * Math.PI * (1 - 1 / Math.max(2, kids.length))
-        : Math.min(3.0, 0.5 * kids.length);
-      let placed = 0, ring = 0;
-      while (placed < kids.length) {
-        const r = (tables.length > 1 ? 175 : 215) + ring * 62;
-        const cap = Math.max(6, Math.floor((spread * r) / 92));
-        const batch = kids.slice(placed, placed + cap);
-        batch.forEach((k, i) => {
-          const a = base + (batch.length === 1
-            ? 0
-            : (i / (batch.length - 1) - 0.5) * spread);
-          pos.set(k, { x: p.x + r * Math.cos(a), y: p.y + r * Math.sin(a) });
-          for (const [j, v] of childrenOf(k, ["value"]).entries()) {
-            pos.set(v, {
-              x: p.x + (r + 105) * Math.cos(a + (j - 0.5) * 0.16),
-              y: p.y + (r + 105) * Math.sin(a + (j - 0.5) * 0.16),
-            });
-          }
+      const cell = el("div", { class: "kg-cell" });
+      const header = el("div", {
+        class: "kg-tablebox kg-label",
+        "data-key": t.key,
+        onclick: (e: Event) => {
+          e.stopPropagation();
+          select(t);
+        },
+      },
+        el("span", { class: "kg-tablename" }, t.label),
+        el("span", { class: "kg-tablerows" },
+          `~${Number((t.props as { rows?: number }).rows ?? 0).toLocaleString()} rows`));
+      labelEls.set(t.key, header);
+      cell.append(header);
+
+      const kids = touching(t.key)
+        .filter((e) => e.source === t.key)
+        .map((e) => byKey.get(e.target))
+        .filter((n): n is GraphNode => !!n);
+      const columns = kids.filter((n) => n.kind === "column");
+      const terms = g.nodes
+        .filter((n) => n.kind === "term" && n.key.startsWith(`term:${t.label}:`))
+        .sort((a, b) => cent(b) - cent(a));
+      const phrases = g.nodes
+        .filter((n) => n.kind === "term" && n.key.startsWith(`phrase:${t.label}:`))
+        .sort((a, b) => cent(b) - cent(a));
+      const values = g.nodes.filter(
+        (n) => n.kind === "value" && n.key.startsWith(`value:${t.label}.`));
+
+      const section = (title: string, cls: string, nodes: GraphNode[],
+        style?: (n: GraphNode) => string) => {
+        if (!nodes.length) return;
+        cell.append(el("div", { class: "subhead kg-subhead" }, title));
+        const flow = el("div", { class: "kg-flow" });
+        for (const n of nodes) {
+          const lab = el("span", {
+            class: `kg-label ${cls}`,
+            "data-key": n.key,
+            style: style?.(n) ?? null,
+            onclick: (e: Event) => {
+              e.stopPropagation();
+              select(n);
+            },
+          }, n.label);
+          hov(lab, `<b>${esc(n.label)}</b> · ${esc(n.kind)}<br>` +
+            Object.entries(n.props).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(" · "));
+          labelEls.set(n.key, lab);
+          flow.append(lab);
+        }
+        cell.append(flow);
+      };
+
+      if (shown.has("column")) section("columns", "kg-col", columns);
+      if (shown.has("value")) section("frequent values", "kg-value", values);
+      if (shown.has("term")) {
+        section("characteristic terms · pagerank", "kg-term", terms, (n) => {
+          const size = 10.5 + Math.min(5, Math.sqrt(cent(n)) * 26);
+          return `font-size: calc(${size.toFixed(1)}px * var(--fs))`;
         });
-        placed += batch.length;
-        ring += 1;
+        section("named entities", "kg-phrase", phrases);
       }
+      map.append(cell);
     }
+    requestAnimationFrame(drawWires);
+    if (selectedKey && byKey.has(selectedKey)) select(byKey.get(selectedKey)!, true);
+  }
 
-    const svg = svgEl("svg", {
-      class: "graph-svg",
-      viewBox: `0 0 ${W} ${H}`,
-      role: "img",
-      "aria-label": "knowledge graph",
-    });
-    svg.append(svgEl("defs", null,
-      svgEl("marker", {
-        id: "arrow", viewBox: "0 0 8 8", refX: 7, refY: 4,
-        markerWidth: 6, markerHeight: 6, orient: "auto",
-      }, svgEl("path", { d: "M 0 0 L 8 4 L 0 8 z", fill: "var(--flat)" }))));
+  /* content-space anchor of a label, independent of pan/zoom */
+  function anchor(elm: HTMLElement): { x: number; y: number; top: number } {
+    const r = elm.getBoundingClientRect();
+    const c = canvas.getBoundingClientRect();
+    return {
+      x: (r.left + r.width / 2 - c.left) / scale,
+      y: (r.bottom - c.top) / scale,
+      top: (r.top - c.top) / scale,
+    };
+  }
 
-    const edgeEls: { el: SVGElement; e: GraphEdge }[] = [];
-    for (const e of edges) {
-      const a = pos.get(e.source), b = pos.get(e.target);
+  function drawWires(): void {
+    wires.replaceChildren();
+    wires.setAttribute("viewBox", `0 0 ${canvas.scrollWidth} ${canvas.scrollHeight}`);
+    wires.setAttribute("width", String(canvas.scrollWidth));
+    wires.setAttribute("height", String(canvas.scrollHeight));
+    // joins between tables, always visible
+    for (const e of g.edges.filter((x) => x.kind === "fk" || x.kind === "inferred_fk")) {
+      const a = labelEls.get(e.source), b = labelEls.get(e.target);
       if (!a || !b) continue;
-      const bend = e.kind === "fk" || e.kind === "inferred_fk" ? 0.12 : 0.02;
-      const mx = (a.x + b.x) / 2 + (a.y - b.y) * bend;
-      const my = (a.y + b.y) / 2 + (b.x - a.x) * bend;
+      const pa = anchor(a), pb = anchor(b);
       const path = svgEl("path", {
         class: `gedge kind-${e.kind}`,
-        d: `M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}`,
-        ...(e.kind === "fk" || e.kind === "inferred_fk" ? { "marker-end": "url(#arrow)" } : {}),
+        d: `M ${pa.x} ${pa.y} C ${pa.x} ${pa.y + 46}, ${pb.x} ${pb.top - 46}, ${pb.x} ${pb.top}`,
       });
-      if (e.label || e.kind === "inferred_fk") {
-        const conf = (e.props as { confidence?: number }).confidence;
-        hov(path, `<b>${esc(e.kind)}</b> ${esc(e.label)}` +
-          (conf !== undefined ? ` · confidence ${conf}` : ""));
-      }
-      edgeEls.push({ el: path, e });
-      svg.append(path);
-      if (e.kind === "fk" || e.kind === "inferred_fk") {
-        svg.append(svgEl("text", {
-          class: "gedge-label", x: mx, y: my, "text-anchor": "middle",
-        }, e.label));
-      }
+      hov(path, `<b>${esc(e.kind)}</b> ${esc(e.label)}`);
+      wires.append(path);
     }
-
-    const nodeEls = new Map<string, SVGElement>();
-    for (const n of nodes) {
-      const p = pos.get(n.key);
-      if (!p) continue;
-      const boxed = n.kind === "table" || n.kind === "column";
-      let grp: SVGElement;
-      if (boxed) {
-        const w = Math.max(90, n.label.length * 8 + 22);
-        const h = n.kind === "column" ? 26 : 40;
-        grp = svgEl("g", {
-          class: `gnode kind-${n.kind}`,
-          transform: `translate(${p.x - w / 2}, ${p.y - h / 2})`,
-          cursor: "pointer",
-        }, svgEl("rect", { width: w, height: h, rx: 4 }));
-        if (n.kind === "table") {
-          grp.append(
-            svgEl("text", { x: w / 2, y: 17, "text-anchor": "middle" }, n.label),
-            svgEl("text", { class: "grows", x: w / 2, y: 31, "text-anchor": "middle" },
-              `~${Number((n.props as { rows?: number }).rows ?? 0).toLocaleString()} rows`));
-        } else {
-          grp.append(svgEl("text", { x: w / 2, y: h / 2 + 3.5, "text-anchor": "middle" }, n.label));
-        }
-      } else {
-        // profile nodes are data-ink, not chrome: a dot and a mono label,
-        // no box (values italic, terms roman). The dot's area carries the
-        // node's PageRank centrality — importance you can see.
-        const c = Number((n.props as { centrality?: number }).centrality ?? 0);
-        const r = Math.min(6, 2.2 + Math.sqrt(c) * 14);
-        grp = svgEl("g", {
-          class: `gnode kind-${n.kind}`,
-          transform: `translate(${p.x}, ${p.y})`,
-          cursor: "pointer",
-        },
-          svgEl("circle", { r, cx: 0, cy: 0 }),
-          svgEl("text", { x: 0, y: 15 + r, "text-anchor": "middle" }, n.label));
-      }
-      grp.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        select(n, grp);
-      });
-      hov(grp, `<b>${esc(n.label)}</b> · ${esc(n.kind)}`);
-      nodeEls.set(n.key, grp);
-      svg.append(grp);
-    }
-    svg.addEventListener("click", () => select(null, null));
-    panel.append(svg);
+    // the selected node's neighborhood
     if (selectedKey) {
-      const n = nodes.find((x) => x.key === selectedKey);
-      const gel = n && nodeEls.get(selectedKey);
-      if (n && gel) select(n, gel);
-      else select(null, null);
-    }
-
-    /* selection: the one emphasis. The node and its edges take the accent,
-     * and the detail strip offers explicit actions — clicking never
-     * navigates by surprise. */
-    function select(n: GraphNode | null, gel: SVGElement | null): void {
-      hideHover();
-      nodeEls.forEach((x) => x.classList.remove("sel"));
-      edgeEls.forEach(({ el: x }) => x.classList.remove("hot"));
-      if (!n || !gel) {
-        selectedKey = null;
-        detail.hidden = true;
-        return;
-      }
-      selectedKey = n.key;
-      gel.classList.add("sel");
-      const touching = edgeEls.filter(({ e }) => e.source === n.key || e.target === n.key);
-      touching.forEach(({ el: x }) => x.classList.add("hot"));
-
-      detail.hidden = false;
-      detail.replaceChildren(
-        el("span", { class: "kindtag" }, n.kind),
-        el("span", { class: "name" }, n.label),
-        el("span", { class: "props" },
-          Object.entries(n.props).map(([k, v]) => `${k} ${v}`).join(" · ") || "—"),
-        el("span", { class: "props" },
-          `${touching.length} edge${touching.length === 1 ? "" : "s"}`),
-      );
-      if (n.kind === "table") {
-        detail.append(el("button", {
-          class: "btn accent",
-          onclick: () => {
-            location.hash = "#/data/" + encodeURIComponent(n.label);
-          },
-        }, "browse data →"));
-      } else if (n.kind === "term" || n.kind === "value") {
-        const neighbors = touching
-          .filter(({ e }) => e.kind === "cooccurs")
-          .map(({ e }) => {
-            const other = e.source === n.key ? e.target : e.source;
-            return g.nodes.find((x) => x.key === other)?.label ?? "";
-          })
-          .filter(Boolean);
-        if (neighbors.length) {
-          detail.append(el("span", { class: "props" }, `co-occurs: ${neighbors.join(" · ")}`));
+      const sel = labelEls.get(selectedKey);
+      if (sel) {
+        const ps = anchor(sel);
+        for (const e of touching(selectedKey)) {
+          const otherKey = e.source === selectedKey ? e.target : e.source;
+          const other = labelEls.get(otherKey);
+          if (!other) continue;
+          const po = anchor(other);
+          wires.append(svgEl("path", {
+            class: "gedge hot",
+            d: `M ${ps.x} ${ps.y} C ${ps.x} ${ps.y + 34}, ${po.x} ${po.top - 34}, ${po.x} ${po.top}`,
+          }));
         }
-        detail.append(el("button", {
-          class: "btn accent",
-          onclick: () => {
-            location.hash = "#/query?d=nl&q=" + encodeURIComponent(n.label);
-          },
-        }, `resolve “${n.label}” →`));
       }
     }
   }
+
+  viewport.addEventListener("click", () => select(null));
+
+  function select(n: GraphNode | null, keep = false): void {
+    hideHover();
+    for (const elm of labelEls.values()) elm.classList.remove("sel", "hood");
+    if (!n) {
+      if (!keep) selectedKey = null;
+      detail.hidden = true;
+      drawWires();
+      return;
+    }
+    selectedKey = n.key;
+    labelEls.get(n.key)?.classList.add("sel");
+    const around = touching(n.key);
+    for (const e of around) {
+      const otherKey = e.source === n.key ? e.target : e.source;
+      labelEls.get(otherKey)?.classList.add("hood");
+    }
+    detail.hidden = false;
+    detail.replaceChildren(
+      el("span", { class: "kindtag" }, n.kind),
+      el("span", { class: "name" }, n.label),
+      el("span", { class: "props" },
+        Object.entries(n.props).map(([k, v]) => `${k} ${v}`).join(" · ") || "—"),
+      el("span", { class: "props" }, `${around.length} edge${around.length === 1 ? "" : "s"}`),
+    );
+    if (n.kind === "table") {
+      detail.append(el("button", {
+        class: "btn accent",
+        onclick: () => {
+          location.hash = "#/data/" + encodeURIComponent(n.label);
+        },
+      }, "browse data →"));
+    } else if (n.kind === "term" || n.kind === "value") {
+      detail.append(el("button", {
+        class: "btn accent",
+        onclick: () => {
+          location.hash = "#/query?d=nl&q=" + encodeURIComponent(n.label);
+        },
+      }, `resolve "${n.label}" →`));
+    }
+    drawWires();
+  }
+
+  render();
+  requestAnimationFrame(fit);
 }
 
 /* ---------- router ---------- */
