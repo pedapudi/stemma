@@ -23,6 +23,15 @@ Same job here. Many surface forms, one referent.
 
 Early. Nothing to install yet.
 
+## Documentation
+
+- [docs/](docs/README.md) — user guide (setup, concepts, server, corpora),
+  a verified [walkthrough](docs/walkthrough.md), and the
+  [architecture](docs/architecture.md) with the literature review behind it
+- [crates/stemmadb/README.md](crates/stemmadb/README.md) — the storage layer
+- [skills/](skills/) — task recipes for LLM agents: set up stemmadb, build
+  corpora, run evals, contribute code
+
 ## Layout
 
 The design and the literature behind it are in
