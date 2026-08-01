@@ -5,3 +5,4 @@
 *.stemmadb
 *.stemmadb-wal
 *.stemmadb-shm
+/eval/careg/data/
