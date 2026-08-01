@@ -11,6 +11,67 @@ service ResolveService {
   // Resolve the entity mentions in a natural-language query against the
   // database identified by `database`.
   rpc Resolve(ResolveRequest) returns (ResolveResponse);
+
+  // Like Resolve, but returns the full resolution trajectory: every span
+  // considered, every candidate from every channel with its scores, and the
+  // reason each near-miss was not selected. The analogue of SQL EXPLAIN;
+  // drives the UI's query-plan view.
+  rpc Explain(ResolveRequest) returns (ExplainResponse);
+}
+
+// ---------- Explain (full trajectory) ----------
+
+message ExplainResponse {
+  string query = 1;
+  double elapsed_ms = 2;
+  repeated TraceToken tokens = 3;
+  // Every span enumerated, including skipped/rejected ones.
+  repeated TraceSpan spans = 4;
+  // Indices into `spans` of the spans selected as mentions, in query order.
+  repeated uint32 mentions = 5;
+}
+
+message TraceToken {
+  string text = 1;
+  // Byte offsets into `query`, end-exclusive.
+  uint32 start = 2;
+  uint32 end = 3;
+  bool stopword = 4;
+}
+
+message TraceChannelScore {
+  // "exact" | "bm25" | "trigram"
+  string channel = 1;
+  // Rank within this channel's results for the span (0 = best).
+  uint32 rank = 2;
+  // Channel-native score, larger = better.
+  double raw = 3;
+}
+
+message TraceCandidate {
+  string table = 1;
+  string column = 2;
+  int64 rowid = 3;
+  // Stored value (possibly truncated for transport).
+  string value = 4;
+  bool value_truncated = 5;
+  // Fused score in [0, 1].
+  double score = 6;
+  bool selected = 7;
+  // Why an unselected candidate lost: "below_threshold" | "outranked" |
+  // "span_not_selected". Empty for selected candidates.
+  string reject_reason = 8;
+  repeated TraceChannelScore channels = 9;
+}
+
+message TraceSpan {
+  uint32 id = 1;
+  string text = 2;
+  uint32 start = 3;
+  uint32 end = 4;
+  // "selected" | "overlapped" | "no_candidates" | "weak" | "skipped"
+  string status = 5;
+  repeated TraceCandidate candidates = 6;
 }
 
 message ResolveRequest {

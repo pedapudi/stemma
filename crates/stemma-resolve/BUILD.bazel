@@ -1,8 +1,24 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "stemma-resolve",
     srcs = ["src/lib.rs"],
     edition = "2021",
     visibility = ["//visibility:public"],
+    deps = [
+        "//crates/stemma-ingest",
+        "//crates/stemma-proto",
+        "//crates/stemmadb",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+        "@crates//:tracing",
+    ],
+)
+
+rust_test(
+    name = "stemma-resolve_test",
+    crate = ":stemma-resolve",
+    # The golden tests load the canonical mini corpus via include_str!.
+    compile_data = ["//eval/testdata:mini.sql"],
 )

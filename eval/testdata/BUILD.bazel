@@ -1,0 +1,2 @@
+# The canonical mini corpus — golden-test fixture for resolution.
+exports_files(["mini.sql"])

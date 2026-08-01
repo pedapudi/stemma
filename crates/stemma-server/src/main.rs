@@ -1,8 +1,8 @@
 //! stemma-server: gRPC front door for the Resolve API.
 //!
-//! Milestone-1 skeleton: serves ResolveService over tonic against a set of
-//! registered databases; the pipeline itself lands in later milestones, so
-//! Resolve currently returns an empty resolution for any query.
+//! Serves Resolve (selected mentions with evidence) and Explain (the full
+//! resolution trajectory, near-misses included) over tonic. On startup each
+//! registered database gets its lexical index built in the .stemmadb store.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use clap::Parser;
 use stemma_proto::v1::resolve_service_server::{ResolveService, ResolveServiceServer};
-use stemma_proto::v1::{ResolveRequest, ResolveResponse};
+use stemma_proto::v1::{ExplainResponse, ResolveRequest, ResolveResponse};
 use stemmadb::StemmaDb;
 use tonic::{Request, Response, Status};
 
@@ -46,6 +46,20 @@ struct Resolver {
     dbs: HashMap<String, Mutex<StemmaDb>>,
 }
 
+impl Resolver {
+    fn trace_for(&self, req: &ResolveRequest) -> Result<stemma_resolve::Trace, Status> {
+        let db = self
+            .dbs
+            .get(&req.database)
+            .ok_or_else(|| Status::not_found(format!("unknown database {:?}", req.database)))?;
+        let db = db.lock().expect("stemmadb lock poisoned");
+        stemma_resolve::resolve_lexical(&db, &req.query).map_err(|e| match e {
+            stemma_resolve::Error::IndexMissing => Status::failed_precondition(e.to_string()),
+            other => Status::internal(other.to_string()),
+        })
+    }
+}
+
 #[tonic::async_trait]
 impl ResolveService for Resolver {
     async fn resolve(
@@ -53,22 +67,26 @@ impl ResolveService for Resolver {
         request: Request<ResolveRequest>,
     ) -> Result<Response<ResolveResponse>, Status> {
         let req = request.into_inner();
-        let db = self
-            .dbs
-            .get(&req.database)
-            .ok_or_else(|| Status::not_found(format!("unknown database {:?}", req.database)))?;
-        // Touch the store so a broken registration fails loudly now rather
-        // than in milestone 2.
-        {
-            let db = db.lock().expect("stemmadb lock poisoned");
-            db.src_tables()
-                .map_err(|e| Status::internal(format!("stemmadb: {e}")))?;
-        }
-        tracing::debug!(query = %req.query, database = %req.database, "resolve (skeleton)");
-        Ok(Response::new(ResolveResponse {
-            mentions: vec![],
-            rewritten_query: String::new(),
-        }))
+        let trace = self.trace_for(&req)?;
+        tracing::debug!(
+            query = %req.query,
+            database = %req.database,
+            mentions = trace.mentions.len(),
+            elapsed_ms = trace.elapsed_ms,
+            "resolve"
+        );
+        Ok(Response::new(stemma_resolve::trace_to_proto(&trace)))
+    }
+
+    async fn explain(
+        &self,
+        request: Request<ResolveRequest>,
+    ) -> Result<Response<ExplainResponse>, Status> {
+        let req = request.into_inner();
+        let trace = self.trace_for(&req)?;
+        Ok(Response::new(stemma_resolve::trace_to_explain_proto(
+            &trace,
+        )))
     }
 }
 
@@ -82,11 +100,16 @@ async fn main() -> anyhow::Result<()> {
         let store = user_db.with_extension("stemmadb");
         let db = StemmaDb::open(&store, user_db)
             .with_context(|| format!("opening {name} ({})", user_db.display()))?;
+        let stats = stemma_ingest::build_lexical_index(&db, false)
+            .with_context(|| format!("indexing {name}"))?;
         tracing::info!(
             name,
             user_db = %user_db.display(),
             store = %store.display(),
             vec = db.vec_version().unwrap_or_default(),
+            values = stats.values,
+            indexed_ms = stats.elapsed_ms as u64,
+            rebuilt = stats.rebuilt,
             "database registered"
         );
         dbs.insert(name.clone(), Mutex::new(db));

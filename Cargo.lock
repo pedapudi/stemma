@@ -1121,6 +1121,12 @@ dependencies = [
 [[package]]
 name = "stemma-ingest"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "stemmadb",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "stemma-kg"
@@ -1142,6 +1148,15 @@ dependencies = [
 [[package]]
 name = "stemma-resolve"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "stemma-ingest",
+ "stemma-proto",
+ "stemmadb",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "stemma-server"
@@ -1149,7 +1164,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "stemma-ingest",
  "stemma-proto",
+ "stemma-resolve",
  "stemmadb",
  "tokio",
  "tonic",

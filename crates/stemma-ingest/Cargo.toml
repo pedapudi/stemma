@@ -3,3 +3,9 @@ name = "stemma-ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+stemmadb = { version = "0.1.0", path = "../stemmadb" }
+thiserror = "2.0.19"
+tracing = "0.1.44"

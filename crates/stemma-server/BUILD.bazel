@@ -6,7 +6,9 @@ rust_binary(
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/stemma-ingest",
         "//crates/stemma-proto",
+        "//crates/stemma-resolve",
         "//crates/stemmadb",
         "@crates//:anyhow",
         "@crates//:clap",

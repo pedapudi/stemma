@@ -1,8 +1,19 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "stemma-ingest",
     srcs = ["src/lib.rs"],
     edition = "2021",
     visibility = ["//visibility:public"],
+    deps = [
+        "//crates/stemmadb",
+        "@crates//:serde",
+        "@crates//:thiserror",
+        "@crates//:tracing",
+    ],
+)
+
+rust_test(
+    name = "stemma-ingest_test",
+    crate = ":stemma-ingest",
 )
