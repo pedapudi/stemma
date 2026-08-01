@@ -8,6 +8,7 @@ license.workspace = true
 anyhow = "1.0.104"
 clap = { version = "4.6.5", features = ["derive"] }
 stemma-ingest = { version = "0.1.0", path = "../stemma-ingest" }
+stemma-kg = { version = "0.1.0", path = "../stemma-kg" }
 stemma-proto = { version = "0.1.0", path = "../stemma-proto" }
 stemma-resolve = { version = "0.1.0", path = "../stemma-resolve" }
 stemmadb = { version = "0.1.0", path = "../stemmadb" }

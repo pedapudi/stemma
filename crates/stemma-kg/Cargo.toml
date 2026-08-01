@@ -3,3 +3,11 @@ name = "stemma-kg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+stemmadb = { version = "0.1.0", path = "../stemmadb" }
+thiserror = "2.0.19"
+tracing = "0.1.44"
+
+[dev-dependencies]
+stemma-ingest = { path = "../stemma-ingest" }

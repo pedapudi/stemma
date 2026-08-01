@@ -102,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("opening {name} ({})", user_db.display()))?;
         let stats = stemma_ingest::build_lexical_index(&db, false)
             .with_context(|| format!("indexing {name}"))?;
+        let kg = stemma_kg::compile(&db, false)
+            .with_context(|| format!("compiling knowledge graph for {name}"))?;
         tracing::info!(
             name,
             user_db = %user_db.display(),
@@ -110,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
             values = stats.values,
             indexed_ms = stats.elapsed_ms as u64,
             rebuilt = stats.rebuilt,
+            kg_nodes = kg.nodes,
+            kg_edges = kg.edges,
             "database registered"
         );
         dbs.insert(name.clone(), Mutex::new(db));

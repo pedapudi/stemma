@@ -24,6 +24,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// value a mention equals.
 pub const EXACT_MAX_LEN: usize = 120;
 
+/// Values at or above this length are classified as documents (`is_doc`):
+/// mentions resolve *into* them (BM25/snippet semantics) rather than *equal*
+/// them, and scoring must not punish them for their length.
+pub const DOC_MIN_LEN: usize = 200;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IndexStats {
     pub tables: usize,
@@ -47,7 +52,8 @@ CREATE TABLE IF NOT EXISTS lex_values (
     src_column TEXT NOT NULL,
     src_rowid  INTEGER NOT NULL,
     value      TEXT NOT NULL,
-    value_norm TEXT NOT NULL
+    value_norm TEXT NOT NULL,
+    is_doc     INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE INDEX IF NOT EXISTS lex_values_norm ON lex_values(value_norm);
 CREATE INDEX IF NOT EXISTS lex_values_src ON lex_values(src_table, src_rowid);
@@ -68,6 +74,29 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lex_trigram USING fts5(
 pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
     let start = std::time::Instant::now();
     let conn = db.conn();
+
+    // Older stores predate the is_doc column; the index is derived state, so
+    // shape changes are handled by dropping and rebuilding.
+    let has_is_doc: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('lex_values') WHERE name = 'is_doc'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let lex_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'lex_values'",
+        [],
+        |r| r.get(0),
+    )?;
+    let force = force || (lex_exists > 0 && has_is_doc == 0);
+    if lex_exists > 0 && has_is_doc == 0 {
+        conn.execute_batch(
+            "DROP TABLE lex_values;
+             DROP TABLE IF EXISTS lex_fts;
+             DROP TABLE IF EXISTS lex_trigram;",
+        )?;
+    }
     conn.execute_batch(LEX_SCHEMA)?;
 
     let existing: i64 = conn.query_row("SELECT count(*) FROM lex_values", [], |r| r.get(0))?;
@@ -92,13 +121,15 @@ pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
     for tc in &columns {
         // Identifiers come from sqlite_master/table_info, quoted defensively.
         let sql = format!(
-            "INSERT INTO lex_values (src_table, src_column, src_rowid, value, value_norm)
-             SELECT ?1, ?2, rowid, \"{col}\", lower(trim(\"{col}\"))
+            "INSERT INTO lex_values (src_table, src_column, src_rowid, value, value_norm, is_doc)
+             SELECT ?1, ?2, rowid, \"{col}\", lower(trim(\"{col}\")),
+                    length(\"{col}\") >= {doc_min}
              FROM {src}.\"{tbl}\"
              WHERE \"{col}\" IS NOT NULL AND trim(\"{col}\") != ''",
             col = tc.column,
             tbl = tc.table,
             src = SRC_SCHEMA,
+            doc_min = DOC_MIN_LEN,
         );
         values += conn.execute(&sql, stemmadb::rusqlite::params![tc.table, tc.column])?;
     }

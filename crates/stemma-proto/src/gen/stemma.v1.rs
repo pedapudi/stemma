@@ -62,6 +62,11 @@ pub struct TraceCandidate {
     pub reject_reason: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "9")]
     pub channels: ::prost::alloc::vec::Vec<TraceChannelScore>,
+    /// For document-shaped values: a match snippet with ⟨⟩ marking hit terms.
+    #[prost(string, tag = "10")]
+    pub snippet: ::prost::alloc::string::String,
+    #[prost(bool, tag = "11")]
+    pub is_doc: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraceSpan {
@@ -153,6 +158,13 @@ pub struct Candidate {
     pub score: f64,
     #[prost(message, repeated, tag = "6")]
     pub evidence: ::prost::alloc::vec::Vec<Evidence>,
+    /// For document-shaped values: a match snippet with ⟨⟩ marking hit terms.
+    #[prost(string, tag = "7")]
+    pub snippet: ::prost::alloc::string::String,
+    /// True when the stored value is a document the mention resolves into,
+    /// rather than a value it equals.
+    #[prost(bool, tag = "8")]
+    pub is_doc: bool,
 }
 /// Why a candidate is believed; every candidate carries at least one.
 #[derive(Clone, PartialEq, ::prost::Message)]

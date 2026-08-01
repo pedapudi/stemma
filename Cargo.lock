@@ -1131,6 +1131,12 @@ dependencies = [
 [[package]]
 name = "stemma-kg"
 version = "0.1.0"
+dependencies = [
+ "stemma-ingest",
+ "stemmadb",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "stemma-lm"
@@ -1165,6 +1171,7 @@ dependencies = [
  "anyhow",
  "clap",
  "stemma-ingest",
+ "stemma-kg",
  "stemma-proto",
  "stemma-resolve",
  "stemmadb",

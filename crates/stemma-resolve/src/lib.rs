@@ -78,6 +78,11 @@ pub struct Candidate {
     /// Why an unselected candidate lost: "below_threshold" | "outranked" |
     /// "span_not_selected".
     pub reject_reason: Option<String>,
+    /// True when the stored value is a document the mention resolves *into*
+    /// (BM25/snippet semantics) rather than a value it equals.
+    pub is_doc: bool,
+    /// FTS snippet with ⟨⟩ marking hit terms — document candidates only.
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +215,8 @@ struct RawHit {
     channel: &'static str,
     rank: usize,
     raw: f64,
+    is_doc: bool,
+    snippet: Option<String>,
 }
 
 fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
@@ -248,6 +255,8 @@ fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
                 channel: "exact",
                 rank,
                 raw: 1.0,
+                is_doc: false,
+                snippet: None,
             });
         }
     }
@@ -255,7 +264,8 @@ fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
     // Channels 2 & 3: BM25 token search and trigram fuzzy/substring search.
     for (channel, fts_table) in [("bm25", "lex_fts"), ("trigram", "lex_trigram")] {
         let sql = format!(
-            "SELECT v.src_table, v.src_column, v.src_rowid, v.value, bm25({fts})
+            "SELECT v.src_table, v.src_column, v.src_rowid, v.value, bm25({fts}),
+                    v.is_doc, snippet({fts}, 0, '⟨', '⟩', '…', 10)
              FROM {fts} f JOIN lex_values v ON v.id = f.rowid
              WHERE {fts} MATCH ?1 ORDER BY bm25({fts}) LIMIT ?2",
             fts = fts_table
@@ -272,6 +282,8 @@ fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, f64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             },
         );
@@ -282,10 +294,11 @@ fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
             Err(_) => continue,
         };
         for (rank, row) in rows.enumerate() {
-            let (table, column, rowid, value, bm25) = match row {
+            let (table, column, rowid, value, bm25, is_doc, snippet) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            let is_doc = is_doc != 0;
             hits.push(RawHit {
                 table,
                 column,
@@ -294,11 +307,99 @@ fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
                 channel,
                 rank,
                 raw: -bm25, // SQLite bm25() is lower-is-better; negate.
+                is_doc,
+                snippet: if is_doc { snippet } else { None },
             });
         }
     }
 
-    Ok(fuse(span, hits))
+    let mut candidates = fuse(span, hits);
+    apply_kg_coherence(db, span, &mut candidates)?;
+    Ok(candidates)
+}
+
+/// The GraphRAG-lite assist: when the span's tokens are characteristic terms
+/// in the knowledge graph, document candidates that also contain the terms'
+/// co-occurring neighbors earn a small, evidence-carrying bonus. Appears in
+/// the trace as the "kg" channel.
+fn apply_kg_coherence(db: &StemmaDb, span: &str, candidates: &mut [Candidate]) -> Result<()> {
+    if candidates.iter().all(|c| !c.is_doc) {
+        return Ok(());
+    }
+    let conn = db.conn();
+    let has_kg: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_kg == 0 {
+        return Ok(());
+    }
+
+    // Co-occurring terms of any span token, strongest first, at most 4.
+    let tokens: Vec<String> = span
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; tokens.len()].join(",");
+    let sql = format!(
+        "SELECT DISTINCT n2.label FROM kg_nodes n1
+         JOIN kg_edges e ON e.kind = 'cooccurs' AND (e.src = n1.id OR e.dst = n1.id)
+         JOIN kg_nodes n2 ON n2.id = CASE WHEN e.src = n1.id THEN e.dst ELSE e.src END
+         WHERE n1.kind = 'term' AND n1.label IN ({placeholders})
+         LIMIT 4"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let coterms: Vec<String> = stmt
+        .query_map(
+            stemmadb::rusqlite::params_from_iter(tokens.iter()),
+            |r| r.get(0),
+        )?
+        .collect::<std::result::Result<_, _>>()?;
+    let coterms: Vec<&String> = coterms.iter().filter(|c| !tokens.contains(c)).collect();
+    if coterms.is_empty() {
+        return Ok(());
+    }
+
+    for c in candidates.iter_mut().filter(|c| c.is_doc) {
+        let mut matched = 0usize;
+        for ct in &coterms {
+            let hit: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM lex_fts
+                     WHERE lex_fts MATCH ?1 AND rowid = (
+                        SELECT id FROM lex_values
+                        WHERE src_table = ?2 AND src_column = ?3 AND src_rowid = ?4)",
+                    stemmadb::rusqlite::params![
+                        format!("\"{}\"", ct.replace('"', "\"\"")),
+                        c.table,
+                        c.column,
+                        c.rowid
+                    ],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if hit > 0 {
+                matched += 1;
+            }
+        }
+        if matched > 0 {
+            c.score = (c.score + 0.04 * matched as f64).min(0.9);
+            c.channels.push(ChannelScore {
+                channel: "kg".into(),
+                rank: 0,
+                raw: matched as f64,
+            });
+        }
+    }
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    Ok(())
 }
 
 /// Reciprocal-rank fusion across channels, with a length-affinity factor so
@@ -308,13 +409,27 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
     use std::collections::BTreeMap;
     const RRF_K: f64 = 4.0;
 
-    let mut grouped: BTreeMap<(String, String, i64), (Vec<ChannelScore>, String)> =
-        BTreeMap::new();
+    struct Group {
+        channels: Vec<ChannelScore>,
+        value: String,
+        is_doc: bool,
+        snippet: Option<String>,
+    }
+    let mut grouped: BTreeMap<(String, String, i64), Group> = BTreeMap::new();
     for h in hits {
         let entry = grouped
             .entry((h.table.clone(), h.column.clone(), h.rowid))
-            .or_insert_with(|| (Vec::new(), h.value.clone()));
-        entry.0.push(ChannelScore {
+            .or_insert_with(|| Group {
+                channels: Vec::new(),
+                value: h.value.clone(),
+                is_doc: h.is_doc,
+                snippet: None,
+            });
+        entry.is_doc |= h.is_doc;
+        if entry.snippet.is_none() {
+            entry.snippet = h.snippet.clone();
+        }
+        entry.channels.push(ChannelScore {
             channel: h.channel.to_string(),
             rank: h.rank,
             raw: h.raw,
@@ -324,19 +439,25 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
     let span_len = span.chars().count() as f64;
     let mut candidates: Vec<Candidate> = grouped
         .into_iter()
-        .map(|((table, column, rowid), (channels, value))| {
-            let has_exact = channels.iter().any(|c| c.channel == "exact");
-            let rrf: f64 = channels.iter().map(|c| 1.0 / (RRF_K + c.rank as f64)).sum();
-            // Normalize: three channels at rank 0 -> 1.0.
+        .map(|((table, column, rowid), g)| {
+            let has_exact = g.channels.iter().any(|c| c.channel == "exact");
+            let rrf: f64 = g.channels.iter().map(|c| 1.0 / (RRF_K + c.rank as f64)).sum();
+            // Normalize: three channels at rank 0 -> 1.0 (docs never have the
+            // exact channel, so their base tops out at 2/3).
             let base = (rrf / (3.0 / RRF_K)).min(1.0);
-            let affinity = (span_len / (value.chars().count() as f64).max(span_len)).sqrt();
             let score = if has_exact {
                 // Exact matches are definitionally right about the value.
                 (0.9 + 0.1 * base).min(1.0)
+            } else if g.is_doc {
+                // A mention resolves *into* a document; punishing the doc for
+                // its length would break retrieval (the careg failure mode).
+                (base * 0.85).min(0.85)
             } else {
+                let affinity =
+                    (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
                 (base * (0.4 + 0.6 * affinity)).min(1.0)
             };
-            let (value, value_truncated) = truncate_value(&value);
+            let (value, value_truncated) = truncate_value(&g.value);
             Candidate {
                 table,
                 column,
@@ -344,9 +465,11 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 value,
                 value_truncated,
                 score,
-                channels,
+                channels: g.channels,
                 selected: false,
                 reject_reason: None,
+                is_doc: g.is_doc,
+                snippet: g.snippet,
             }
         })
         .collect();
@@ -432,13 +555,18 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                         column: c.column.clone(),
                         value: c.value.clone(),
                         score: c.score,
+                        snippet: c.snippet.clone().unwrap_or_default(),
+                        is_doc: c.is_doc,
                         evidence: c
                             .channels
                             .iter()
                             .map(|ch| pb::Evidence {
                                 kind: Some(pb::evidence::Kind::Lexical(pb::LexicalMatch {
                                     channel: ch.channel.clone(),
-                                    matched_text: c.value.clone(),
+                                    matched_text: c
+                                        .snippet
+                                        .clone()
+                                        .unwrap_or_else(|| c.value.clone()),
                                     score: ch.raw,
                                 })),
                             })
@@ -491,6 +619,8 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                         score: c.score,
                         selected: c.selected,
                         reject_reason: c.reject_reason.clone().unwrap_or_default(),
+                        snippet: c.snippet.clone().unwrap_or_default(),
+                        is_doc: c.is_doc,
                         channels: c
                             .channels
                             .iter()
@@ -623,6 +753,56 @@ mod tests {
             .count();
         assert!(rejected > 0, "explain must carry rejected candidates");
         assert_eq!(explain.spans.len(), trace.spans.len());
+    }
+
+    #[test]
+    fn document_corpus_resolution_works() {
+        // The careg failure mode in miniature: values are long documents, so
+        // no exact channel and length affinity must not crush the scores.
+        let dir = std::env::temp_dir().join(format!("stemma-resolve-{}-docs", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            let pad = "The remainder of this section sets out procedural requirements, \
+                       definitions, and cross-references to related provisions. "
+                .repeat(3);
+            c.execute_batch(&format!(
+                "CREATE TABLE regs(id INTEGER PRIMARY KEY, body TEXT);
+                 INSERT INTO regs VALUES
+                   (1, 'Coastal development permits require commission approval. {pad}'),
+                   (2, 'Insurance filings are reviewed by the commissioner. {pad}'),
+                   (3, 'Coastal zone boundaries are established by the commission. {pad}');"
+            ))
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+
+        let trace = resolve_lexical(&db, "coastal development permits").unwrap();
+        assert!(
+            !trace.mentions.is_empty(),
+            "document corpus must produce mentions: {trace:?}"
+        );
+        let best = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .flat_map(|s| &s.candidates)
+            .find(|c| c.selected)
+            .expect("a selected candidate");
+        assert!(best.is_doc);
+        assert_eq!(best.table, "regs");
+        assert!(
+            best.snippet.as_deref().unwrap_or("").contains('⟨'),
+            "doc hits carry a marked snippet: {:?}",
+            best.snippet
+        );
+        // The coastal-permit doc (1) must outrank the insurance doc (2).
+        assert_eq!(best.rowid, 1);
     }
 
     #[test]

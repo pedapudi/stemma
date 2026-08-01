@@ -62,6 +62,9 @@ message TraceCandidate {
   // "span_not_selected". Empty for selected candidates.
   string reject_reason = 8;
   repeated TraceChannelScore channels = 9;
+  // For document-shaped values: a match snippet with ⟨⟩ marking hit terms.
+  string snippet = 10;
+  bool is_doc = 11;
 }
 
 message TraceSpan {
@@ -128,6 +131,11 @@ message Candidate {
   // Calibrated confidence in [0, 1].
   double score = 5;
   repeated Evidence evidence = 6;
+  // For document-shaped values: a match snippet with ⟨⟩ marking hit terms.
+  string snippet = 7;
+  // True when the stored value is a document the mention resolves into,
+  // rather than a value it equals.
+  bool is_doc = 8;
 }
 
 // Why a candidate is believed; every candidate carries at least one.
