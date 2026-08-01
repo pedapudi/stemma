@@ -29,6 +29,7 @@ class SqlRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[dict]
+    conversation: str = "default"
 
 
 def create_app(
@@ -145,22 +146,31 @@ def create_app(
         )
         if not text:
             raise HTTPException(400, "no user message")
+        conv = req.conversation or "default"
         try:
             return await agent_chat.send(
                 name, text,
                 explain_fn=lambda q, database: client.explain_dict(
-                    q, database=database, source="agent", session=f"{name}/default"
+                    q, database=database, source="agent", session=f"{name}/{conv}"
                 ),
+                conv=conv,
             )
         except Exception as e:
             raise HTTPException(502, f"agent: {e}") from e
 
     @app.get("/api/db/{name}/chat")
-    def chat_transcript(name: str):
+    def chat_transcript(name: str, conversation: str = "default"):
         browser(name)
         if agent_chat is None:
             return {"messages": []}
-        return {"messages": agent_chat.transcript(name)}
+        return {"messages": agent_chat.transcript(name, conversation)}
+
+    @app.get("/api/db/{name}/chats")
+    def chats(name: str):
+        browser(name)
+        if agent_chat is None:
+            return {"conversations": []}
+        return {"conversations": agent_chat.conversations(name)}
 
     @app.get("/api/db/{name}/history")
     def history(name: str, limit: int = 8):

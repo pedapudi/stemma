@@ -197,6 +197,87 @@ function esc(s: unknown): string {
   );
 }
 
+/* Minimal markdown → DOM: headings, lists, bold/italic/code, fenced code,
+ * http links. Hand-rolled (no npm), building nodes — never raw innerHTML. */
+function md(text: string): HTMLElement {
+  const root = el("div", { class: "md-root" });
+  const blocks = text.split(/```/);
+  blocks.forEach((block, bi) => {
+    if (bi % 2 === 1) {
+      root.append(el("pre", { class: "md-code" }, block.replace(/^\w*\n/, "")));
+      return;
+    }
+    let list: HTMLElement | null = null;
+    for (const rawLine of block.split("\n")) {
+      const line = rawLine.trimEnd();
+      if (!line.trim()) {
+        list = null;
+        continue;
+      }
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
+      if (h) {
+        list = null;
+        root.append(el("div", { class: `md-h md-h${h[1].length}` }, ...mdInline(h[2])));
+      } else if (li) {
+        if (!list) {
+          list = el("ul", { class: "md-list" });
+          root.append(list);
+        }
+        list.append(el("li", null, ...mdInline(li[1])));
+      } else {
+        list = null;
+        root.append(el("p", { class: "md-p" }, ...mdInline(line)));
+      }
+    }
+  });
+  return root;
+}
+
+function mdInline(text: string): (Node | string)[] {
+  const out: (Node | string)[] = [];
+  // tokens: `code`  **bold**  *italic*  [label](http url)
+  const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[[^\]]+\]\(https?:[^)]+\))/g;
+  let last = 0;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const t = m[0];
+    if (m[1]) out.push(el("code", { class: "md-codespan" }, t.slice(1, -1)));
+    else if (m[2]) out.push(el("b", null, t.slice(2, -2)));
+    else if (m[3]) out.push(el("i", null, t.slice(1, -1)));
+    else if (m[4]) {
+      const mm = t.match(/^\[([^\]]+)\]\((https?:[^)]+)\)$/);
+      if (mm) out.push(el("a", { href: mm[2], target: "_blank", rel: "noreferrer" }, mm[1]));
+    }
+    last = m.index + t.length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+/* The structured candidate hovercard: reference, score meter, snippet with
+ * accent hits, channel chips in their own hues, the reject verdict. */
+function hovCandidate(c: TraceCandidate): string {
+  const snip = esc((c.snippet || c.value).slice(0, 170))
+    .replace(/⟨/g, '<b class="hc-hit">').replace(/⟩/g, "</b>");
+  const chips = c.channels.map((ch) =>
+    `<span class="hc-ch hc-ch-${esc(ch.channel)}">${esc(ch.channel)} · ${ch.raw.toFixed(1)}</span>`
+  ).join("");
+  return `
+    <div class="hc-head">
+      <span class="hc-ref">${esc(c.table)}.${esc(c.column)}</span>
+      <span class="hc-rowid">#${c.rowid}</span>
+      <span class="hc-score">${c.score.toFixed(2)}</span>
+    </div>
+    <div class="hc-meter"><i style="width:${Math.round(c.score * 100)}%"></i></div>
+    <div class="hc-snip">${snip}</div>
+    <div class="hc-chips">${chips}</div>` +
+    (c.selected
+      ? '<div class="hc-verdict hc-ok">selected</div>'
+      : `<div class="hc-verdict hc-no">${esc((c.reject_reason || "rejected").replace(/_/g, " "))}</div>`) +
+    '<div class="hc-hint">click for the card</div>';
+}
+
 /* Render a snippet whose hits are marked with ⟨⟩. */
 function snippetNode(snippet: string): HTMLElement {
   const out = el("span", { class: "snippet" });
@@ -246,9 +327,18 @@ const state: {
   view: string;
 } = { cfg: null, dbs: [], db: null, schema: null, view: "query" };
 
-/* per-database chat transcripts, session-local */
+/* chat transcripts keyed by db:conversation; conversations persist in the
+ * store's chat_log and resume across sessions */
 type ChatMsg = { role: "user" | "assistant"; content: string; trail?: ChatTrailItem[] };
 const chatLog = new Map<string, ChatMsg[]>();
+
+function activeConv(db: string): string {
+  return localStorage.getItem(`stemma.conv.${db}`) ?? "default";
+}
+
+function setActiveConv(db: string, conv: string): void {
+  localStorage.setItem(`stemma.conv.${db}`, conv);
+}
 
 /* Theme rows: id, display name, swatch strip (paper · panel · ink · good ·
  * bad · accent) — the strips can't read live tokens, so the six chips are the
@@ -850,12 +940,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
           showCard(sp, c);
         },
       });
-      hov(dot,
-        `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} · ${c.score.toFixed(2)}<br>` +
-        `${esc((c.snippet || c.value).slice(0, 120))}<br>` +
-        c.channels.map((ch) => esc(ch.channel)).join(" · ") +
-        (c.selected ? "" : ` · <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`) +
-        "<br><i>click for the card</i>");
+      hov(dot, hovCandidate(c));
       allDots.push({ dot, c });
       strip.append(dot);
     });
@@ -914,9 +999,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
             `${c.table}.${c.column} #${c.rowid} (${c.score.toFixed(2)})`).join(" · ")
           : "—"));
     if (s.candidates.length) {
-      hov(row, s.candidates.map((c) =>
-        `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \u201c${esc(c.snippet || c.value)}\u201d<br>` +
-        `score ${c.score.toFixed(3)} · ${esc(c.reject_reason)}`).join("<hr>"));
+      hov(row, s.candidates.slice(0, 3).map(hovCandidate).join("<hr>"));
     }
     alsoBox.append(row);
   }
@@ -1044,10 +1127,49 @@ function setChatRail(open: boolean): void {
 function renderChatRail(): void {
   const rail = document.getElementById("chatrail") as HTMLElement;
   rail.replaceChildren();
+  const db = state.db as string;
+  const conv = activeConv(db);
+  const key = `${db}:${conv}`;
+
+  const convPick = el("select", {
+    class: "input rail-convpick",
+    onchange: () => {
+      setActiveConv(db, convPick.value);
+      renderChatRail();
+    },
+  });
+  const newBtn = el("button", {
+    class: "btn accent",
+    title: "start a new chat",
+    onclick: () => {
+      const id = "c" + Date.now().toString(36);
+      setActiveConv(db, id);
+      chatLog.set(`${db}:${id}`, []);
+      renderChatRail();
+    },
+  }, "+ new chat");
   rail.append(el("div", { class: "rail-head" },
     el("span", { class: "subhead", style: "margin:0" }, "chat"),
     el("span", { class: "sql-caption" },
-      state.cfg?.lm ? `${state.db} · ${state.cfg.lm.model}` : "no model configured")));
+      state.cfg?.lm ? `${db} · ${state.cfg.lm.model}` : "no model configured"),
+    el("span", { class: "spacer" }),
+    newBtn));
+  rail.append(el("div", { class: "rail-convrow" }, convPick));
+
+  // the resume list: every conversation in the store, newest first
+  getJSON<{ conversations: { id: string; title: string; turns: number }[] }>(
+    `/api/db/${db}/chats`).then((r) => {
+      const seen = new Set<string>();
+      convPick.replaceChildren();
+      for (const c of r.conversations) {
+        seen.add(c.id);
+        convPick.append(el("option", { value: c.id, selected: c.id === conv ? "" : null },
+          `${c.title || c.id} · ${Math.ceil(c.turns / 2)} turns`));
+      }
+      if (!seen.has(conv)) {
+        convPick.append(el("option", { value: conv, selected: "" }, "(new chat)"));
+      }
+    }).catch(() => { /* resume list is a nicety */ });
 
   if (!state.cfg?.lm) {
     rail.append(el("div", { class: "rail-transcript" },
@@ -1059,19 +1181,18 @@ function renderChatRail(): void {
     return;
   }
 
-  const db = state.db as string;
-  if (!chatLog.has(db)) {
-    chatLog.set(db, []);
-    // history lives in the store's chat_log; restore it once per session
-    getJSON<{ messages: ChatMsg[] }>(`/api/db/${db}/chat`).then((r) => {
-      const cur = chatLog.get(db) as ChatMsg[];
-      if (cur.length === 0 && r.messages.length) {
-        cur.push(...r.messages);
-        if (chatRailOpen()) renderChatRail();
-      }
-    }).catch(() => { /* absent history is fine */ });
+  if (!chatLog.has(key)) {
+    chatLog.set(key, []);
+    getJSON<{ messages: ChatMsg[] }>(
+      `/api/db/${db}/chat?conversation=${encodeURIComponent(conv)}`).then((r) => {
+        const cur = chatLog.get(key) as ChatMsg[];
+        if (cur.length === 0 && r.messages.length) {
+          cur.push(...r.messages);
+          if (chatRailOpen()) renderChatRail();
+        }
+      }).catch(() => { /* absent history is fine */ });
   }
-  const log = chatLog.get(db) as ChatMsg[];
+  const log = chatLog.get(key) as ChatMsg[];
 
   const transcript = el("div", { class: "rail-transcript" });
   const input = el("input", {
@@ -1101,7 +1222,7 @@ function renderChatRail(): void {
         for (const t of m.trail ?? []) transcript.append(renderTrailItem(t));
         transcript.append(el("div", { class: "chat-msg" },
           el("div", { class: "who" }, "stemma"),
-          el("div", { class: "md" }, m.content)));
+          md(m.content)));
       }
     }
     transcript.scrollTop = transcript.scrollHeight;
@@ -1114,7 +1235,7 @@ function renderChatRail(): void {
       const d = el("details", { class: "chat-tool", open: "" });
       d.append(el("summary", null,
         el("span", { class: "chip" }, "resolve"),
-        `“${trace.query}” · ${trace.mentions.length} mention${trace.mentions.length === 1 ? "" : "s"}`));
+        `\u201c${trace.query}\u201d · ${trace.mentions.length} mention${trace.mentions.length === 1 ? "" : "s"}`));
       d.append(renderMiniTrace(trace));
       d.append(el("div", { style: "margin:3px 0 2px" },
         el("button", {
@@ -1146,13 +1267,13 @@ function renderChatRail(): void {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          conversation: conv,
           messages: log.map((m) => ({ role: m.role, content: m.content })),
         }),
       });
       const d = (await r.json()) as ChatResponse & { detail?: string };
       if (!r.ok) throw new Error(d.detail ?? r.statusText);
       log.push({ role: "assistant", content: d.message, trail: d.trail });
-      // chat drives the visual: the newest resolution opens in the main view
       const lastResolve = [...d.trail].reverse().find((t) => t.tool === "resolve" && t.trace);
       if (lastResolve?.trace) showTraceInMain(lastResolve.trace);
     } catch (e) {
@@ -1297,11 +1418,24 @@ async function viewGraph(host: HTMLElement): Promise<void> {
     }, `${k}s · ${count}`);
     legend.append(chip);
   }
+  const searchBox = el("input", {
+    class: "input kg-search",
+    placeholder: "find in graph…",
+    oninput: () => {
+      const q = searchBox.value.trim().toLowerCase();
+      for (const [k, elm] of labelEls) {
+        const n = byKey.get(k);
+        const hit = q !== "" && (n?.label ?? "").toLowerCase().includes(q);
+        elm.classList.toggle("kg-hit", hit);
+        elm.classList.toggle("kg-dim", q !== "" && !hit);
+      }
+    },
+  });
   const zoomSeg = el("span", { class: "seg", style: "margin-left:auto" },
     el("button", { onclick: () => zoomBy(1 / 1.25) }, "−"),
     el("button", { onclick: () => fit() }, "fit"),
     el("button", { onclick: () => zoomBy(1.25) }, "+"));
-  legend.append(zoomSeg);
+  legend.append(searchBox, zoomSeg);
 
   const detail = el("div", { class: "graph-detail", hidden: "" });
   const wires = svgEl("svg", { class: "kg-wires", "aria-hidden": "true" });
@@ -1312,6 +1446,7 @@ async function viewGraph(host: HTMLElement): Promise<void> {
 
   let scale = 1, tx = 0, ty = 0;
   let selectedKey: string | null = null;
+  let hoveredKey: string | null = null;
   const labelEls = new Map<string, HTMLElement>();
 
   function applyTransform(): void {
@@ -1397,6 +1532,7 @@ async function viewGraph(host: HTMLElement): Promise<void> {
       const values = g.nodes.filter(
         (n) => n.kind === "value" && n.key.startsWith(`value:${t.label}.`));
 
+      const maxCent = Math.max(1e-6, ...g.nodes.map((x) => cent(x)));
       const section = (title: string, cls: string, nodes: GraphNode[],
         style?: (n: GraphNode) => string) => {
         if (!nodes.length) return;
@@ -1410,6 +1546,23 @@ async function viewGraph(host: HTMLElement): Promise<void> {
             onclick: (e: Event) => {
               e.stopPropagation();
               select(n);
+            },
+            onmouseenter: () => {
+              hoveredKey = n.key;
+              for (const e2 of touching(n.key)) {
+                const other = e2.source === n.key ? e2.target : e2.source;
+                labelEls.get(other)?.classList.add("hood");
+              }
+              drawWires();
+            },
+            onmouseleave: () => {
+              hoveredKey = null;
+              if (selectedKey !== n.key) {
+                labelEls.forEach((x, k2) => {
+                  if (k2 !== selectedKey) x.classList.remove("hood");
+                });
+              }
+              drawWires();
             },
           }, n.label);
           hov(lab, `<b>${esc(n.label)}</b> · ${esc(n.kind)}<br>` +
@@ -1425,7 +1578,11 @@ async function viewGraph(host: HTMLElement): Promise<void> {
       if (shown.has("term")) {
         section("characteristic terms · pagerank", "kg-term", terms, (n) => {
           const size = 10.5 + Math.min(5, Math.sqrt(cent(n)) * 26);
-          return `font-size: calc(${size.toFixed(1)}px * var(--fs))`;
+          // sequential ramp: centrality carries the ink→accent mix, so hue
+          // encodes the same variable as size
+          const mix = Math.min(78, Math.round(Math.sqrt(cent(n) / maxCent) * 78));
+          return `font-size: calc(${size.toFixed(1)}px * var(--fs)); ` +
+            `color: color-mix(in srgb, var(--ink-soft) ${100 - mix}%, var(--accent) ${mix}%)`;
         });
         section("named entities", "kg-phrase", phrases);
       }
@@ -1463,13 +1620,14 @@ async function viewGraph(host: HTMLElement): Promise<void> {
       hov(path, `<b>${esc(e.kind)}</b> ${esc(e.label)}`);
       wires.append(path);
     }
-    // the selected node's neighborhood
-    if (selectedKey) {
-      const sel = labelEls.get(selectedKey);
+    // the selected (or hovered) node's neighborhood
+    const focusKey = hoveredKey ?? selectedKey;
+    if (focusKey) {
+      const sel = labelEls.get(focusKey);
       if (sel) {
         const ps = anchor(sel);
-        for (const e of touching(selectedKey)) {
-          const otherKey = e.source === selectedKey ? e.target : e.source;
+        for (const e of touching(focusKey)) {
+          const otherKey = e.source === focusKey ? e.target : e.source;
           const other = labelEls.get(otherKey);
           if (!other) continue;
           const po = anchor(other);
@@ -1590,6 +1748,12 @@ async function route(): Promise<void> {
   (document.getElementById("chattoggle") as HTMLButtonElement).addEventListener(
     "click", () => setChatRail(Boolean((document.getElementById("chatrail") as HTMLElement).hidden)));
   if (chatRailOpen()) setChatRail(true);
+  // clicking the current view's nav entry re-renders it (a stale or errored
+  // view heals instead of doing nothing)
+  document.querySelectorAll<HTMLAnchorElement>("#nav a").forEach((a) =>
+    a.addEventListener("click", () => {
+      if (a.getAttribute("href") === location.hash) route();
+    }));
   globalThis.addEventListener("hashchange", route);
   pollHealth();
   route();

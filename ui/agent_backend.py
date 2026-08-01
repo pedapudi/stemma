@@ -43,23 +43,24 @@ class AgentChat:
     def _store_path(self, db: str) -> str:
         return os.path.splitext(self.dbs[db])[0] + ".stemmadb"
 
-    def _log(self, db: str, role: str, content: str, trail: list[dict[str, Any]]) -> None:
+    def _log(self, db: str, conv: str, role: str, content: str,
+             trail: list[dict[str, Any]]) -> None:
         conn = sqlite3.connect(self._store_path(db))
         try:
             conn.execute(
-                "INSERT INTO chat_log (conversation, role, content, trail) VALUES ('default', ?, ?, ?)",
-                (role, content, json.dumps(trail)),
+                "INSERT INTO chat_log (conversation, role, content, trail) VALUES (?, ?, ?, ?)",
+                (conv, role, content, json.dumps(trail)),
             )
             conn.commit()
         finally:
             conn.close()
 
-    def transcript(self, db: str) -> list[dict[str, Any]]:
+    def transcript(self, db: str, conv: str = "default") -> list[dict[str, Any]]:
         conn = sqlite3.connect(f"file:{self._store_path(db)}?mode=ro", uri=True)
         try:
             rows = conn.execute(
                 "SELECT role, content, trail FROM chat_log "
-                "WHERE conversation = 'default' ORDER BY id"
+                "WHERE conversation = ? ORDER BY id", (conv,)
             ).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -70,20 +71,41 @@ class AgentChat:
             for r, c, t in rows
         ]
 
-    async def send(self, db: str, text: str, explain_fn) -> dict[str, Any]:
-        """One user turn through the agent; returns {message, trail}."""
-        if db not in self._made:
-            await self.sessions.create_session(
-                app_name="stemma-console", user_id="console", session_id=db
-            )
-            self._made.add(db)
+    def conversations(self, db: str) -> list[dict[str, Any]]:
+        """Every conversation with its opening line — the resume list."""
+        conn = sqlite3.connect(f"file:{self._store_path(db)}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT conversation, min(said_at), count(*), "
+                " (SELECT content FROM chat_log c2 WHERE c2.conversation = c1.conversation "
+                "  AND c2.role = 'user' ORDER BY c2.id LIMIT 1) "
+                "FROM chat_log c1 GROUP BY conversation ORDER BY min(id) DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+        return [
+            {"id": cid, "started": at, "turns": n, "title": (first or cid)[:80]}
+            for cid, at, n, first in rows
+        ]
 
-        self._log(db, "user", text, [])
+    async def send(self, db: str, text: str, explain_fn,
+                   conv: str = "default") -> dict[str, Any]:
+        """One user turn through the agent; returns {message, trail}."""
+        key = f"{db}:{conv}"
+        if key not in self._made:
+            await self.sessions.create_session(
+                app_name="stemma-console", user_id="console", session_id=key
+            )
+            self._made.add(key)
+
+        self._log(db, conv, "user", text, [])
         trail: list[dict[str, Any]] = []
         final = ""
         async for ev in self.runner.run_async(
             user_id="console",
-            session_id=db,
+            session_id=key,
             new_message=types.Content(role="user", parts=[types.Part(text=text)]),
         ):
             for call in ev.get_function_calls():
@@ -110,7 +132,7 @@ class AgentChat:
                 if texts and ev.is_final_response():
                     final = "\n".join(texts)
 
-        self._log(db, "assistant", final, trail)
+        self._log(db, conv, "assistant", final, trail)
         return {"message": final, "trail": trail}
 
 

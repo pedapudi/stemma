@@ -45,6 +45,88 @@ function esc(s) {
     "'": "&#39;"
   })[c]);
 }
+function md(text) {
+  const root = el("div", {
+    class: "md-root"
+  });
+  const blocks = text.split(/```/);
+  blocks.forEach((block, bi) => {
+    if (bi % 2 === 1) {
+      root.append(el("pre", {
+        class: "md-code"
+      }, block.replace(/^\w*\n/, "")));
+      return;
+    }
+    let list = null;
+    for (const rawLine of block.split("\n")) {
+      const line = rawLine.trimEnd();
+      if (!line.trim()) {
+        list = null;
+        continue;
+      }
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
+      if (h) {
+        list = null;
+        root.append(el("div", {
+          class: `md-h md-h${h[1].length}`
+        }, ...mdInline(h[2])));
+      } else if (li) {
+        if (!list) {
+          list = el("ul", {
+            class: "md-list"
+          });
+          root.append(list);
+        }
+        list.append(el("li", null, ...mdInline(li[1])));
+      } else {
+        list = null;
+        root.append(el("p", {
+          class: "md-p"
+        }, ...mdInline(line)));
+      }
+    }
+  });
+  return root;
+}
+function mdInline(text) {
+  const out = [];
+  const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[[^\]]+\]\(https?:[^)]+\))/g;
+  let last = 0;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const t = m[0];
+    if (m[1]) out.push(el("code", {
+      class: "md-codespan"
+    }, t.slice(1, -1)));
+    else if (m[2]) out.push(el("b", null, t.slice(2, -2)));
+    else if (m[3]) out.push(el("i", null, t.slice(1, -1)));
+    else if (m[4]) {
+      const mm = t.match(/^\[([^\]]+)\]\((https?:[^)]+)\)$/);
+      if (mm) out.push(el("a", {
+        href: mm[2],
+        target: "_blank",
+        rel: "noreferrer"
+      }, mm[1]));
+    }
+    last = m.index + t.length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+function hovCandidate(c) {
+  const snip = esc((c.snippet || c.value).slice(0, 170)).replace(/⟨/g, '<b class="hc-hit">').replace(/⟩/g, "</b>");
+  const chips = c.channels.map((ch) => `<span class="hc-ch hc-ch-${esc(ch.channel)}">${esc(ch.channel)} \xB7 ${ch.raw.toFixed(1)}</span>`).join("");
+  return `
+    <div class="hc-head">
+      <span class="hc-ref">${esc(c.table)}.${esc(c.column)}</span>
+      <span class="hc-rowid">#${c.rowid}</span>
+      <span class="hc-score">${c.score.toFixed(2)}</span>
+    </div>
+    <div class="hc-meter"><i style="width:${Math.round(c.score * 100)}%"></i></div>
+    <div class="hc-snip">${snip}</div>
+    <div class="hc-chips">${chips}</div>` + (c.selected ? '<div class="hc-verdict hc-ok">selected</div>' : `<div class="hc-verdict hc-no">${esc((c.reject_reason || "rejected").replace(/_/g, " "))}</div>`) + '<div class="hc-hint">click for the card</div>';
+}
 function snippetNode(snippet) {
   const out = el("span", {
     class: "snippet"
@@ -87,6 +169,12 @@ var state = {
   view: "query"
 };
 var chatLog = /* @__PURE__ */ new Map();
+function activeConv(db) {
+  return localStorage.getItem(`stemma.conv.${db}`) ?? "default";
+}
+function setActiveConv(db, conv) {
+  localStorage.setItem(`stemma.conv.${db}`, conv);
+}
 var COLOR_THEMES = [
   [
     "monokai",
@@ -1015,7 +1103,7 @@ function renderTrace(out, trace) {
           showCard(sp, c);
         }
       });
-      hov(dot, `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \xB7 ${c.score.toFixed(2)}<br>${esc((c.snippet || c.value).slice(0, 120))}<br>` + c.channels.map((ch) => esc(ch.channel)).join(" \xB7 ") + (c.selected ? "" : ` \xB7 <i>${esc(c.reject_reason.replace(/_/g, " "))}</i>`) + "<br><i>click for the card</i>");
+      hov(dot, hovCandidate(c));
       allDots.push({
         dot,
         c
@@ -1096,7 +1184,7 @@ function renderTrace(out, trace) {
       class: "alsoran-cands"
     }, s.candidates.length ? s.candidates.map((c) => `${c.table}.${c.column} #${c.rowid} (${c.score.toFixed(2)})`).join(" \xB7 ") : "\u2014"));
     if (s.candidates.length) {
-      hov(row, s.candidates.map((c) => `<b>${esc(c.table)}.${esc(c.column)}</b> #${c.rowid} \u201C${esc(c.snippet || c.value)}\u201D<br>score ${c.score.toFixed(3)} \xB7 ${esc(c.reject_reason)}`).join("<hr>"));
+      hov(row, s.candidates.slice(0, 3).map(hovCandidate).join("<hr>"));
     }
     alsoBox.append(row);
   }
@@ -1221,6 +1309,26 @@ function setChatRail(open) {
 function renderChatRail() {
   const rail = document.getElementById("chatrail");
   rail.replaceChildren();
+  const db = state.db;
+  const conv = activeConv(db);
+  const key = `${db}:${conv}`;
+  const convPick = el("select", {
+    class: "input rail-convpick",
+    onchange: () => {
+      setActiveConv(db, convPick.value);
+      renderChatRail();
+    }
+  });
+  const newBtn = el("button", {
+    class: "btn accent",
+    title: "start a new chat",
+    onclick: () => {
+      const id = "c" + Date.now().toString(36);
+      setActiveConv(db, id);
+      chatLog.set(`${db}:${id}`, []);
+      renderChatRail();
+    }
+  }, "+ new chat");
   rail.append(el("div", {
     class: "rail-head"
   }, el("span", {
@@ -1228,7 +1336,30 @@ function renderChatRail() {
     style: "margin:0"
   }, "chat"), el("span", {
     class: "sql-caption"
-  }, state.cfg?.lm ? `${state.db} \xB7 ${state.cfg.lm.model}` : "no model configured")));
+  }, state.cfg?.lm ? `${db} \xB7 ${state.cfg.lm.model}` : "no model configured"), el("span", {
+    class: "spacer"
+  }), newBtn));
+  rail.append(el("div", {
+    class: "rail-convrow"
+  }, convPick));
+  getJSON(`/api/db/${db}/chats`).then((r) => {
+    const seen = /* @__PURE__ */ new Set();
+    convPick.replaceChildren();
+    for (const c of r.conversations) {
+      seen.add(c.id);
+      convPick.append(el("option", {
+        value: c.id,
+        selected: c.id === conv ? "" : null
+      }, `${c.title || c.id} \xB7 ${Math.ceil(c.turns / 2)} turns`));
+    }
+    if (!seen.has(conv)) {
+      convPick.append(el("option", {
+        value: conv,
+        selected: ""
+      }, "(new chat)"));
+    }
+  }).catch(() => {
+  });
   if (!state.cfg?.lm) {
     rail.append(el("div", {
       class: "rail-transcript"
@@ -1237,11 +1368,10 @@ function renderChatRail() {
     }, "\u2014 talk to the data by proxy needs a model: restart the console with --lm-endpoint http://host:port/v1 --lm-model <name> (any openai-compatible server: vllm, llama.cpp, litellm; bearer token via LM_API_KEY)")));
     return;
   }
-  const db = state.db;
-  if (!chatLog.has(db)) {
-    chatLog.set(db, []);
-    getJSON(`/api/db/${db}/chat`).then((r) => {
-      const cur = chatLog.get(db);
+  if (!chatLog.has(key)) {
+    chatLog.set(key, []);
+    getJSON(`/api/db/${db}/chat?conversation=${encodeURIComponent(conv)}`).then((r) => {
+      const cur = chatLog.get(key);
       if (cur.length === 0 && r.messages.length) {
         cur.push(...r.messages);
         if (chatRailOpen()) renderChatRail();
@@ -1249,7 +1379,7 @@ function renderChatRail() {
     }).catch(() => {
     });
   }
-  const log = chatLog.get(db);
+  const log = chatLog.get(key);
   const transcript = el("div", {
     class: "rail-transcript"
   });
@@ -1290,9 +1420,7 @@ function renderChatRail() {
           class: "chat-msg"
         }, el("div", {
           class: "who"
-        }, "stemma"), el("div", {
-          class: "md"
-        }, m.content)));
+        }, "stemma"), md(m.content)));
       }
     }
     transcript.scrollTop = transcript.scrollHeight;
@@ -1349,6 +1477,7 @@ function renderChatRail() {
           "content-type": "application/json"
         },
         body: JSON.stringify({
+          conversation: conv,
           messages: log.map((m) => ({
             role: m.role,
             content: m.content
@@ -1514,6 +1643,19 @@ async function viewGraph(host) {
     }, `${k}s \xB7 ${count}`);
     legend.append(chip);
   }
+  const searchBox = el("input", {
+    class: "input kg-search",
+    placeholder: "find in graph\u2026",
+    oninput: () => {
+      const q = searchBox.value.trim().toLowerCase();
+      for (const [k, elm] of labelEls) {
+        const n = byKey.get(k);
+        const hit = q !== "" && (n?.label ?? "").toLowerCase().includes(q);
+        elm.classList.toggle("kg-hit", hit);
+        elm.classList.toggle("kg-dim", q !== "" && !hit);
+      }
+    }
+  });
   const zoomSeg = el("span", {
     class: "seg",
     style: "margin-left:auto"
@@ -1524,7 +1666,7 @@ async function viewGraph(host) {
   }, "fit"), el("button", {
     onclick: () => zoomBy(1.25)
   }, "+"));
-  legend.append(zoomSeg);
+  legend.append(searchBox, zoomSeg);
   const detail = el("div", {
     class: "graph-detail",
     hidden: ""
@@ -1545,6 +1687,7 @@ async function viewGraph(host) {
   host.append(legend, detail, viewport);
   let scale = 1, tx = 0, ty = 0;
   let selectedKey = null;
+  let hoveredKey = null;
   const labelEls = /* @__PURE__ */ new Map();
   function applyTransform() {
     canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
@@ -1623,6 +1766,7 @@ async function viewGraph(host) {
       const terms = g.nodes.filter((n) => n.kind === "term" && n.key.startsWith(`term:${t.label}:`)).sort((a, b) => cent(b) - cent(a));
       const phrases = g.nodes.filter((n) => n.kind === "term" && n.key.startsWith(`phrase:${t.label}:`)).sort((a, b) => cent(b) - cent(a));
       const values = g.nodes.filter((n) => n.kind === "value" && n.key.startsWith(`value:${t.label}.`));
+      const maxCent = Math.max(1e-6, ...g.nodes.map((x) => cent(x)));
       const section = (title, cls, nodes, style) => {
         if (!nodes.length) return;
         cell.append(el("div", {
@@ -1639,6 +1783,23 @@ async function viewGraph(host) {
             onclick: (e) => {
               e.stopPropagation();
               select(n);
+            },
+            onmouseenter: () => {
+              hoveredKey = n.key;
+              for (const e2 of touching(n.key)) {
+                const other = e2.source === n.key ? e2.target : e2.source;
+                labelEls.get(other)?.classList.add("hood");
+              }
+              drawWires();
+            },
+            onmouseleave: () => {
+              hoveredKey = null;
+              if (selectedKey !== n.key) {
+                labelEls.forEach((x, k2) => {
+                  if (k2 !== selectedKey) x.classList.remove("hood");
+                });
+              }
+              drawWires();
             }
           }, n.label);
           hov(lab, `<b>${esc(n.label)}</b> \xB7 ${esc(n.kind)}<br>` + Object.entries(n.props).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(" \xB7 "));
@@ -1652,7 +1813,8 @@ async function viewGraph(host) {
       if (shown.has("term")) {
         section("characteristic terms \xB7 pagerank", "kg-term", terms, (n) => {
           const size = 10.5 + Math.min(5, Math.sqrt(cent(n)) * 26);
-          return `font-size: calc(${size.toFixed(1)}px * var(--fs))`;
+          const mix = Math.min(78, Math.round(Math.sqrt(cent(n) / maxCent) * 78));
+          return `font-size: calc(${size.toFixed(1)}px * var(--fs)); color: color-mix(in srgb, var(--ink-soft) ${100 - mix}%, var(--accent) ${mix}%)`;
         });
         section("named entities", "kg-phrase", phrases);
       }
@@ -1686,12 +1848,13 @@ async function viewGraph(host) {
       hov(path, `<b>${esc(e.kind)}</b> ${esc(e.label)}`);
       wires.append(path);
     }
-    if (selectedKey) {
-      const sel = labelEls.get(selectedKey);
+    const focusKey = hoveredKey ?? selectedKey;
+    if (focusKey) {
+      const sel = labelEls.get(focusKey);
       if (sel) {
         const ps = anchor(sel);
-        for (const e of touching(selectedKey)) {
-          const otherKey = e.source === selectedKey ? e.target : e.source;
+        for (const e of touching(focusKey)) {
+          const otherKey = e.source === focusKey ? e.target : e.source;
           const other = labelEls.get(otherKey);
           if (!other) continue;
           const po = anchor(other);
@@ -1803,6 +1966,9 @@ async function route() {
   });
   document.getElementById("chattoggle").addEventListener("click", () => setChatRail(Boolean(document.getElementById("chatrail").hidden)));
   if (chatRailOpen()) setChatRail(true);
+  document.querySelectorAll("#nav a").forEach((a) => a.addEventListener("click", () => {
+    if (a.getAttribute("href") === location.hash) route();
+  }));
   globalThis.addEventListener("hashchange", route);
   pollHealth();
   route();
