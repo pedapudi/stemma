@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 132 76" width="132" height="76"
+     role="img" aria-label="stemmadb" color="#F2EEDE">
+  <title>stemmadb</title>
+  <!-- the stacked lockup: mark centered above the display wordmark. -->
+  <g transform="translate(50, 2)">
+    <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 20 C4 13 9 12 12 8"/>
+      <path d="M12 20 C12 15 12 12 12 8"/>
+      <path d="M20 20 C20 13 15 12 12 8"/>
+      <path d="M7.5 15.5 L9.2 17.2"/>
+      <path d="M16.5 15.5 L14.8 17.2"/>
+    </g>
+    <circle cx="12" cy="5.6" r="2.1" fill="var(--brand-accent, #3FB87A)"/>
+  </g>
+  <text x="66" y="56" text-anchor="middle" fill="currentColor"
+        font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-weight="700" font-size="14" letter-spacing="0.14">stemma<tspan fill="var(--brand-accent, #3FB87A)">·</tspan>db</text>
+</svg>

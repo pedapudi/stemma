@@ -839,3 +839,5 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .gedge.path-hot { stroke: var(--accent) !important; stroke-width: 2.2 !important; opacity: 1 !important; }
 .kg-label.path-hood, .gnode.path-hood .glabel { color: var(--accent); }
 .gnode.path-hood .gdot, .kg-tablebox.path-hood { stroke: var(--accent); border-color: var(--accent); }
+
+.brand-dot { color: var(--brand-accent); }

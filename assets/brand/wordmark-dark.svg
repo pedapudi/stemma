@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 28" width="176" height="28"
+     role="img" aria-label="stemmadb" color="#F2EEDE">
+  <title>stemmadb</title>
+  <!-- the display wordmark: stemma·db. machines write `stemmadb`; in display
+       contexts the interpunct — the house separator — carries the archetype
+       dot, the lockup's one colored element. JetBrains Mono 700, lowercase,
+       always. currentColor ink; color="" is the <img> fallback. -->
+  <text x="2" y="21" fill="currentColor"
+        font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-weight="700" font-size="20" letter-spacing="0.2">stemma<tspan fill="var(--brand-accent, #3FB87A)">·</tspan>db</text>
+</svg>

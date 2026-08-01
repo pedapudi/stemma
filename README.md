@@ -1,7 +1,7 @@
 <p>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/mark-dark.svg">
-    <img alt="stemma" src="assets/brand/mark.svg" width="48">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/banner-dark.svg">
+    <img alt="stemma·db — many surface forms, one referent" src="assets/brand/banner.svg" width="640">
   </picture>
 </p>
 

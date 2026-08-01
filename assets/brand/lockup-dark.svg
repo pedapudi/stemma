@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 152 24" width="152" height="24"
-     role="img" aria-label="stemmadb" color="#15181C">
+     role="img" aria-label="stemmadb" color="#F2EEDE">
   <title>stemmadb</title>
   <!-- mark + display wordmark (stemma·db), horizontal. the gap is 9 units — a
        third of the mark's width. ink is currentColor; the archetype dot and
@@ -11,8 +11,8 @@
     <path d="M7.5 15.5 L9.2 17.2"/>
     <path d="M16.5 15.5 L14.8 17.2"/>
   </g>
-  <circle cx="12" cy="5.6" r="2.1" fill="var(--brand-accent, #2FA46A)"/>
+  <circle cx="12" cy="5.6" r="2.1" fill="var(--brand-accent, #3FB87A)"/>
   <text x="33" y="17" fill="currentColor"
         font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-        font-weight="700" font-size="14" letter-spacing="0.14">stemma<tspan fill="var(--brand-accent, #2FA46A)">·</tspan>db</text>
+        font-weight="700" font-size="14" letter-spacing="0.14">stemma<tspan fill="var(--brand-accent, #3FB87A)">·</tspan>db</text>
 </svg>

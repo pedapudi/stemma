@@ -221,3 +221,33 @@ Lowercase, declarative, measured — the same register as the rest of the house.
   is informational and never interactive.
 - **no exclamation marks, no first person for the system.** the system reports;
   it does not celebrate. "indexed 12,480 rows" — not "all done!"
+
+
+## the wordmark
+
+machines write `stemmadb` — code, paths, identifiers, shell examples, package
+names. display contexts write **stemma·db**: the interpunct is the house
+separator carrying the archetype dot, the wordmark's one colored element
+(#2FA46A on light grounds, #3FB87A on dark). JetBrains Mono 700, lowercase,
+always. the ecosystem name alone is `stemma`, plain.
+
+never: uppercase any form · color any glyph but the interpunct · use the
+interpunct form in code · set the wordmark in a non-mono face.
+
+## the asset inventory
+
+| asset | light | dark | use |
+|---|---|---|---|
+| mark | `mark.svg` | `mark-dark.svg` | the 24×24 glyph alone |
+| wordmark | `wordmark.svg` | `wordmark-dark.svg` | text-only placements |
+| lockup | `lockup.svg` | `lockup-dark.svg` | mark + wordmark, horizontal |
+| stacked lockup | `lockup-stacked.svg` | `lockup-stacked-dark.svg` | square-ish placements |
+| hero leaf | `leaf-large.svg` | (currentColor) | docs headers, banners |
+| favicon | `favicon.svg` | (self-grounded) | browser tabs |
+| app icon | `icon.svg` | `icon-dark.svg` | 512 tile, maskable-safe 60% zone |
+| banner | `banner.svg` | `banner-dark.svg` | 1200×630 — readme, social cards |
+| png renders | `png/icon-{16..512}.png`, `png/apple-touch-icon.png`, `png/banner*.png` | | hosts that can't svg |
+
+svg ink is `currentColor` with a `color=""` fallback for `<img>` use; the
+light/dark twins differ only in that fallback and the accent value. regenerate
+pngs with cairosvg (`svg2png`) — no other tooling assumed.
