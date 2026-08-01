@@ -794,3 +794,48 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 /* conversation controls in the rail */
 .rail-convrow { padding: 8px 14px 0; }
 .rail-convpick { width: 100%; font-family: var(--sans); background: var(--panel); cursor: pointer; }
+
+/* ============ force-diagram graph ============ */
+.kg-canvas svg.graph-svg { display: block; }
+.gnode .gdot { stroke: var(--paper); stroke-width: 1.5; transition: stroke .12s; }
+.gnode.kind-table .gdot { fill: var(--panel); stroke: var(--ink-soft); stroke-width: 1.5; }
+.gnode .glabel { fill: var(--ink-soft); font: calc(10.5px * var(--fs)) var(--mono); paint-order: stroke; stroke: var(--paper); stroke-width: 3px; stroke-linejoin: round; }
+.gnode .glabel-table { fill: var(--ink); font: 700 calc(13px * var(--fs)) var(--mono); }
+.gnode .glabel-small { font-size: calc(9px * var(--fs)); }
+.kg-zoomed-out .glabel-small { display: none; }
+.gnode.is-phrase .glabel { fill: var(--good); }
+.gnode.kind-value .glabel { fill: var(--caution); font-style: italic; }
+.gnode:hover .gdot, .gnode.sel .gdot { stroke: var(--accent); stroke-width: 2.5; }
+.gnode.sel .glabel, .gnode.hood .glabel { fill: var(--accent); }
+.gnode.kg-hit .glabel { fill: var(--accent); text-decoration: underline; }
+.gnode.kg-hit .gdot { stroke: var(--accent); }
+.gnode.kg-dim { opacity: .18; }
+
+/* ============ lineage: query → substitution ============ */
+.lineage { position: relative; margin-bottom: 14px; }
+.traj-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.lineage-wire { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: .8; }
+.lineage-wire.lost { stroke: var(--flat); stroke-dasharray: 3 3; opacity: .5; }
+.subline {
+  font-family: var(--mono); font-size: calc(12.5px * var(--fs)); line-height: 2.3;
+  margin-top: 26px; overflow-x: auto; white-space: nowrap; padding-bottom: 2px;
+}
+.sub-plain { color: var(--ink-faint); }
+.sub-chip {
+  font-family: var(--mono); font-size: calc(11px * var(--fs));
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  padding: 1px 7px; margin: 0 2px; cursor: pointer;
+}
+.sub-chip:hover { background: var(--accent); color: var(--paper); }
+.sub-chip.sub-unresolved {
+  color: var(--ink-faint); border: 1px dashed var(--flat); background: transparent; cursor: default;
+}
+
+/* ============ join paths strip ============ */
+.joinpaths { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; margin: 8px 0 10px; }
+.joinpaths .joinpath { cursor: pointer; }
+.joinpaths .joinpath.inferred { border-style: dashed; color: var(--caution); border-color: var(--caution); }
+.gedge.path-hot { stroke: var(--accent) !important; stroke-width: 2.2 !important; opacity: 1 !important; }
+.kg-label.path-hood, .gnode.path-hood .glabel { color: var(--accent); }
+.gnode.path-hood .gdot, .kg-tablebox.path-hood { stroke: var(--accent); border-color: var(--accent); }
