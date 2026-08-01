@@ -1,0 +1,3 @@
+# proto-gen is a cargo-run development tool (see tools/regen_protos.sh); it is
+# intentionally not built by Bazel to keep protoc/codegen out of the build
+# graph while generated code is checked in.

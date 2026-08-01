@@ -1,0 +1,117 @@
+// stemma Resolve API: pin natural-language mentions to concrete records.
+//
+// The response is deliberately a *candidate set with evidence*, not a single
+// forced answer: downstream consumers (a text-to-SQL generator, an agent, a
+// human) choose, and recall matters more than a premature hard commit.
+syntax = "proto3";
+
+package stemma.v1;
+
+service ResolveService {
+  // Resolve the entity mentions in a natural-language query against the
+  // database identified by `database`.
+  rpc Resolve(ResolveRequest) returns (ResolveResponse);
+}
+
+message ResolveRequest {
+  // The natural-language question, verbatim.
+  string query = 1;
+  // Logical name of the target database (registered with the server).
+  string database = 2;
+  ResolveOptions options = 3;
+}
+
+message ResolveOptions {
+  // Maximum ranked candidates returned per mention (0 = server default).
+  uint32 max_candidates_per_mention = 1;
+  // Permit the LM band (mention expansion, adjudication). Off = pure
+  // lexical/dense/KG pipeline.
+  bool allow_lm = 2;
+  // Drop candidates below this confidence (0 = server default).
+  double min_confidence = 3;
+}
+
+message ResolveResponse {
+  // Detected mentions with their ranked candidate resolutions.
+  repeated Mention mentions = 1;
+  // The query with mentions substituted by canonical terms, suitable as
+  // enriched input to a downstream query generator. Empty until substitution
+  // is implemented.
+  string rewritten_query = 2;
+}
+
+// A span of the query believed to reference something in the database.
+message Mention {
+  // Surface text of the span.
+  string text = 1;
+  // Byte offsets into ResolveRequest.query (start inclusive, end exclusive).
+  uint32 start = 2;
+  uint32 end = 3;
+  // Ranked candidate resolutions, best first.
+  repeated Candidate candidates = 4;
+  // True when the pipeline affirmatively concluded no record matches
+  // (distinct from "no candidates found").
+  bool nil = 5;
+}
+
+// One concrete record (or schema element) a mention may resolve to.
+message Candidate {
+  // Table holding the record.
+  string table = 1;
+  // SQLite rowid of the record (0 when the candidate is a schema element).
+  int64 rowid = 2;
+  // Column whose value matched, when the link is value-level.
+  string column = 3;
+  // The canonical stored value that matched.
+  string value = 4;
+  // Calibrated confidence in [0, 1].
+  double score = 5;
+  repeated Evidence evidence = 6;
+}
+
+// Why a candidate is believed; every candidate carries at least one.
+message Evidence {
+  oneof kind {
+    LexicalMatch lexical = 1;
+    SemanticMatch semantic = 2;
+    KgPath kg_path = 3;
+    ProbeResult probe = 4;
+    Adjudication adjudication = 5;
+  }
+}
+
+message LexicalMatch {
+  // Retrieval channel: "exact", "bm25", "trigram", or "spellfix".
+  string channel = 1;
+  // The stored text the mention matched against (an alias, a cell value).
+  string matched_text = 2;
+  // Channel-native score (BM25 score, edit distance, ...).
+  double score = 3;
+}
+
+message SemanticMatch {
+  // Embedding model identity, as recorded in the stemmadb model registry.
+  string model = 1;
+  double similarity = 2;
+}
+
+// A path through the knowledge graph connecting this candidate to another
+// resolved mention's candidate — the collective-disambiguation evidence.
+message KgPath {
+  // Node labels along the path, e.g. ["person:17 'W. Chen'", "team:42"].
+  repeated string nodes = 1;
+  // Edge labels between consecutive nodes, e.g. ["manages"].
+  repeated string edges = 2;
+}
+
+// A live verification query run against the user database.
+message ProbeResult {
+  string sql = 1;
+  uint64 row_count = 2;
+}
+
+// An LM select-among-k decision (only present when the LM band ran).
+message Adjudication {
+  string model = 1;
+  string rationale = 2;
+}

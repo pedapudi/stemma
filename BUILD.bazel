@@ -1,0 +1,5 @@
+# Root package: holds the Cargo workspace manifests referenced by MODULE.bazel.
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])

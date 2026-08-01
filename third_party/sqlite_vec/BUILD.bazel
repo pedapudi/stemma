@@ -1,0 +1,15 @@
+# Vendored sqlite-vec v0.1.6 amalgamation (Apache-2.0/MIT, Alex Garcia).
+# Statically linked into stemmadb and registered via sqlite3_auto_extension —
+# no runtime extension loading, no SQLite surgery.
+cc_library(
+    name = "sqlite_vec",
+    srcs = ["sqlite-vec.c"],
+    hdrs = ["sqlite-vec.h"],
+    copts = [
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+    ],
+    includes = ["."],
+    deps = ["//third_party/sqlite:sqlite3_headers"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,47 @@
+// Embedder sidecar API: batch embedding and cross-encoder reranking.
+//
+// Backends (TEI, in-process ONNX, OpenAI-compatible /v1/embeddings, Vertex)
+// adapt to this interface; the model registry in stemmadb records which
+// backend/model produced every stored vector.
+syntax = "proto3";
+
+package stemma.v1;
+
+service EmbedderService {
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+  rpc Rerank(RerankRequest) returns (RerankResponse);
+  rpc ModelInfo(ModelInfoRequest) returns (ModelInfoResponse);
+}
+
+message EmbedRequest {
+  // Texts to embed, in order.
+  repeated string texts = 1;
+}
+
+message EmbedResponse {
+  repeated Embedding embeddings = 1;
+}
+
+message Embedding {
+  repeated float values = 1;
+}
+
+message RerankRequest {
+  string query = 1;
+  repeated string passages = 2;
+}
+
+message RerankResponse {
+  // One score per passage, same order as the request.
+  repeated double scores = 1;
+}
+
+message ModelInfoRequest {}
+
+message ModelInfoResponse {
+  // Stable identity for the model registry: backend, model name, revision.
+  string backend = 1;
+  string model = 2;
+  string revision = 3;
+  uint32 dimension = 4;
+}

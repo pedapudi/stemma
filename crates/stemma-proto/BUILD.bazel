@@ -1,0 +1,18 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+# Compiles the checked-in generated code (src/gen); regenerate from proto/
+# with tools/regen_protos.sh after editing any .proto.
+rust_library(
+    name = "stemma-proto",
+    srcs = [
+        "src/gen/stemma.v1.rs",
+        "src/lib.rs",
+    ],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:prost",
+        "@crates//:tonic",
+        "@crates//:tonic-prost",
+    ],
+)

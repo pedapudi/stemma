@@ -1,0 +1,12 @@
+# Vendored SQLite amalgamation headers (3.50.4) — used only to compile
+# extensions such as sqlite-vec. The SQLite library itself is provided by
+# libsqlite3-sys's bundled build via crate_universe, keeping SQLite stock.
+cc_library(
+    name = "sqlite3_headers",
+    hdrs = [
+        "sqlite3.h",
+        "sqlite3ext.h",
+    ],
+    includes = ["."],
+    visibility = ["//third_party:__subpackages__"],
+)

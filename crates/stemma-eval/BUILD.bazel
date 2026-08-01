@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+rust_binary(
+    name = "stemma-eval",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:anyhow",
+        "@crates//:clap",
+        "@crates//:rusqlite",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:sqlparser",
+    ],
+)
+
+rust_test(
+    name = "stemma-eval_test",
+    crate = ":stemma-eval",
+)

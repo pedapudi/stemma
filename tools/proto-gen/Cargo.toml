@@ -1,0 +1,9 @@
+[package]
+name = "proto-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
