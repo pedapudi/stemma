@@ -63,7 +63,7 @@ TOOLS = [
     },
 ]
 
-MAX_ROUNDS = 6
+MAX_ROUNDS = 8
 
 
 class LmConfig:
@@ -82,7 +82,7 @@ def _post(cfg: LmConfig, payload: dict[str, Any]) -> dict[str, Any]:
             **({"authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}),
         },
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=420) as r:
         return json.load(r)
 
 
@@ -125,13 +125,36 @@ def chat(
     ]
     trail: list[dict[str, Any]] = []
 
-    for _ in range(MAX_ROUNDS):
-        resp = _post(cfg, {
+    for round_no in range(MAX_ROUNDS):
+        # Last round: withdraw the tools so the model must answer from the
+        # evidence it gathered — exploration without synthesis helps no one.
+        final = round_no == MAX_ROUNDS - 1
+        payload = {
             "model": cfg.model,
-            "messages": convo,
-            "tools": TOOLS,
+            # some chat templates (Qwen3.5) hard-reject mid-conversation
+            # system messages, so the final-round nudge rides as user
+            "messages": convo + ([{
+                "role": "user",
+                "content": "(tool budget exhausted — answer my question now from "
+                "the evidence already gathered, citing table.column #rowid refs; "
+                "no further tool calls are available)",
+            }] if final else []),
             "temperature": 0.2,
-        })
+            # tools stay in the request (templates need them to render the
+            # history); tool_choice forbids further calls on the last round
+            "tools": TOOLS,
+            # thinking off for tool rounds: exploration should be fast, and
+            # the evidence trail is the reasoning (harmless where unsupported)
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if final:
+            payload["tool_choice"] = "none"
+        try:
+            resp = _post(cfg, payload)
+        except Exception as e:
+            # a failed round must not discard the evidence already gathered
+            return {"message": f"— LM endpoint error mid-conversation: {e}; "
+                               "the trail shows what was gathered", "trail": trail}
         msg = resp["choices"][0]["message"]
         convo.append(msg)
         calls = msg.get("tool_calls") or []
@@ -154,8 +177,8 @@ def chat(
                     result = sql_fn(args.get("query", ""))
                     result = {
                         "columns": result["columns"],
-                        "rows": result["rows"][:30],
-                        "truncated": result.get("truncated", False) or len(result["rows"]) > 30,
+                        "rows": result["rows"][:12],
+                        "truncated": result.get("truncated", False) or len(result["rows"]) > 12,
                     }
                     trail.append({"tool": "sql", "args": args, "result": result})
                 elif name == "schema":
