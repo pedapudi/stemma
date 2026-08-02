@@ -23,12 +23,12 @@ whether the encoder half works at all: **embedding-space crowding**.
 > never the retrieval mechanism.**
 
 The entity-linking literature converged on this by trying the alternative.
-The dense retrieve-then-rerank lineage — BLINK [Wu et al. 2020], ELQ
-[Li et al. 2020], ReFinED [Ayoola et al. 2022], ReLiK [Orlando et al. 2024]
-— beats generative entity linking on accuracy *and* on latency, and the gap
-widens as the catalog grows. Autoregressive entity retrieval [De Cao et al.
-2021] is elegant and constrains generation to valid identifiers with a
-prefix trie; the problem is what "valid" buys you.
+The dense retrieve-then-rerank lineage — BLINK [Wu 2020], ELQ [B.Z. Li 2020],
+ReFinED [Ayoola 2022], ReLiK [Orlando 2024] — beats generative entity linking
+on accuracy *and* on latency, and the gap widens as the catalog grows.
+Autoregressive entity retrieval [De Cao 2021] is elegant and constrains
+generation to valid identifiers with a prefix trie; the problem is what
+"valid" buys you.
 
 **Constrained decoding forces validity, not correctness.** A model
 constrained to emit only identifiers that exist in the catalog will always
@@ -36,11 +36,23 @@ emit one that exists. When the right answer is not in its learned
 distribution — because the catalog changed, or because the model never saw
 this database — it emits a *confidently wrong but structurally valid*
 identifier. That is strictly worse than an explicit no-match, because a
-no-match is detectable downstream and a valid-but-wrong record is not. The
-SIGIR 2025 analysis of constrained auto-regressive decoding for generative
-retrieval [Wu et al. 2025] measures the cost directly: the constraint
-that guarantees valid output also constrains the model *away from* correct
-output, and the effect is systematic rather than incidental.
+no-match is detectable downstream and a valid-but-wrong record is not.
+
+[S. Wu 2025] makes this precise, and it is worth being clear that the paper is
+**theoretical rather than an ablation**. It derives a lower bound on the KL
+divergence between the true and predicted step-wise marginals, arising because
+the model is unaware of future constraints while it is generating — the
+constraint is applied to a distribution that was not computed with the
+constraint in mind. It further shows that beam search over those marginals
+optimizes the wrong objective, so on sparse relevance distributions a model
+can achieve *perfect top-1 precision while suffering poor top-k recall*: on
+TREC DL 2019, R@50 of 53.7 against P@1 of 69.8; on MS MARCO-dev, 67.5 against
+90.5. The gap opens at the very first decoding step.
+
+That precision/recall asymmetry is the specific reason constrained generation
+is wrong for stemma: the pipeline's whole output contract is a **recall-biased
+candidate set**, and this is a mechanism that trades recall for top-1
+precision by construction.
 
 For stemma the argument is sharper than for the open-domain case, because
 stemma's "catalog" is *the user's database* — a catalog no model was trained
@@ -102,7 +114,7 @@ analytically — exact for unit vectors, since `cos = 1 − d²/2`.
   being indexed.
 
 `vec_slice()` is available in this build, which matters for Matryoshka-style
-encoders [Kusupati et al. 2022]: a 1024-dimension vector can be truncated to
+encoders [Kusupati 2022]: a 1024-dimension vector can be truncated to
 256 or 512 at query time for a cheap first pass, with the full dimension used
 for rescoring, without storing three copies. Nothing uses it yet, and it is
 the cheapest available answer to the full-scan cost — a 256-dimension first
@@ -201,7 +213,7 @@ agree on everything:
    this document as outstanding, this is the one that fails quietly, and the
    check is four lines.
 2. **Same instruction prefix.** Instruction-tuned retrieval encoders — the
-   Qwen3-Embedding family among them [Zhang et al. 2025] — expect an
+   Qwen3-Embedding family among them [Zhang 2025] — expect an
    asymmetric prompt: a task instruction on the query side, documents raw.
    `stemma_embed::format_query()` implements it, and the same asymmetry was
    used when the vectors were produced. Getting this wrong is the most common
@@ -316,29 +328,29 @@ Contextual embeddings are **anisotropic**: representations from pretrained
 language models occupy a narrow cone rather than the full sphere, so two
 random words have far higher expected cosine similarity than chance
 [Ethayarajh 2019]. The training objective produces this — the *representation
-degeneration problem* [Gao et al. 2019] shows that the standard likelihood
+degeneration problem* [J. Gao 2019] shows that the standard likelihood
 objective with tied output embeddings pushes representations toward a narrow
 cone as a direct consequence of the loss, not as an artefact of the data, and
 later work locates part of the effect in self-attention itself
-[Godey et al. 2024]. Some of the measured anisotropy turns out to be a few
-**rogue dimensions** dominating the cosine [Timkey & van Schijndel 2021], and
+[Godey 2024]. Some of the measured anisotropy turns out to be a few
+**rogue dimensions** dominating the cosine [Timkey 2021], and
 the space is better described as clusters on a manifold than as one uniform
-cone [Cai et al. 2021].
+cone [Cai 2021].
 
 Sentence-embedding work attacked it geometrically: removing the top dominant
-directions [Mu et al. 2018], mapping the distribution to a Gaussian with a
-normalizing flow [Li et al. 2020b], and achieving most of the same gain with
-a linear whitening transform [Su et al. 2021]. SimCSE then reframed the whole
+directions [Mu 2018], mapping the distribution to a Gaussian with a
+normalizing flow [Bohan Li 2020], and achieving most of the same gain with
+a linear whitening transform [Su 2021]. SimCSE then reframed the whole
 thing as a trade-off between **alignment** (similar pairs close) and
-**uniformity** (representations spread over the sphere) [Gao et al. 2021],
+**uniformity** (representations spread over the sphere) [T. Gao 2021],
 importing the framework from contrastive representation learning
-[Wang & Isola 2020] — where the failure mode has its own name, *dimensional
-collapse* [Jing et al. 2022]. High-dimensional retrieval has its own version,
+[T. Wang 2020] — where the failure mode has its own name, *dimensional
+collapse* [Jing 2022]. High-dimensional retrieval has its own version,
 **hubness**: a few points become the nearest neighbour of disproportionately
 many queries, and the effect worsens as intrinsic dimensionality rises
-relative to extrinsic [Radovanović et al. 2010]. And a standing caution over
+relative to extrinsic [Radovanović 2010]. And a standing caution over
 all of it: cosine similarity is only "similarity" to the extent the training
-objective made it so [Steck et al. 2024].
+objective made it so [Steck 2024].
 
 Two things follow, and the second is the one that matters here.
 
@@ -380,12 +392,12 @@ Before and after any encoder change, on a sample of the corpus:
 
 - **Mean and spread of pairwise cosine similarity.** Crowding shows as a high
   mean with a small standard deviation. This is the direct measurement.
-- **Effective rank** [Roy & Vetterli 2007] and **participation ratio** of the
+- **Effective rank** [Roy 2007] and **participation ratio** of the
   embedding matrix's singular values — how many dimensions the corpus
   actually uses. IsoScore is the calibrated alternative when a single
-  0–1 utilization number is wanted [Rudman et al. 2022].
+  0–1 utilization number is wanted [Rudman 2022].
 - **Hubness**: the skew of the *k*-occurrence distribution (how often each
-  point appears in others' top-*k*) [Radovanović et al. 2010]. A long right
+  point appears in others' top-*k*) [Radovanović 2010]. A long right
   tail means a few documents are absorbing queries they have nothing to do
   with.
 - **Retrieval recall@k on held-out queries**, which is the only one that
@@ -396,153 +408,315 @@ These belong in the `model_registry` row's neighbourhood as recorded
 properties of a vector generation, so that a blue-green swap can be justified
 by numbers rather than by belief.
 
-## ambit: measuring crowding, and tuning against the measurement
+## ambit: a measurement instrument
 
-[ambit](https://github.com/pedapudi/ambit) is the sibling project that
-addresses crowding directly. Its framing, in its own words: *"ambit tells you
-where an embedded dataset is too crowded to work — and which items are in
-trouble."*
-
-Two things about its thesis matter for how it slots into stemma.
-
-**Crowding hides from averages.** A corpus can look healthy on every global
-statistic while one pocket of it has collapsed — a small tight clump barely
-moves a mean. So ambit measures occupancy *continuously over every scale*
-(no histogram bins or grid cells, whose size and placement change the answer),
-*against a calibrated null* (every number read against what a well-spread
-dataset of the same size and shape would show), and *down to named items*
-— not "this region is dense" but "these documents, by id, are each expected
-to collide with about twelve others". The measurement is unsupervised: no
-labels, no gold pairs.
-
-**The operational unit is a noise budget, not a geometry score.** Model a
-query as its target item plus noise of scale σ. A competitor at distance *r*
-wins the retrieval exactly when the noise crosses the halfway plane between
-the two items, with probability Φ(−r/2σ). Summing over competitors gives the
-expected number of wrong items outranking the right one, and **σ\*** — the
-largest noise at which that expectation stays ≤ 1 — is the corpus's
-resolution bandwidth: *how much query sloppiness the corpus tolerates before
-wrong items win*. That is directly the quantity stemma's dense channel cares
-about, because an oblique mention is a noisy query by construction.
-
-The surface is a CLI over a library:
+[ambit](https://github.com/pedapudi/ambit) is the sibling project for this
+problem, and the first thing to be clear about is what it is not. It is a
+**numpy-first Python library with a thin CLI** — one hard dependency, `numpy`
+— that reads *already-embedded vectors* and renders a self-contained HTML
+report. It does not train models. It does not serve them. It has no model
+registry. Its framing, in its own words: *"ambit tells you where an embedded
+dataset is too crowded to work — and which items are in trouble."*
 
 ```sh
+ambit info   embeddings.parquet                        # streaming scan, scalars
 ambit report embeddings.parquet --id-col uuid --out report.html
-ambit info   embeddings.parquet                    # terminal scan, numbers only
-ambit report encoder-a.parquet --compare encoder-b.parquet --id-col uuid \
-             --out diff.html                       # same items, two encoders
+ambit report a.parquet --compare b.parquet --id-col uuid --out diff.html
 ```
 
-with `ambit.report()` / `ambit.diagnose()` / `ambit.scan()` in Python and a
-training module (`ambit.training`) that turns the measurements into gradient
-signal: `resolution_weights` (oversample the items measured to be in
-trouble), `mine_confusable_negatives` (draw negatives from the measured
-confusable window, with a guard that never mines an anchor's top-*m* base
-neighbours, because that window is exactly where unlabelled true relatives
-live), `confusion_loss` (minimize expected collisions at the measured σ) and
-`preservation_loss` (pin who-is-similar-to-whom to the frozen base model).
+with `ambit.diagnose()` / `ambit.report()` / `ambit.scan()` in Python. Nothing
+is read from the environment; a `Config` object or keyword overrides drive
+everything. It also ships `ambit embed`, which produces vectors through an
+OpenAI-compatible `/v1/embeddings` endpoint — the same protocol stemma's
+`Embedder` backend speaks.
 
-The discipline it enforces is the one stemma needs: **measure first, apply
-the cheapest fix the measurement licenses.** ambit's own decision tree says
-*don't tune* when the data merely hugs the anisotropy-matched reference —
-mean-centering or light whitening recovers it — and *fix the data, not the
-model* when the pockets are near-duplicates. Only genuine clumping beyond the
-cone at moderate scale is a tuning case. That matters here because it means
-"train a per-corpus encoder" is a conclusion a measurement can license or
-refuse, not a default.
+Its thesis is that **crowding is a loss of resolution**: when items pack too
+tightly, cosine similarity can no longer tell them apart. Three properties of
+that framing matter here.
 
-### What this looked like on stemma's own legal corpus
+**It is relatedness-agnostic.** The harm is *unresolvability*, not density.
+A tight group of genuinely related items is still a group a query cannot rank
+within — which is exactly stemma's problem when a mention has to pick one
+regulation out of forty near-identical ones.
 
-ambit has already been run over a corpus that **shares this repository's
-`regulations` table exactly**. The measurements below come from a
-1,000,000-vector map of the Nemotron legal corpus — California Code of
-Regulations 57,523 · Case-Law Summary 53,137 · CaseHOLD 444,670 · eCFR-QA
-444,670 — embedded at 1024 dimensions with **Qwen3-Embedding-0.6B**
-[Zhang et al. 2025] and with three successive fine-tunes of it, recorded in
-`analyze-{base,v1,v2,v3}.txt` and the corresponding `legal-qwen3-*` ambit
-reports.
+**Averages cannot see it, and there is arithmetic for that.** A planted pocket
+of 200 near-duplicates in a 4,000-item corpus (median intra-pocket cosine
+0.929) moves the mean pair cosine by about +0.002 — roughly 6% of one null
+standard deviation, invisible without a calibrated test and uninformative
+about *which* items failed. In a matched power study the continuous layer
+detects a 20-item (1%) pocket at power 1.00 where mean-cosine detection has
+power 0.04 and hubness 0.18.
 
-The California Code of Regulations slice is row-for-row the same 57,523
-records as `legal.db`'s `regulations` table (verified by uuid join, below).
-The federal half differs: this repository's `sections` table is the Nemotron
-**eCFR** subset, while the ambit map's fourth subset is **eCFR-QA**, a
-question-answer derivative. So the numbers below describe the *neighbourhood*
-stemma's regulations live in, and describe the regulations themselves
-exactly.
+**High dimension is a blessing, not a curse.** At d = 1024 the null standard
+deviation of a random pair cosine is 1/√1024 ≈ 0.031, so a healthy corpus has
+essentially *no* close pairs and every close pair is a finding.
 
-The base-model geometry is the crowding argument stated as data:
+### The doctrine: cheapest sufficient fix wins
 
-| | base (Qwen3-Embedding-0.6B) |
+This is the part of ambit's design most likely to be misread, so it is worth
+stating flatly: **ambit does not argue that corpus-tuned embedding models fix
+crowding.** Its documented ordering puts training *last*:
+
+| diagnosis | licensed fix |
+|---|---|
+| Data hugs the anisotropy-matched reference (a cone and nothing more) | **Do not tune.** Mean-centering, all-but-the-top [Mu 2018], light whitening [Su 2021; Huang 2021]. Re-measure. |
+| Pockets born near distance 0 (near-duplicates) | **Fix the data, not the model.** Deduplicate, or accept the pocket as one entity. Training against true duplicates wastes gradient and hurts recall. |
+| Genuine clumping beyond the cone at moderate scale | **Only this licenses training.** |
+
+The evidence for the cheap path is strong: on real corpora, mean-centering
+plus all-but-the-top *"removes ~100% of the impostor floor and widens margins
+4× … no training, no labels."* ambit's technical report lists model-versus-data
+attribution — *"the fraction of measured crowding removable by a budgeted
+transform class, computed rather than predicted"* — as future work, not as a
+settled result.
+
+For stemma this ordering is a design constraint, not a footnote. It means the
+first response to a crowded corpus is a linear transform applied at index and
+query time, recorded in `model_registry` as a property of the vector
+generation — not a fine-tuning run. It also means "tune an encoder per corpus"
+is a conclusion a measurement can *refuse*.
+
+### What ambit measures, and why it is exact in stemma's regime
+
+The load-bearing quantity is a collision probability with a closed form.
+Model a query as its target plus isotropic noise, `q = x + σg`. A competitor
+`y` beats the target exactly when the noise crosses the halfway plane between
+them, so
+
+$$ P(y \text{ beats } x) = \Phi\!\left(-\frac{\lVert x-y \rVert}{2\sigma}\right) $$
+
+**exactly, in any dimension** — verified by simulation to a maximum deviation
+of 9×10⁻⁴. Summing over competitors gives the *confusion functional*
+
+$$ C(\sigma) = \sum_{j \ne i} \Phi\!\left(-\frac{\lVert x - x_j \rVert}{2\sigma}\right) $$
+
+— the expected number of wrong items outranking the right one — and **σ\*** is
+the largest σ at which `C(σ) ≤ 1`. It is the corpus's **noise budget**: how
+much query sloppiness the corpus tolerates before wrong items win. Being a
+union bound, it is conservative under any competitor correlation, which makes
+it a guarantee rather than an estimate.
+
+Two consequences are what make this the strongest hook between the two
+projects.
+
+**First, σ\* is exact — not extrapolated — precisely in stemma's
+instance-layer regime.** ambit is explicit about its scope: everything treats
+*the corpus as its own query population*, which "covers dedup, clustering,
+related-item retrieval, and corpus-as-queries search directly", and
+extrapolating to an external query workload assumes that workload lands where
+the documents are. The technical report is blunter: the treatment is "exact
+for deduplication, clustering, and corpus-as-queries retrieval."
+
+That is a description of
+[the knowledge graph's instance layer](04-knowledge-graph.md#instance-layer):
+alias clustering, and entity resolution across rows — deciding that *Wei Chen*
+in one table and *W. Chen* in another are one referent. Records are queried
+against records. **For stemma's document retrieval the σ\* number is an
+informative proxy; for stemma's entity resolution it is the right number,
+exactly.**
+
+**Second, near-duplicates are provably the worst pathology.** As the distance
+between two items goes to zero, Φ(−r/2σ) → 1/2 *at every σ*: a near-duplicate
+is a coin flip at any noise level, no matter how good the encoder. That is the
+formal reason a duplicate pocket cannot be fixed by tuning, and it is why
+ambit's decision tree routes duplicates to deduplication rather than to
+training.
+
+It is also the one place where the confusion functional and the
+alignment/uniformity framework [T. Wang 2020] **disagree**, and the
+disagreement is entity-resolution-shaped. Across eight synthetic corpus types
+the two agree on 27 of 28 pairwise orderings (rank correlation 0.978). The
+single flip is "cone plus duplicate pocket" (C = 17.78) versus "low-rank
+collapse" (C = 15.49): the confusion kernel calls the duplicate corpus worse,
+uniformity calls it better. For a system whose job is to tell records apart,
+the confusion ordering is the operationally correct one — a duplicate pocket
+is unresolvable, and a low-rank space merely has less room. (The two are not
+unrelated: by a Chernoff bound, uniformity at t = 2 *is* a collision bound at
+σ = 0.25.)
+
+### The division of labour ambit implies
+
+ambit names the confusable records. Its per-entity fields report, by id, the
+radius each record needs to gather a fixed share of the corpus, and the
+expected collision count at σ\*. Its pocket detector surfaces tight groups
+with birth and death scales and lists their members by id.
+
+What it does not have — verified by grep across its documentation — is any
+notion of *linking*: no pair-linking, no transitive closure, no blocking keys,
+no match/non-match decision. It produces a diagnosis, not a resolution.
+
+**That is exactly the seam stemma fills.** ambit says *these records are
+unresolvable at this noise budget*; stemma's entity-resolution and coherence
+layer decides *which of them are the same referent, and with what evidence*.
+The two halves compose without overlap, and the compose point is concrete: a
+record ambit flags with a high expected collision count is a record whose
+alias edges should carry a lower confidence, and a pocket ambit names is a
+candidate cluster for the instance layer to adjudicate rather than a set of
+independent rows.
+
+Three honest limits on the diagnosis side, worth knowing before building on
+it: the merge tree runs on a subsample of at most 4,096 points, so pockets are
+a profile over a reservoir rather than a full-corpus clustering; σ\* is a
+union bound and therefore a conservative screen; and the pocket detector's
+minimum size of 8 means duplicate *pairs* and *triples* never appear as
+pockets at all — they surface only in the low tail of the per-entity field.
+
+### The legal corpus, measured
+
+The corpus in this repository is a subset of one ambit has been run over. The
+California Code of Regulations slice is row-for-row the same 57,523 records as
+`legal.db`'s `regulations` table (verified by uuid join, below). The federal
+half differs: this repository's `sections` table is the Nemotron **eCFR**
+subset, while the ambit map's fourth subset is **eCFR-QA**, a question-answer
+derivative.
+
+Base-model geometry — Qwen3-Embedding-0.6B [Zhang 2025] at 1024 dimensions
+over the full 1,000,000-vector map:
+
+| | base |
 |---|---:|
-| mean random-pair cosine | **+0.236** |
-| kNN@10 hubness (k-occurrence skew) | +1.90 |
-| kNN@10 same-subdomain purity | 0.89 |
-| participation ratio | 93 / 1024 |
-| effective rank | 728 |
+| mean random-pair cosine | **+0.236** (null sd ≈ 0.031 at d = 1024) |
+| crowding onset | ≈ cos **+0.82**, global rank-envelope p = **0.010** [Myllymäki 2017] |
+| resolution bandwidth σ\* | **0.123** vs **0.148** for a well-spread corpus |
+| — noise budget retained | **83%** |
+| effective rank | 728 of 1024 |
 | 90% of variance in | 361 dims |
+| IsoScore | 0.090 |
+| kNN@10 hubness skew | +1.90 |
+| kNN@10 same-subdomain purity | 0.89 |
 | centroid cosine, CA-Regs ↔ eCFR-QA | **0.81** |
 
-Read the last row first. California's state regulations and the federal eCFR
-are *different corpora about different law*, and the base encoder places their
-centroids at cosine 0.81 — nearly collinear. A mention that should
-discriminate between state and federal regulation has almost no angle to work
-with. Meanwhile a mean random-pair cosine of +0.236 with only 93 of 1024
-dimensions carrying meaningful variance is exactly the anisotropic-cone
-picture of [Ethayarajh 2019] and [Gao et al. 2019], measured on the corpus
-stemma actually serves.
+Read the last row first. California's state regulations and the federal
+eCFR-QA set are *different corpora about different law*, and the base encoder
+places their centroids at cosine 0.81 — nearly collinear. A mention that
+should discriminate between state and federal regulation has very little angle
+to work with.
 
-The three tuning rounds are worth recording honestly, because they are a
-demonstration that this is a real engineering problem and not a switch:
+The σ\* line is the one that translates to stemma directly: the corpus retains
+83% of the noise budget a well-spread corpus of the same size and shape would
+have. That is a real but not catastrophic loss — which is itself a useful
+result, because it says this corpus is a *cone* problem more than a *pocket*
+problem, and ambit's own decision tree routes cone problems to centering and
+whitening rather than to training.
+
+The per-entity field names names. The most crowded records carry expected
+collision counts of about 12 at σ\* (uuids `9b3dd305…`, `a310931d…`), against
+a most-isolated tail near 1.21 on the same radius scale; the most prominent
+pocket holds 204 sampled points, forming at radius 0.41 and persisting for
+0.09. Those are the records for which a lexical mention will not discriminate,
+listed by the identifier stemma joins on.
+
+Two caveats on citing these numbers. The occupancy z-score of −4,211 that
+appears in the same report is **a test statistic, not an effect size** — it
+grows with the pair-sample count and is comparable only at matched sampling.
+And the report-level numbers here are for the base model only: the tuned
+models' reports were rendered with `--approx 200000`, whose reservoir happened
+to draw only two of the four subsets, so their header figures are not
+comparable to the base report's. The cross-model table below comes from a
+separate script run identically over the full map.
+
+### Three rounds of tuning, and a split verdict
+
+**These models were not trained with ambit.** They were trained with
+sentence-transformers — `MultipleNegativesRankingLoss` inside `MatryoshkaLoss`
+(1024/768/512/256) for v1 and v2, a custom multi-positive InfoNCE with
+false-negative masking for v3 — as full fine-tunes of Qwen3-Embedding-0.6B, no
+LoRA, last-token pooling with left padding, global batch 256 across two GPUs,
+lr 2e-5, two epochs. ambit was the **audit layer**: it measured the corpus
+before, and compared the checkpoints after.
+
+Geometry, from one script run identically over all four full 1M maps:
 
 | | base | v1 | v2 | v3 |
 |---|---:|---:|---:|---:|
 | mean random-pair cosine | +0.236 | +0.181 | **+0.147** | +0.212 |
-| kNN hubness skew | +1.90 | +2.27 | **+1.50** | +1.74 |
+| kNN@10 hubness skew | +1.90 | +2.27 | **+1.50** | +1.74 |
 | kNN@10 purity | 0.89 | 0.91 | 0.81 | **0.90** |
 | CA-Regs ↔ eCFR-QA centroid | 0.81 | **0.66** | 0.78 | 0.78 |
 
-- **v1** (eCFR pairs only, hard negatives mined with the base model, full
-  fine-tune with `MultipleNegativesRankingLoss` under `MatryoshkaLoss` at
-  1024/768/512/256) separated the regulatory family best — 0.81 → 0.66 — and
-  won its trained task decisively (eCFR question→section Recall@1 0.288 →
-  0.355, +23%; mean rank 345 → 210). It also *spiked hubness* to +2.27 and
-  regressed everything it was not trained on: open-corpus single-doc
-  Recall@10 0.952 → 0.830, multi-hop set-Recall@10 0.687 → 0.366. A clean
-  specialist, and a clean case of catastrophic forgetting.
-- **v2** folded the other domains back in under one uniform schema. It opened
-  the cone the most (+0.147) and pushed hubness *below* base (+1.50) — but
-  kNN purity fell to 0.81, neighbourhoods got mixed, and multi-hop stayed
-  well under base.
-- **v3** (multi-positive InfoNCE with false-negative masking — necessary
-  because 82% of gold documents are shared by two or more queries) produced
-  the cleanest geometry of any tuned model, restoring purity to base level
-  (0.90) while keeping the cone open, with the best mean rank on the trained
-  task (197) and near-full recovery of single-doc retrieval (R@10 0.918 vs
-  base 0.952).
+Retrieval, on held-out splits (1,000 Set A questions over 35,173 eCFR
+sections; 747 single-doc and 749 multi-doc Set B questions over a ~1.035M-doc
+corpus):
 
-And the honest negative result: **v3's multi-hop Recall@10 did not move**
-(0.487 vs v2's 0.481), even with purity restored and the loss provably
-correct. The diagnosis was data composition — only 1,808 of 48,413 training
-queries (3.7%) were multi-positive — not geometry and not the objective.
+| | base | v1 | v2 | v3 |
+|---|---:|---:|---:|---:|
+| **Set A** (trained task) R@1 | 0.288 | **0.355** | 0.336 | 0.350 |
+| Set A R@10 | 0.750 | **0.840** | 0.832 | 0.829 |
+| Set A mean rank | 345 | 210 | 240 | **197** |
+| **Set B** single-doc R@10 | **0.952** | 0.830 | 0.906 | 0.918 |
+| **Set B** multi-doc set-Recall@10 | **0.687** | 0.366 | 0.481 | 0.487 |
+| Set B multi-doc set-Recall@100 | **0.872** | 0.634 | 0.790 | 0.814 |
 
-Three lessons transfer directly to stemma's design:
+The verdict is split, and the project states it that way: **ship v3 for
+single-target legal retrieval; for multi-hop retrieval the base model still
+wins.** Three lessons transfer directly into stemma's design.
 
-1. **Better isotropy is not better retrieval.** v2 had the best global
-   geometry and the worst neighbourhood purity. A blue-green swap justified
-   by mean cosine alone would have shipped it. The gate has to be held-out
-   retrieval on the tasks the corpus is actually used for
-   ([06-evaluation.md](06-evaluation.md)), with geometry as the explanation
-   rather than the verdict.
-2. **Per-corpus tuning is per-*task* tuning in disguise.** v1's gain was
-   eCFR-task-aligned and did not transfer. For stemma this means a tuned
-   encoder is registered against the corpus *and* the retrieval pattern it
-   was tuned for, and a corpus serving several patterns may want more than
-   one vector generation.
-3. **The base model can win.** For multi-hop retrieval on this corpus, it
-   does. A design that treats the tuned encoder as strictly better than its
-   base would have no way to express that; a registry that treats them as two
-   equally legitimate vector generations does.
+**Better isotropy is not better retrieval.** v1 improved essentially every
+geometry number — the cone opened, the regulatory family separated 0.81 → 0.66,
+participation ratio rose from 93 to 115 of 1024 dimensions — and *regressed*
+open-corpus retrieval badly (multi-doc set-Recall@10 0.687 → 0.366). The
+project's own summary: "better isotropy ≠ better retrieval on every task."
+A blue-green swap justified by mean cosine alone would have shipped it.
+
+**Per-corpus tuning is per-*task* tuning in disguise.** v1's gains were
+eCFR-task-aligned and did not transfer. For stemma this means a tuned encoder
+is registered against the corpus *and* the retrieval pattern it was tuned for,
+and a corpus serving several patterns may need more than one vector
+generation.
+
+**The residual gap was data, not geometry and not the loss.** v3 restored kNN
+purity to base level *and* used a provably correct multi-positive objective,
+and multi-hop@10 still did not move (0.487 vs v2's 0.481; only deeper k
+improved). The cause was training-set composition — only 1,808 of 48,413
+queries (3.7%) were multi-positive, so the single-target signal dominated.
+That is a negative result about *measurement-guided tuning generally*: the
+geometry was fixed and the retrieval metric did not follow, because the
+limiting factor was never the geometry.
+
+*Provenance note: the geometry table is reproduced from analysis outputs on
+this machine; the retrieval table and the training configuration are reported
+by the project's own write-up and were not re-run here.*
+
+### When measurement licenses training: ambit's hooks
+
+When the diagnosis does land in the third row of the decision table, ambit
+ships the pieces to aim a fine-tune — about 200 lines, deliberately small:
+
+- **`resolution_weights(X, sigma, floor=0.25)`** — sampling weights
+  proportional to per-entity collision counts, with a uniform floor so the
+  bulk stays anchored. The items measured to be in trouble get oversampled.
+- **`mine_confusable_negatives(X, cos_window=(liftoff, 0.98), guard_top_m=5,
+  per_anchor=8)`** — negatives drawn from the measured confusable window, with
+  a **false-negative guard**: an anchor's top-*m* base-model neighbours are
+  never negatives, because that window is exactly where unlabelled true
+  relatives live. For stemma this guard is not optional — in the legal corpus,
+  82% of gold documents are shared by two or more queries.
+- **`confusion_loss(z, sigma, exclude)`** — a batch estimate of `C(σ)/(n−1)`.
+  Its **gradient locality is a theorem**, not a hope: the derivative of
+  Φ(−r/2σ) decays as exp(−r²/8σ²), so pairs beyond ≈3σ contribute vanishing
+  gradient, and the loss provably cannot disturb global dissimilarity
+  structure. It widens margins *inside* the confusable window and nowhere
+  else.
+- **`preservation_loss(z, z_base)`** — per-anchor KL from the frozen base
+  model's in-batch similarity distribution. "Don't hurt similarity" as a
+  differentiable statement.
+
+`σ` comes from the measurement, and the window's lower bound is the measured
+crowding onset — neither is a swept hyperparameter. The published effect is
+**synthetic only**: on a planted 300-of-4,000 pocket at d = 64, a linear
+adapter reduced flagged-item median expected collisions from 2.59 to 1.25 at
+held-out neighbour overlap 0.92. That is the honest state of the training
+layer, and it is why this document treats measurement-guided tuning as a
+designed path rather than a proven one.
+
+The verification loop is the part stemma should copy regardless: hold out a
+reservoir that neither mining nor batching ever sees, and grade every round on
+it with a compare report — σ\* rising, crowding onset retreating toward higher
+cosine, collision counts falling on the entities flagged in the first
+diagnosis, and neighbour overlap against the base staying high. That last one
+is the drift alarm; if it collapses you are re-skinning the space, not
+repairing it.
+
 
 ### The integration
 
@@ -575,29 +749,46 @@ name; what distinguishes them is which fine-tune produced them. With
 vectors have identical registry rows. Given the numbers below — where v1 and
 v2 differ by 0.32 absolute on multi-hop recall — that is not a cosmetic gap.
 
-**The careg vectors are the first payload, and they are ready.** The corpus
-builders preserve `uuid` for exactly this reason —
-[`build_careg_db.py`](../../eval/careg/build_careg_db.py) says so in its
-module docstring, and
-[`docs/user-guide/04-corpora.md`](../user-guide/04-corpora.md) states the
-intent. The artefact those documents refer to exists and has been checked
-against the database in this repository:
+**The careg vectors are the first payload, and there are four of them.**
 
-| | |
-|---|---|
-| files | `careg-00000{0,1,2}.parquet` (one of four subsets in a 1M-row map) |
-| columns | `row_id int64`, `uuid string`, `subset string`, `embedding fixed_size_list<float>[1024]` |
-| parquet metadata | `embedding_model = Qwen3-Embedding-0.6B`, `embedding_dim = 1024`, `embedding_dtype = float32` |
-| rows | 57,523 |
-| uuid coverage against `legal.db` `regulations` | **57,523 / 57,523 — 100%** |
+First, a correction worth making precisely, because the repository's own prose
+invites the wrong reading. The careg **source parquet contains no embedding
+column** — its schema is `text`, `license`, `metadata{category, models_used}`,
+`uuid`, and nothing else. The vectors are a *separate, external artefact*,
+uuid-aligned to it. What
+[`build_careg_db.py`](../../eval/careg/build_careg_db.py) preserves is the
+join key, and its docstring says exactly that: uuid is kept "so the
+pre-computed embeddings … can be joined in later without re-embedding."
 
-Two details make this a good first payload rather than merely an available
-one. The **row count is exact** against the user table, and the **model
-identity travels with the vectors** in the parquet's own key-value metadata —
-so the `model_registry` row can be populated from the artefact instead of
-from a human's recollection of which checkpoint produced it. That is the same
-identity discipline the Embedder service's `ModelInfo` enforces at runtime,
-arriving through a different door.
+There are **four uuid-aligned vector sets**, one per encoder generation, each
+verified against the database in this repository:
+
+| set | `embedding_model` metadata | rows | uuid coverage of `regulations` |
+|---|---|---:|---|
+| `emb-1024-1M` | `Qwen3-Embedding-0.6B` (base) | 57,523 | **57,523 / 57,523 — 100%** |
+| `emb-1024-1M-tuned` | `qwen3-emb-legal-v1` | 57,523 | **100%** |
+| `emb-1024-1M-v2` | `qwen3-emb-legal-v2` | 57,523 | **100%** |
+| `emb-1024-1M-v3` | `qwen3-emb-legal-v3` | 57,523 | **100%** |
+
+All are `row_id int64`, `uuid string`, `subset string`,
+`embedding fixed_size_list<float>[1024]`, with key-value schema metadata
+`{embedding_model, embedding_dim: "1024", embedding_dtype: "float32"}`.
+
+**This maps one-to-one onto the blue-green design, and is the reason that
+design exists.** Four generations of the same 57,523 records, each carrying
+its own model identity, is precisely the situation `model_registry` was shaped
+for: four vector tables, four registry rows, no mixing, and an A/B comparison
+that needs no embedding run. The **model identity travels with the vectors**
+in the parquet metadata, so a registry row can be populated from the artefact
+rather than from a human's recollection of which checkpoint produced it —
+the same discipline `ModelInfo` enforces at runtime, arriving through a
+different door.
+
+It also sharpens the `revision` gap noted above: all four sets would land in
+the registry as dimension 1024, quantization f32, and a `model` string that
+distinguishes them only because the fine-tunes were given distinct served
+names. Nothing structural prevents two generations of the *same* served name
+from becoming indistinguishable.
 
 The load path is a join, not an embedding run:
 
@@ -634,7 +825,7 @@ re-embedding anything.
 1024-dimension `f32` generation and a Matryoshka-truncated 256-dimension
 generation are different rows in `model_registry` pointing at different
 tables. `vec_slice()` in the linked sqlite-vec build makes truncation a query-
-time operation when the encoder was trained for it [Kusupati et al. 2022],
+time operation when the encoder was trained for it [Kusupati 2022],
 and `vec_quantize_int8()` / `vec_quantize_binary()` make quantized generations
 expressible — with `quantization` in the registry recording which, so that a
 distance computed against the wrong representation is impossible to produce
@@ -675,11 +866,16 @@ producing evidence.
 
 *"the crown"* → *"the British monarchy; royal institution"*.
 
-The single highest-leverage use of a language model in an entity-linking
-pipeline is not selection — it is giving the retriever something to retrieve
-with. LLM-augmented entity linking [Xin et al. 2025] reports substantial
-absolute gains from exactly this: the LM writes context for the mention, the
-retriever does the retrieval, and neither does the other's job.
+The most promising use of a language model in an entity-linking pipeline is
+not selection — it is giving the retriever something to retrieve with.
+LLM-augmented entity linking works exactly this way: the LM writes context for
+the mention, a specialized linker does the linking, and neither does the
+other's job. [Xin 2025] reports an absolute 8.9% entity-linking accuracy gain
+across six benchmarks — **measured against prior methods that integrate
+tuning-free LLMs into entity linking, not against specialized linkers in
+general.** The claim to take from it is that *this* way of using an LM beats
+other ways of using an LM, which is the architectural point, not a claim that
+LM augmentation beats everything.
 
 For stemma the expansion is fed to the lexical and dense channels as
 additional queries, and the results fuse into the same RRF as everything
@@ -730,7 +926,7 @@ by canonical values:
 It exists because the most common downstream consumer is a query generator,
 and handing it a *pre-linked* question turns value linking from something it
 must do into something it must merely transcribe. This is the
-resolve-then-generate pattern [Talaei et al. 2024] made concrete at the
+resolve-then-generate pattern [Talaei 2024] made concrete at the
 interface: the artifact carries the linking, and the generator writes SQL
 against a question whose oblique references have already been pinned.
 
@@ -788,43 +984,16 @@ gets the options; the human gets the trace.
 
 ## References
 
-- [Ayoola et al. 2022] Tom Ayoola et al. "ReFinED: An Efficient Zero-shot-capable
-  Approach to End-to-End Entity Linking." NAACL 2022 (Industry Track).
-- [De Cao et al. 2021] Nicola De Cao et al. "Autoregressive Entity Retrieval."
-  ICLR 2021.
-- [Ethayarajh 2019] Kawin Ethayarajh. "How Contextual are Contextualized Word
-  Representations?" EMNLP-IJCNLP 2019.
-- [Gao et al. 2019] Jun Gao et al. "Representation Degeneration Problem in
-  Training Natural Language Generation Models." ICLR 2019.
-- [Gao et al. 2021] Tianyu Gao, Xingcheng Yao, Danqi Chen. "SimCSE: Simple
-  Contrastive Learning of Sentence Embeddings." EMNLP 2021.
-- [Kusupati et al. 2022] Aditya Kusupati et al. "Matryoshka Representation
-  Learning." NeurIPS 2022.
-- [Li et al. 2020] Belinda Z. Li et al. "Efficient One-Pass End-to-End Entity
-  Linking for Questions." EMNLP 2020 (ELQ).
-- [Li et al. 2020b] Bohan Li et al. "On the Sentence Embeddings from
-  Pre-trained Language Models." EMNLP 2020.
-- [Orlando et al. 2024] Riccardo Orlando et al. "ReLiK: Retrieve and LinK."
-  ACL 2024 (Findings).
-- [Radovanović et al. 2010] Miloš Radovanović, Alexandros Nanopoulos,
-  Mirjana Ivanović. "Hubs in Space: Popular Nearest Neighbors in
-  High-Dimensional Data." JMLR 11, 2010.
-- [Su et al. 2021] Jianlin Su, Jiarun Cao, Weijie Liu, Yangyiwen Ou.
-  "Whitening Sentence Representations for Better Semantics and Faster
-  Retrieval." arXiv:2103.15316.
-- [Talaei et al. 2024] Shayan Talaei et al. "CHESS: Contextual Harnessing for
-  Efficient SQL Synthesis." arXiv:2405.16755.
-- [Wang & Isola 2020] Tongzhou Wang, Phillip Isola. "Understanding
-  Contrastive Representation Learning through Alignment and Uniformity on the
-  Hypersphere." ICML 2020.
-- [Wu et al. 2020] Ledell Wu et al. "Scalable Zero-shot Entity Linking with
-  Dense Entity Retrieval." EMNLP 2020 (BLINK).
-- [Wu et al. 2025] Shiguang Wu, Zhaochun Ren, Xin Xin, Jiyuan Yang, Mengqi
-  Zhang, Zhumin Chen, Maarten de Rijke, Pengjie Ren. "Constrained
-  Auto-Regressive Decoding Constrains Generative Retrieval." SIGIR 2025.
-- [Xin et al. 2025] Amy Xin et al. "LLMAEL: Large Language Models are Good
-  Context Augmenters for Entity Linking." CIKM 2025. arXiv:2407.04020.
-- [Zhang et al. 2025] Yanzhao Zhang et al. "Qwen3 Embedding: Advancing Text
-  Embedding and Reranking Through Foundation Models." arXiv:2506.05176.
+Full bibliography, with venues and identifiers verified:
+[00-bibliography.md](00-bibliography.md). Works cited in this document:
 
-Full bibliography, with venues and identifiers verified: [00-bibliography.md](00-bibliography.md).
+- **Entity linking** — [Wu 2020] (BLINK), [B.Z. Li 2020] (ELQ),
+  [De Cao 2021] (GENRE), [Ayoola 2022] (ReFinED), [Orlando 2024] (ReLiK),
+  [Xin 2025] (LLMAEL).
+- **Generative retrieval** — [S. Wu 2025].
+- **Text-to-SQL** — [Talaei 2024] (CHESS).
+- **Embedding geometry** — [Ethayarajh 2019], [J. Gao 2019], [Bohan Li 2020],
+  [Su 2021], [Huang 2021], [T. Gao 2021], [T. Wang 2020], [Radovanović 2010],
+  [Kusupati 2022], [Zhang 2025] (Qwen3-Embedding), and from section H:
+  [Mu 2018], [Timkey 2021], [Cai 2021], [Godey 2024], [Jing 2022], [Roy 2007],
+  [Rudman 2022], [Steck 2024], [Myllymäki 2017].

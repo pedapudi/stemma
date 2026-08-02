@@ -98,9 +98,9 @@ pair (`office_id → id`). FKs pointing at tables outside the served set are
 skipped rather than creating dangling nodes.
 
 This is the join graph that schema-linking work in text-to-SQL exploits —
-from relation-aware schema encoding [Wang et al. 2020] through schema
-serialization with anchor text [Lin et al. 2020] to decoupled schema linking
-[Li et al. 2023b]. Getting it for free from the DDL is the easy half; the
+from relation-aware schema encoding [B. Wang 2020] through schema
+serialization with anchor text [Lin 2020] to decoupled schema linking
+[H. Li 2023]. Getting it for free from the DDL is the easy half; the
 hard half is that real databases mostly do not declare it.
 
 ## Discovered relations: inclusion-dependency mining
@@ -108,9 +108,9 @@ hard half is that real databases mostly do not declare it.
 `compile_inferred_joins` recovers undeclared joins by testing **inclusion
 dependencies** — whether one column's values are contained in another's. This
 is a well-studied primitive: SPIDER's sort-merge formulation
-[Bauckmann et al. 2007], BINDER's divide-and-conquer scaling
-[Papenbrock et al. 2015b], and the profiling platform that collects and
-compares them [Papenbrock et al. 2015].
+[Bauckmann 2007], BINDER's divide-and-conquer scaling
+[Papenbrock 2015b], and the profiling platform that collects and
+compares them [Papenbrock 2015a].
 
 **Candidate generation** narrows the search space before any data is touched:
 
@@ -153,10 +153,10 @@ and a consumer that needs recall can take everything and weight it.
 unambiguous that the set of valid inclusion dependencies contains many
 spurious set inclusions — two unrelated small integer columns will contain
 each other by accident — which is why later work classifies true foreign keys
-from IND *features* rather than accepting every IND [Rostin et al. 2009], and
+from IND *features* rather than accepting every IND [Rostin 2009], and
 why holistic approaches score primary and foreign keys jointly against the
 whole candidate space, recovering roughly 88% of primary keys and 91% of
-foreign keys [Jiang & Naumann 2020]. stemma's single-threshold test is the
+foreign keys [Jiang 2020]. stemma's single-threshold test is the
 first-order version: it emits candidates with a confidence and labels them
 `inferred`, and the classifier that would sharpen them is unbuilt.
 
@@ -165,7 +165,7 @@ O(*r·k*) `EXCEPT` queries, each linear in the two column sizes. On a wide
 schema this is the most expensive part of compilation, and it is quadratic in
 table count. Cheaper pruning — comparing min/max ranges, distinct counts, or
 Bloom-filter sketches before the exact `EXCEPT`, as the inclusion-dependency
-literature does [Bauckmann et al. 2007] — is the obvious next step and is
+literature does [Bauckmann 2007] — is the obvious next step and is
 unbuilt.
 
 The regression test builds `depts(id)` / `staff(dept)` with no declared FK
@@ -211,7 +211,7 @@ frequent values are constants has no categorical structure to exploit.
 This is the pass that gives a *document* corpus graph structure. A table of
 57,523 regulation bodies has no categorical columns, no useful frequent
 values, and — if you stop at the schema layer — no graph at all. The
-GraphRAG lineage [Edge et al. 2024; Guo et al. 2024] solves this with an LLM
+GraphRAG lineage [Edge 2024; Guo 2025] solves this with an LLM
 extraction pass over every document. stemma solves the first-order version of
 it with corpus statistics, deterministically and at no per-document cost. The
 LLM pass is designed as a *supplement*, not a replacement.
@@ -262,9 +262,19 @@ outrank a bursty term appearing in five hundred. The top
 `PAGERANK_CANDIDATES = 200` proceed.
 
 Burstiness as a topicality signal is the same observation that motivates
-RAKE's degree/frequency ratio [Rose et al. 2010] and YAKE's term-dispersion
-features [Campos et al. 2020], arrived at from corpus statistics rather than
-from a per-document parse.
+RAKE's degree/frequency ratio [Rose 2010] and YAKE's term-dispersion features
+[Campos 2018; Campos 2020], arrived at from corpus statistics rather than from
+a per-document parse.
+
+The deliberate omission is **position**. Single-document keyphrase extractors
+weight early occurrences heavily — PositionRank biases the random walk toward
+terms appearing near the start of a document [Florescu 2017], and SingleRank's
+neighbourhood extension exists because one short document has too little
+signal on its own [Wan 2008]. stemma has the opposite problem: thousands of
+documents in one register, where a term's position within any single
+regulation says nothing, and the discriminating signal is which *other* terms
+it keeps company with across the corpus. Corpus-level co-occurrence is the
+right instrument here; per-document position is not.
 
 ### Step 2 — one document pass builds everything
 
@@ -289,7 +299,7 @@ it is what the code does today.
 ### Step 3 — TextRank
 
 The co-occurrence graph is ranked with weighted PageRank
-[Mihalcea & Tarau 2004; Page et al. 1999]:
+[Mihalcea 2004; Page 1999]:
 
 $$
 R_{t+1}(i) = \frac{1-d}{n} + d\!\left(\frac{\sum_{j \in \text{dangling}} R_t(j)}{n}
@@ -542,7 +552,7 @@ graph proposes *coastal development permit* as a unit, and the nudge is what
 lets it beat its own fragments for the byte range.
 
 This is the corpus acting as its own alias table — the AIDA-lineage move
-[Hoffart et al. 2011] of using an entity vocabulary to propose spans, with
+[Hoffart 2011] of using an entity vocabulary to propose spans, with
 the vocabulary compiled rather than curated.
 
 ### 2. Candidate scoring — the `kg` coherence channel
@@ -621,7 +631,7 @@ there are two Chens — but the **pair** is: the right Chen is the one with a
 path to some team.
 
 Collective entity linking solved this shape of problem more than a decade ago
-[Hoffart et al. 2011; Phan et al. 2019]. Score candidate *tuples* jointly:
+[Hoffart 2011; Phan 2019]. Score candidate *tuples* jointly:
 
 $$
 \hat{c} = \arg\max_{c \in C_1 \times \cdots \times C_m}
@@ -659,7 +669,7 @@ Two further uses of the compiled graph, both cheap:
   retrieval queries* rather than only as a post-hoc bonus, recovering
   documents that use the topic's vocabulary without using the span's exact
   words. This is the deterministic counterpart to LM mention expansion
-  [Xin et al. 2025] and should run first, because it costs a graph lookup
+  [Xin 2025] and should run first, because it costs a graph lookup
   instead of a model call.
 - **Schema-path priors.** The join graph tells the resolver which tables are
   reachable from which; a mention that resolves into a table with no path to
@@ -690,40 +700,47 @@ Two further uses of the compiled graph, both cheap:
 
 ## References
 
-- [Bauckmann et al. 2007] Jana Bauckmann, Ulf Leser, Felix Naumann, Véronique
+- [Bauckmann 2007] Jana Bauckmann, Ulf Leser, Felix Naumann, Véronique
   Tietz. "Efficiently Detecting Inclusion Dependencies." 2007 (SPIDER; venue
   unverified — see [00-bibliography.md](00-bibliography.md)).
-- [Campos et al. 2020] Ricardo Campos et al. "YAKE! Keyword extraction from
+- [Campos 2018] Ricardo Campos et al. "A Text Feature Based Automatic Keyword
+  Extraction Method for Single Documents." ECIR 2018.
+- [Campos 2020] Ricardo Campos et al. "YAKE! Keyword extraction from
   single documents using multiple local features." *Information Sciences*
   509, 2020.
-- [Jiang & Naumann 2020] Lan Jiang, Felix Naumann. "Holistic primary key and
+- [Florescu 2017] Corina Florescu, Cornelia Caragea. "PositionRank: An
+  Unsupervised Approach to Keyphrase Extraction from Scholarly Documents."
+  ACL 2017.
+- [Jiang 2020] Lan Jiang, Felix Naumann. "Holistic primary key and
   foreign key detection." *J. Intelligent Information Systems* 54, 2020.
-- [Li et al. 2023b] Haoyang Li, Jing Zhang, Cuiping Li, Hong Chen. "RESDSQL:
+- [H. Li 2023] Haoyang Li, Jing Zhang, Cuiping Li, Hong Chen. "RESDSQL:
   Decoupling Schema Linking and Skeleton Parsing for Text-to-SQL." AAAI 2023.
-- [Lin et al. 2020] Xi Victoria Lin, Richard Socher, Caiming Xiong. "Bridging
+- [Lin 2020] Xi Victoria Lin, Richard Socher, Caiming Xiong. "Bridging
   Textual and Tabular Data for Cross-Domain Text-to-SQL Semantic Parsing."
   Findings of EMNLP 2020.
-- [Edge et al. 2024] Darren Edge et al. "From Local to Global: A Graph RAG
+- [Edge 2024] Darren Edge et al. "From Local to Global: A Graph RAG
   Approach to Query-Focused Summarization." arXiv:2404.16130.
-- [Hoffart et al. 2011] Johannes Hoffart et al. "Robust Disambiguation of
+- [Hoffart 2011] Johannes Hoffart et al. "Robust Disambiguation of
   Named Entities in Text." EMNLP 2011.
-- [Mihalcea & Tarau 2004] Rada Mihalcea, Paul Tarau. "TextRank: Bringing
+- [Mihalcea 2004] Rada Mihalcea, Paul Tarau. "TextRank: Bringing
   Order into Text." EMNLP 2004.
-- [Page et al. 1999] Lawrence Page, Sergey Brin, Rajeev Motwani, Terry
+- [Page 1999] Lawrence Page, Sergey Brin, Rajeev Motwani, Terry
   Winograd. "The PageRank Citation Ranking: Bringing Order to the Web."
   Stanford InfoLab, 1999.
-- [Papenbrock et al. 2015] Thorsten Papenbrock et al. "Data Profiling with
+- [Papenbrock 2015a] Thorsten Papenbrock et al. "Data Profiling with
   Metanome." PVLDB 8(12), 2015.
-- [Papenbrock et al. 2015b] Thorsten Papenbrock et al. "Divide &
+- [Papenbrock 2015b] Thorsten Papenbrock et al. "Divide &
   Conquer-based Inclusion Dependency Discovery." PVLDB 8(7), 2015.
-- [Phan et al. 2019] Minh C. Phan et al. "Pair-Linking for Collective Entity
+- [Phan 2019] Minh C. Phan et al. "Pair-Linking for Collective Entity
   Disambiguation: Two Could Be Better Than All." IEEE TKDE, 2019.
-- [Rostin et al. 2009] Alexandra Rostin, Oliver Albrecht, Jana Bauckmann,
+- [Rostin 2009] Alexandra Rostin, Oliver Albrecht, Jana Bauckmann,
   Felix Naumann, Ulf Leser. "A Machine Learning Approach to Foreign Key
   Discovery." WebDB 2009.
-- [Wang et al. 2020] Bailin Wang et al. "RAT-SQL: Relation-Aware Schema
+- [Wan 2008] Xiaojun Wan, Jianguo Xiao. "Single Document Keyphrase Extraction
+  Using Neighborhood Knowledge." AAAI 2008.
+- [B. Wang 2020] Bailin Wang et al. "RAT-SQL: Relation-Aware Schema
   Encoding and Linking for Text-to-SQL Parsers." ACL 2020.
-- [Xin et al. 2025] Amy Xin et al. "LLMAEL: Large Language Models are Good
+- [Xin 2025] Amy Xin et al. "LLMAEL: Large Language Models are Good
   Context Augmenters for Entity Linking." CIKM 2025.
 
 Full bibliography: [00-bibliography.md](00-bibliography.md).

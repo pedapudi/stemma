@@ -98,13 +98,17 @@ crowding**, where a domain-uniform corpus collapses into a narrow region of a
 general-purpose encoder's space and retrieval discrimination goes with it —
 grounded in the anisotropy, degeneration and hubness literature, and then
 *measured*: on this repository's own legal corpus a general encoder places
-California's regulations and the federal eCFR at centroid cosine 0.81, with
-93 of 1024 dimensions carrying the variance. How
-[ambit](https://github.com/pedapudi/ambit) measures that (σ\*, the corpus's
-noise budget) and tunes against it, what three rounds of tuning actually did
-— including an honest negative result — and how tuned encoders slot in as
-registry-identified vector generations, with the corpus's 100%-covered
-pre-computed vectors as the first payload. The decoder's two roles — mention
+California's regulations and the federal eCFR at centroid cosine 0.81 and
+retains 83% of the noise budget a well-spread corpus would have. How
+[ambit](https://github.com/pedapudi/ambit) — a measurement instrument, not a
+training pipeline — makes that number *exact* rather than indicative in
+stemma's entity-resolution regime, why its doctrine puts training last behind
+centering and deduplication, and why it and stemma compose without overlap:
+ambit names which records are unresolvable at what noise budget, and has no
+linking layer; stemma decides. Then what three rounds of corpus tuning
+actually did, including a split verdict and an honest negative result, and how
+tuned encoders slot in as registry-identified vector generations — four of
+them, each 100% uuid-covered, already on disk. The decoder's two roles — mention
 expansion before retrieval and constrained select-among-k with explicit NIL
 after it — the evidence against making the decoder the retrieval mechanism,
 the `rewritten_query` substitution artifact, and the agent/MCP layer as the
@@ -122,9 +126,14 @@ guidelines read as evaluation rules; and the acceptance gate for each
 milestone.
 
 **[00 — Bibliography](00-bibliography.md)**
-The shared reference list, grouped by topic. Every entry was checked against
-the published record rather than cited from memory; entries that could not be
-confirmed are labelled.
+The shared reference list, grouped by topic, with citation keys disambiguated
+by first-author given name where surnames collide. Sections A–G were checked
+against the published record — anthology pages, proceedings, DOIs — rather
+than cited from memory; section H is labelled as checked against a secondary
+list. It closes with notes on contested claims, including why this document
+set leads with the BIRD no-evidence ablations rather than with the widely
+quoted "~37% of failures are schema linking" figure, which turns out to rest
+on a single paper's own error profile.
 
 ## Reading order
 

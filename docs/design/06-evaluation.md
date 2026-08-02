@@ -12,7 +12,7 @@ Source: [`crates/stemma-eval/src/main.rs`](../../crates/stemma-eval/src/main.rs)
 
 ## The no-evidence protocol
 
-BIRD [Li et al. 2023] ships, alongside each question and its gold SQL, a
+BIRD [J. Li 2023] ships, alongside each question and its gold SQL, a
 human-written `evidence` string: a hint that names the column, spells out the
 domain abbreviation, or gives the stored value the question refers to
 obliquely. For example, a question about "eligible free rate" comes with
@@ -22,13 +22,19 @@ That evidence *is* the linking artifact. It is exactly what stemma is built
 to produce, handed to the system for free.
 
 Leaderboard numbers are therefore conditional on a pre-solved linking step,
-and the conditional is expensive. Removing the hints costs existing systems
-over 10 points of execution accuracy [Nan et al. 2026]; conversely,
-automatically regenerating evidence recovers up to 17.73 EX and 17.69 VES
-over the no-evidence setting, and sometimes beats the shipped human hints —
-which the same work documents as containing missing and erroneous entries
-[Yun & Lee 2025]. That last point matters for protocol design: BIRD's human
-evidence is a *reference*, not an oracle.
+and the conditional is expensive. Removing the hints costs CodeS-7B 11.93
+points of execution accuracy (57.17 → 45.24), CodeS-3B 11.60 and CodeS-1B
+12.00 [Nan 2026]; a second measurement puts the range at 8.35 to 20.86 points
+across systems, with RSL-SQL/GPT-4o falling 65.78 → 54.50 and DAIL-SQL/GPT-4
+falling 56.32 → 35.46 [Yun 2025]. Only 5 of 52 BIRD leaderboard methods report
+no-evidence numbers at all [Nan 2026] — which is itself the argument for
+making the no-evidence setting the default rather than the ablation.
+
+[Yun 2025] also documents that BIRD's human evidence contains missing and
+erroneous entries, and that automatically generated evidence sometimes
+outperforms it. That matters for protocol design: **BIRD's human evidence is a
+reference, not an oracle**, and the evidence-reconstruction metric below is
+scored against it accordingly.
 
 stemma's protocol is the setting that measures the thing:
 
@@ -297,7 +303,7 @@ any other corpus. This is not a coincidence of convenience; it is why BIRD
 was chosen over benchmarks that would need a loader, since a loader is a
 place for the evaluation to diverge from production behaviour.
 
-KaggleDBQA [Lee et al. 2021] is the designated later stress test, for
+KaggleDBQA [C.-H. Lee 2021] is the designated later stress test, for
 abbreviation-heavy schemas where column names are opaque and the linking
 problem is at its hardest.
 
@@ -360,10 +366,13 @@ in which two vector spaces are queried together *and* no window in which
 there is no index at all.
 
 The careg corpus makes the first of those unusually cheap to run: four
-encoder generations over the same 57,523 rowids
-([05-encoders-decoders.md](05-encoders-decoders.md#what-this-looked-like-on-stemmas-own-legal-corpus)),
-so a dense-recall comparison across checkpoints needs staging and restarting,
-not embedding.
+encoder generations over the same 57,523 rowids, each at 100% uuid coverage
+([05-encoders-decoders.md](05-encoders-decoders.md#the-integration)), so a
+dense-recall comparison across checkpoints needs staging and restarting, not
+embedding. It also comes with a measured geometric baseline
+([05-encoders-decoders.md](05-encoders-decoders.md#the-legal-corpus-measured)),
+so a dense-channel change can be reported as *both* a retrieval delta and a
+crowding delta.
 
 **Gate 4 — collective disambiguation.** A query with two interdependent
 mentions (*Chen's team*) resolves the correct pair where independent scoring
@@ -384,19 +393,17 @@ which is why no such claim appears anywhere in this document set.
 
 ## References
 
-- [Cao et al. 2024] Zhenbiao Cao et al. "RSL-SQL: Robust Schema Linking in
-  Text-to-SQL Generation." arXiv:2411.00073.
-- [Lee et al. 2021] Chia-Hsuan Lee, Oleksandr Polozov, Matthew Richardson.
+- [C.-H. Lee 2021] Chia-Hsuan Lee, Oleksandr Polozov, Matthew Richardson.
   "KaggleDBQA: Realistic Evaluation of Text-to-SQL Parsers." ACL-IJCNLP 2021.
-- [Lei et al. 2025] Fangyu Lei et al. "Spider 2.0: Evaluating Language Models
-  on Real-World Enterprise Text-to-SQL Workflows." ICLR 2025.
-- [Li et al. 2023] Jinyang Li et al. "Can LLM Already Serve as a Database
+- [Lei 2025] Fangyu Lei et al. "Spider 2.0: Evaluating Language Models
+  on Real-World Enterprise Text-to-SQL Workflows." ICLR 2025 (Oral).
+- [J. Li 2023] Jinyang Li et al. "Can LLM Already Serve as a Database
   Interface? A Big Bench for Large-Scale Database Grounded Text-to-SQLs."
   NeurIPS 2023 (BIRD).
-- [Nan et al. 2026] Yafeng Nan et al. "DIVER: A Robust Text-to-SQL System
+- [Nan 2026] Yafeng Nan et al. "DIVER: A Robust Text-to-SQL System
   with Dynamic Interactive Value Linking and Evidence Reasoning."
   arXiv:2602.12064.
-- [Yun & Lee 2025] Janghyeon Yun, Sang-goo Lee. "SEED: Enhancing Text-to-SQL
+- [Yun 2025] Janghyeon Yun, Sang-goo Lee. "SEED: Enhancing Text-to-SQL
   Performance and Practical Usability Through Automatic Evidence Generation."
   IEEE ICDEW 2025. arXiv:2506.07423.
 

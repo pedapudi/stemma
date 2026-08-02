@@ -406,7 +406,7 @@ stage does not merge — see
 **Three views of the same cell.** `value_norm` is `lower(trim(value))` and
 is B-tree indexed, giving O(log n) exact lookup that is case- and
 edge-whitespace-insensitive. `lex_fts` is a `unicode61`-tokenized FTS5 index
-supporting BM25-ranked word search [Robertson & Zaragoza 2009]. `lex_trigram`
+supporting BM25-ranked word search [Robertson 2009]. `lex_trigram`
 is an FTS5 index with the `trigram` tokenizer, which indexes overlapping
 3-character sequences and therefore matches substrings and near-misses that
 word tokenization cannot — `Northgate` inside `Seattle - Northgate`. Both
@@ -716,7 +716,7 @@ stage that fills them lands.
 
 ## References
 
-- [Robertson & Zaragoza 2009] Stephen Robertson, Hugo Zaragoza. "The
+- [Robertson 2009] Stephen Robertson, Hugo Zaragoza. "The
   Probabilistic Relevance Framework: BM25 and Beyond." *Foundations and
   Trends in Information Retrieval* 3(4), 2009.
 

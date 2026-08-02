@@ -49,8 +49,7 @@ Every tunable in the pipeline, with its source and its job:
 | KG span nudge | ×1.08 | stemma-resolve | Selection preference for spans matching a KG entity |
 | `STOPWORDS` | 29 words | stemma-resolve | Never a mention alone; allowed inside longer spans |
 
-`RRF_K = 4.0` is far below the k = 60 of the original formulation [Cormack
-et al. 2009]. That is deliberate and is discussed under
+`RRF_K = 4.0` is far below the k = 60 of the original formulation [Cormack 2009]. That is deliberate and is discussed under
 [fusion](#stage-5--reciprocal-rank-fusion): with only three channels and
 eight results each, k = 60 flattens every rank difference into noise.
 
@@ -108,7 +107,8 @@ query of *T* tokens this is
 $$ S(T) = \sum_{i=0}^{T-1} \min(4,\; T-i) = 4T - 6 \quad (T \ge 4) $$
 
 A five-token query yields 14 spans, an eight-token query 26. Both match the
-observed traces exactly.
+observed traces exactly. With an embedder configured and `T > 4`, one more
+span is added — see [the whole-query span](#the-whole-query-span) below.
 
 A span is marked `skipped` immediately if **all** its tokens are stopwords,
 or if its text is shorter than `MIN_SPAN_CHARS = 3` characters. Skipped spans
@@ -116,6 +116,36 @@ are *kept in the trace* rather than discarded, so the console can grey them
 out and a reader can see that the pipeline considered and dismissed them. All
 other spans start with the provisional status `selected`, refined after
 candidates are gathered.
+
+### The whole-query span
+
+One span escapes the four-token cap, and only when an embedder is configured:
+
+```rust
+if embedder.is_some() && tokens.len() > MAX_SPAN_TOKENS {
+    // one extra span covering tokens[0].start .. tokens[last].end
+}
+```
+
+The reasoning is specific to what a dense encoder can do that n-grams cannot.
+A mention like *"getting fired from a state job"* has **no lexical anchor at
+any n-gram width** — no sub-phrase of it matches a stored value — but the full
+phrase lands near the right documents in vector space. So when the dense
+channel is available, the entire query gets its own span and competes for its
+own byte range like any other.
+
+Greedy selection then arbitrates, and the arbitration is the elegant part: a
+strong lexical anchor scores in the exact band (≥ 0.9) and wins its range,
+marking the whole-query span `overlapped`; an anchor-free semantic query has
+no such competitor and the whole-query span wins. As a side effect, winning
+the entire byte range **suppresses incidental substring junk**, because every
+smaller span it covers is marked `overlapped`.
+
+Note the asymmetry this creates: with no embedder, a long semantic query
+produces only fragment spans; with one, it produces fragments *and* a whole.
+The span set is a function of the configured backends, not of the query alone.
+
+### No early segmentation
 
 There is no early segmentation decision here. Overlapping alternatives —
 `Wei`, `Chen`, `Wei Chen`, `did Wei Chen` — all coexist and all get
@@ -148,7 +178,7 @@ uses as a unit.
 
 This is the knowledge graph participating in *mention detection*, not just
 in ranking — the classic entity-linking move of using an alias table to
-propose spans [Hoffart et al. 2011], with the alias table compiled from the
+propose spans [Hoffart 2011], with the alias table compiled from the
 user's own corpus instead of a fixed catalog.
 
 **Honest scope note.** On the legal corpus the compiled term vocabulary is 88
@@ -165,7 +195,7 @@ Each non-skipped span runs three independent lexical retrieval channels, each
 capped at `PER_CHANNEL_LIMIT = 8` results. **These three are never conditional
 on each other**: the failure modes are disjoint, and a cascade that skips one
 because another looked confident loses exactly the cases the skipped channel
-was for [Cormack et al. 2009]. (The fourth channel, dense, *is* conditional —
+was for [Cormack 2009]. (The fourth channel, dense, *is* conditional —
 see [stage 4b](#stage-4b--the-dense-channel-targeted) — because its cost
 profile is different by two orders of magnitude.)
 
@@ -173,7 +203,7 @@ It is worth being explicit that the lexical channels are not a legacy
 fallback waiting to be replaced by the dense one. BM25 over an inverted index
 remains a strong baseline for exactly this problem: Sparkly, a TF/IDF blocker
 built on Lucene, outperformed eight state-of-the-art entity-matching blockers
-[Paulsen et al. 2023]. Names, codes and identifiers are lexical objects, and
+[Paulsen 2023]. Names, codes and identifiers are lexical objects, and
 a channel that matches them character-for-character is the right tool.
 
 ### Channel 1 — exact
@@ -271,23 +301,9 @@ Three selection rules, each with a reason:
   pass over 57,523 × 1024 floats — hundreds of milliseconds — so the cap is
   what keeps the dense channel affordable at all.
 
-### The full-query span
-
-Span enumeration caps n-grams at `MAX_SPAN_TOKENS = 4`, which is the right
-width for lexical anchors and the wrong one for a mention that is semantic
-all the way through: *"getting fired from a state job"* has no anchor at any
-n-gram width, but the full phrase lands near the right documents in vector
-space. So when an embedder is configured and the query is longer than the
-n-gram cap, the whole query gets one extra span of its own. It flows through
-the same phases as every other span, and **greedy mention selection
-arbitrates**: a query with a strong lexical anchor is won by that anchor's
-span (exact scores in [0.9, 1.0], comfortably above any calibrated cosine)
-and the full-query span is marked `overlapped`; an anchor-free query is won
-by the full-query span, which — because it covers the entire token range —
-also suppresses the incidental substring matches that would otherwise
-shatter the query into junk mentions ("fired from a" resolving into a mortar
-regulation). No new selection rule was added; covering more bytes at a
-higher score is already how the greedy cover decides.
+The [whole-query span](#the-whole-query-span) is a natural dense target: it
+never has an exact hit and it is the longest span by construction, so it
+sorts first into the probe budget.
 
 The selected spans are embedded in **one batched call**, then probed:
 
@@ -309,7 +325,7 @@ pub fn format_query(mention: &str) -> String {
 ```
 
 Documents were embedded raw; the *mention* carries the retrieval instruction.
-This is the Qwen3-Embedding-family convention [Zhang et al. 2025], and it is
+This is the Qwen3-Embedding-family convention [Zhang 2025], and it is
 in the code rather than in a config file because getting it wrong silently
 costs most of the encoder's quality — everything still runs, the numbers are
 just worse. See
@@ -353,7 +369,7 @@ $$
 = \min\!\left(\tfrac{4}{3}\,\mathrm{rrf},\; 1\right)
 $$
 
-Reciprocal rank fusion [Cormack et al. 2009] is used for the reason it is
+Reciprocal rank fusion [Cormack 2009] is used for the reason it is
 always used: the channels produce scores on incomparable scales — a constant
 1.0, a negated BM25 in the single digits, a negated BM25 over trigrams, a
 cosine in [−1, 1] — and rank is the only quantity they share. RRF needs no
@@ -525,7 +541,7 @@ have with a document — length is evidence about the document's genre, and
 penalizing it means preferring short documents over relevant ones. Document
 retrieval solved this decades ago inside BM25 itself, whose length
 normalization compares a document against the corpus mean rather than
-against the query [Robertson & Zaragoza 2009]; the mistake here would be to
+against the query [Robertson 2009]; the mistake here would be to
 apply a *second*, harsher, query-relative penalty on top of the one BM25
 already applied correctly.
 
@@ -764,7 +780,7 @@ by descending score. A single high-scoring wrong long span can block two
 correct short ones, and nothing reconsiders. The principled fix is joint
 selection over segmentations, which is the same machinery collective
 disambiguation needs; at query scale (2–4 mentions × ~10 candidates)
-exhaustive joint scoring is microseconds [Hoffart et al. 2011].
+exhaustive joint scoring is microseconds [Hoffart 2011].
 
 **Mentions are scored independently.** There is no interaction between
 mentions at all today. *"Chen's team"* resolves `Chen` and `team` as
@@ -846,15 +862,15 @@ written while the server is stopped. There is no online re-embed.
 
 ## References
 
-- [Cormack et al. 2009] Gordon V. Cormack, Charles L. A. Clarke, Stefan
+- [Cormack 2009] Gordon V. Cormack, Charles L. A. Clarke, Stefan
   Buettcher. "Reciprocal Rank Fusion Outperforms Condorcet and Individual
   Rank Learning Methods." SIGIR 2009.
-- [Hoffart et al. 2011] Johannes Hoffart et al. "Robust Disambiguation of
+- [Hoffart 2011] Johannes Hoffart et al. "Robust Disambiguation of
   Named Entities in Text." EMNLP 2011.
-- [Paulsen et al. 2023] Derek Paulsen, Yash Govind, AnHai Doan. "Sparkly: A
+- [Paulsen 2023] Derek Paulsen, Yash Govind, AnHai Doan. "Sparkly: A
   Simple yet Surprisingly Strong TF/IDF Blocker for Entity Matching."
   PVLDB 16(6), 2023.
-- [Robertson & Zaragoza 2009] Stephen Robertson, Hugo Zaragoza. "The
+- [Robertson 2009] Stephen Robertson, Hugo Zaragoza. "The
   Probabilistic Relevance Framework: BM25 and Beyond." *FnTIR* 3(4), 2009.
 
 Full bibliography: [00-bibliography.md](00-bibliography.md).

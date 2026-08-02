@@ -8,15 +8,23 @@ downstream consumer (a query generator, an agent, a human) builds on.
 
 ## Why this problem
 
-Error analyses on the BIRD text-to-SQL benchmark attribute the largest share of
-failures — roughly a third, though the number varies by system analyzed — to
-schema/value linking: finding the right table, column, and stored value, not
-SQL logic. BIRD ships human-written "evidence" hints that
-pre-solve exactly this linking, and state-of-the-art systems lose >10%
-execution accuracy when the hints are removed (DIVER 2026, SEED 2025). The
-field's newest systems converge on *resolve-then-generate*: produce a verified
-resolution artifact before query generation. stemma is a purpose-built engine
-for that artifact.
+BIRD ships human-written "evidence" hints that pre-solve schema and value
+linking — finding the right table, column, and stored value. Remove them and
+state-of-the-art systems collapse: more than 10 points of execution accuracy
+(DIVER, SIGMOD 2026 — CodeS-7B 57.17→45.24), or 8.35–20.86 points across
+systems (SEED, ICDEW 2025). Only 5 of 52 BIRD leaderboard methods report
+no-evidence numbers at all.
+
+Published error analyses point the same way but less precisely: one attributes
+37% of its BIRD-dev errors to schema linking, defined to include incorrect
+tables, columns or values (SEA-SQL 2025), while others range from 20% to 57%
+depending on taxonomy and denominator. Treat that as evidence about where
+failures concentrate, not as a constant.
+
+The field's newest systems converge on *resolve-then-generate*: produce a
+verified resolution artifact before query generation. stemma is a purpose-built
+engine for that artifact. Full citations, with the caveat on each number, are
+in [docs/design/00-bibliography.md](design/00-bibliography.md).
 
 ## Design conclusions from the literature
 

@@ -24,25 +24,36 @@ A question names things obliquely — *the Q3 numbers for the Seattle office*,
 run, each mention has to become a record: `offices` rowid 17, whose stored
 name is `'Seattle - Northgate'`.
 
-Error analyses on BIRD [Li et al. 2023], categorized under DIN-SQL's
-taxonomy, put schema-and-value-linking errors — the wrong table, the wrong
-column, the wrong stored value — as the largest single failure category at
-roughly 37%, ahead of JOIN errors and far ahead of nesting or grouping
-[Cao et al. 2024]. And BIRD ships human-written "evidence" hints that
-pre-solve exactly that linking. Remove them and the loss is measurable:
-execution accuracy drops by over 10% [Nan et al. 2026], and automatically
-regenerating the missing evidence recovers up to 17.7 points of execution
-accuracy — sometimes beating BIRD's own human hints, which are themselves
-documented as containing defects [Yun & Lee 2025]. Spider 2.0's enterprise
-databases, often exceeding a thousand columns, make the linking step harder
-still [Lei et al. 2025].
+The measurement that carries the argument is an ablation, not an error
+taxonomy. BIRD [J. Li 2023] ships human-written "evidence" hints alongside
+each question — hints that pre-solve exactly the linking step. Remove them and
+the loss is large and directly measured on the benchmark's own metric:
+execution accuracy collapses by more than 10 points (CodeS-7B 57.17 → 45.24,
+CodeS-3B 55.02 → 43.42) [Nan 2026], and a second study puts the cost at 8.35
+to 20.86 points across systems (RSL-SQL/GPT-4o 65.78 → 54.50, DAIL-SQL/GPT-4
+56.32 → 35.46), with automatically generated evidence recovering much of it
+[Yun 2025]. Tellingly, only 5 of 52 BIRD leaderboard methods report
+no-evidence numbers at all [Nan 2026]. Spider 2.0's enterprise databases,
+often exceeding a thousand columns, make the linking step harder still
+[Lei 2025].
+
+Error taxonomies point the same way but are a weaker instrument, and this
+document set does not lean on them. One published analysis attributes 37% of
+its BIRD-dev errors to schema linking, defined to include incorrect tables,
+columns **or values** [C. Li 2025]; others put the figure anywhere from 20% to
+57% depending on taxonomy and denominator [D. Lee 2025]. No published work
+reports "value linking" as a category with its own percentage — the closest is
+a 24% "Value Misrepresentation" rate against an unstated denominator
+[Qu 2024]. The spread is a disagreement about how to count, not about what is
+failing. See
+[00-bibliography.md](00-bibliography.md#notes-on-contested-claims).
 
 The field's newest systems converge on *resolve-then-generate*: produce a
-verified linking artifact, then generate against it [Talaei et al. 2024].
+verified linking artifact, then generate against it [Talaei 2024].
 stemma is a purpose-built engine for that artifact, extracted as a component
 rather than embedded in a generator.
 
-The honest counterargument is [Maamari et al. 2024], often summarized as
+The honest counterargument is [Maamari 2024], often summarized as
 "schema linking is dead": with sufficiently strong reasoning models, *pruning*
 the schema before generation can lose more recall than the saved context is
 worth. Note the scope. That is an argument against a filtering step, and
@@ -528,22 +539,26 @@ the authority; those pages need refreshing.
 
 ## References
 
-- [Cao et al. 2024] Zhenbiao Cao et al. "RSL-SQL: Robust Schema Linking in
-  Text-to-SQL Generation." arXiv:2411.00073.
-- [Lei et al. 2025] Fangyu Lei et al. "Spider 2.0: Evaluating Language Models
-  on Real-World Enterprise Text-to-SQL Workflows." ICLR 2025.
-- [Li et al. 2023] Jinyang Li et al. "Can LLM Already Serve as a Database
+- [C. Li 2025] Chaofan Li, Yingxia Shao, Yawen Li, Zheng Liu. "SEA-SQL:
+  Semantic-Enhanced Text-to-SQL with Adaptive Refinement." *Frontiers of
+  Computer Science*, 2025. arXiv:2408.04919.
+- [D. Lee 2025] Dongjun Lee, Choongwon Park, Jaehyuk Kim, Heesoo Park.
+  "MCS-SQL: Leveraging Multiple Prompts and Multiple-Choice Selection For
+  Text-to-SQL Generation." COLING 2025.
+- [Lei 2025] Fangyu Lei et al. "Spider 2.0: Evaluating Language Models
+  on Real-World Enterprise Text-to-SQL Workflows." ICLR 2025 (Oral).
+- [J. Li 2023] Jinyang Li et al. "Can LLM Already Serve as a Database
   Interface? A Big Bench for Large-Scale Database Grounded Text-to-SQLs."
   NeurIPS 2023 (BIRD).
-- [Maamari et al. 2024] Karime Maamari, Fadhil Abubaker, Daniel Jaroslawicz,
+- [Maamari 2024] Karime Maamari, Fadhil Abubaker, Daniel Jaroslawicz,
   Amine Mhedhbi. "The Death of Schema Linking? Text-to-SQL in the Age of
   Well-Reasoned Language Models." arXiv:2408.07702.
-- [Nan et al. 2026] Yafeng Nan et al. "DIVER: A Robust Text-to-SQL System
+- [Nan 2026] Yafeng Nan et al. "DIVER: A Robust Text-to-SQL System
   with Dynamic Interactive Value Linking and Evidence Reasoning."
   arXiv:2602.12064.
-- [Talaei et al. 2024] Shayan Talaei et al. "CHESS: Contextual Harnessing for
+- [Talaei 2024] Shayan Talaei et al. "CHESS: Contextual Harnessing for
   Efficient SQL Synthesis." arXiv:2405.16755.
-- [Yun & Lee 2025] Janghyeon Yun, Sang-goo Lee. "SEED: Enhancing Text-to-SQL
+- [Yun 2025] Janghyeon Yun, Sang-goo Lee. "SEED: Enhancing Text-to-SQL
   Performance and Practical Usability Through Automatic Evidence Generation."
   IEEE ICDEW 2025. arXiv:2506.07423.
 
