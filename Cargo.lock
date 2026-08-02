@@ -1374,6 +1374,7 @@ name = "stemma-ingest"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "stemma-embed",
  "stemmadb",
  "thiserror",
  "tracing",

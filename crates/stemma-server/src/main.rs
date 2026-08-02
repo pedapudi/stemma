@@ -209,6 +209,52 @@ impl ResolveService for Resolver {
     }
 }
 
+/// Enqueues missing document embeddings for one database and drains the
+/// queue to empty, batch by batch, on its own store connection.
+fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str) {
+    let store = user_db.with_extension("stemmadb");
+    let db = match StemmaDb::open(&store, user_db) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(name, error = %e, "embed drain: opening store failed");
+            return;
+        }
+    };
+    let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model);
+    let queued = match stemma_ingest::enqueue_missing_embeddings(&db) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(name, error = %e, "embed drain: enqueue failed");
+            return;
+        }
+    };
+    tracing::info!(name, queued, "embed drain: queue filled");
+    loop {
+        match stemma_ingest::drain_embed_queue(&db, &embedder, stemma_ingest::EMBED_BATCH) {
+            Ok(stats) => {
+                tracing::info!(
+                    name,
+                    queued,
+                    drained = stats.drained,
+                    failed = stats.failed,
+                    remaining = stats.remaining,
+                    "embed drain: batch"
+                );
+                if stats.remaining == 0 {
+                    tracing::info!(name, "embed drain: queue empty");
+                    return;
+                }
+            }
+            Err(e) => {
+                // Left-over items stay pending with their attempt counts;
+                // the next server start picks them back up.
+                tracing::warn!(name, error = %e, "embed drain: stopped");
+                return;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -269,6 +315,19 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
+
+    // Index-time embedding: with an embedder configured, each database gets a
+    // background task that enqueues its unembedded documents and drains the
+    // queue until empty, then exits — no polling loop. The store is WAL, so
+    // the task opens its own connection and serving is never blocked; a
+    // drain failure degrades the dense channel, never the server.
+    if let (Some(ep), Some(model)) = (&args.embed_endpoint, &args.embed_model) {
+        for (name, user_db) in &args.dbs {
+            let (name, user_db) = (name.clone(), user_db.clone());
+            let (ep, model) = (ep.clone(), model.clone());
+            tokio::task::spawn_blocking(move || drain_task(&name, &user_db, &ep, &model));
+        }
+    }
 
     tracing::info!(listen = %listen, "stemma-server starting");
     tonic::transport::Server::builder()

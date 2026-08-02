@@ -7,6 +7,7 @@
 //! the milestone-2 candidate-generation substrate; the dense (vec0) and
 //! knowledge-store compilation passes join it in later milestones.
 
+use stemma_embed::Embedder;
 use stemmadb::{StemmaDb, SRC_SCHEMA};
 
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +16,15 @@ pub enum Error {
     Db(#[from] stemmadb::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] stemmadb::rusqlite::Error),
+    #[error("embedder error: {0}")]
+    Embed(#[from] stemma_embed::Error),
+    #[error(
+        "vec_dense is registered to model {registered:?} but the embedder \
+         offers {offered:?}; refusing to mix vector spaces"
+    )]
+    ModelMismatch { registered: String, offered: String },
+    #[error("vec_dense exists with no model_registry row; provenance unknown, refusing to append")]
+    UnregisteredVectorTable,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -233,6 +243,272 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
     }))
 }
 
+/// Items per embedding call when draining the queue.
+pub const EMBED_BATCH: usize = 32;
+
+/// A queue item failing this many embedding attempts is marked `failed` and
+/// left for inspection rather than retried forever.
+pub const EMBED_MAX_ATTEMPTS: i64 = 3;
+
+/// Finds document cells (`lex_values.is_doc = 1`) with no vector in
+/// `vec_dense` and enqueues them as pending work in `embed_queue`. Documents
+/// only: dense retrieval pays off where mentions resolve *into* long text;
+/// short values are already served by the lexical channels.
+///
+/// Idempotent: an item already pending (or failed) is left alone; an item
+/// previously `done` whose vector has since disappeared is reset to pending.
+/// Returns the number of items newly enqueued or reset.
+pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
+    let conn = db.conn();
+    let has_dense: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
+        [],
+        |r| r.get(0),
+    )?;
+    // vec0 metadata columns are not probe-friendly; materialize the covered
+    // triples once instead of scanning the virtual table per lex row.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS covered (
+             src_table TEXT NOT NULL, src_column TEXT NOT NULL, src_rowid INTEGER NOT NULL
+         );
+         DELETE FROM covered;",
+    )?;
+    if has_dense > 0 {
+        conn.execute(
+            "INSERT INTO covered SELECT src_table, src_column, src_rowid FROM vec_dense",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS temp.covered_key ON covered(src_table, src_column, src_rowid);",
+    )?;
+    let queued = conn.execute(
+        "INSERT INTO embed_queue (src_table, src_column, src_rowid)
+         SELECT lv.src_table, lv.src_column, lv.src_rowid
+         FROM lex_values lv
+         WHERE lv.is_doc = 1
+           AND NOT EXISTS (
+               SELECT 1 FROM covered c
+               WHERE c.src_table = lv.src_table
+                 AND c.src_column = lv.src_column
+                 AND c.src_rowid = lv.src_rowid)
+         ON CONFLICT (src_table, src_column, src_rowid) DO UPDATE SET
+             status = 'pending', attempts = 0, error = '',
+             updated_at = datetime('now')
+         WHERE embed_queue.status = 'done'",
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE covered;")?;
+    Ok(queued)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DrainStats {
+    /// Items embedded and marked done by this call.
+    pub drained: usize,
+    /// Items marked failed by this call (budget exhausted or unembeddable).
+    pub failed: usize,
+    /// Pending items left after this call.
+    pub remaining: usize,
+}
+
+/// Drains one batch of pending `embed_queue` items through the embedder into
+/// `vec_dense`, creating the vec0 table (at the embedder's reported
+/// dimension) and its `model_registry` row on first use.
+///
+/// Documents are embedded RAW — the asymmetric Qwen3-style convention puts
+/// the instruction on the query side only (`stemma_embed::format_query`);
+/// applying it here would desert the vector space the queries live in.
+///
+/// Failure semantics: an embedding-call failure bumps `attempts` on the batch
+/// and returns the error (the caller decides whether to keep going); an item
+/// out of retry budget, or whose source text has vanished, is marked
+/// `failed` with an error note and never blocks the rest. A registry row
+/// carrying a different model identity is a hard refusal: every pending item
+/// is marked failed and the call errors, because appending into a foreign
+/// vector space is worse than not embedding at all.
+pub fn drain_embed_queue(
+    db: &StemmaDb,
+    embedder: &dyn Embedder,
+    batch: usize,
+) -> Result<DrainStats> {
+    let conn = db.conn();
+    let mut failed = 0usize;
+
+    // Model identity discipline, checked before any embedding work. The
+    // `model` string is the vector-space identity; `backend` records how
+    // vectors arrived ('staged' loaders and a live embedder of the same
+    // model share a space).
+    let offered = embedder.identity().model;
+    let registered: Option<String> = conn
+        .query_row(
+            "SELECT model FROM model_registry WHERE vector_table = 'vec_dense'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let has_dense: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
+        [],
+        |r| r.get(0),
+    )?;
+    let refusal = match &registered {
+        Some(m) if *m != offered => Some(Error::ModelMismatch {
+            registered: m.clone(),
+            offered,
+        }),
+        None if has_dense > 0 => Some(Error::UnregisteredVectorTable),
+        _ => None,
+    };
+    if let Some(err) = refusal {
+        conn.execute(
+            "UPDATE embed_queue SET status = 'failed', error = ?1,
+                    updated_at = datetime('now')
+             WHERE status = 'pending'",
+            [err.to_string()],
+        )?;
+        return Err(err);
+    }
+
+    // Items out of retry budget fail now rather than being picked forever.
+    failed += conn.execute(
+        "UPDATE embed_queue SET status = 'failed',
+                error = CASE WHEN error = '' THEN 'retry budget exhausted' ELSE error END,
+                updated_at = datetime('now')
+         WHERE status = 'pending' AND attempts >= ?1",
+        [EMBED_MAX_ATTEMPTS],
+    )?;
+
+    // One batch of pending work, least-retried first. `serialized` is the
+    // text to embed when set; documents leave it empty and are fetched from
+    // lex_values so the store holds each document once.
+    let mut items: Vec<(i64, String, String, i64, Option<String>)> = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT q.id, q.src_table, q.src_column, q.src_rowid,
+                    coalesce(nullif(q.serialized, ''), lv.value)
+             FROM embed_queue q
+             LEFT JOIN lex_values lv
+               ON lv.src_table = q.src_table AND lv.src_column = q.src_column
+              AND lv.src_rowid = q.src_rowid
+             WHERE q.status = 'pending'
+             ORDER BY q.attempts, q.id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([batch as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        for row in rows {
+            items.push(row?);
+        }
+    }
+
+    // Items whose source text is gone (index rebuilt out from under the
+    // queue) cannot be embedded, now or later.
+    let mut texts = Vec::new();
+    let mut work = Vec::new();
+    for (id, table, column, rowid, text) in items {
+        match text {
+            Some(t) => {
+                work.push((id, table, column, rowid));
+                texts.push(t);
+            }
+            None => {
+                conn.execute(
+                    "UPDATE embed_queue SET status = 'failed',
+                            error = 'source text missing from lex_values',
+                            updated_at = datetime('now')
+                     WHERE id = ?1",
+                    [id],
+                )?;
+                failed += 1;
+            }
+        }
+    }
+
+    let mut drained = 0usize;
+    if !work.is_empty() {
+        let vectors = match embedder.embed(&texts) {
+            Ok(v) => v,
+            Err(e) => {
+                // The whole batch shares one call; charge one attempt each
+                // and leave the items pending for the budget to bound.
+                let note = e.to_string();
+                for (id, ..) in &work {
+                    conn.execute(
+                        "UPDATE embed_queue SET attempts = attempts + 1, error = ?2,
+                                updated_at = datetime('now')
+                         WHERE id = ?1",
+                        stemmadb::rusqlite::params![id, note],
+                    )?;
+                }
+                return Err(e.into());
+            }
+        };
+
+        let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+        if has_dense == 0 {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_dense USING vec0(
+                     embedding float[{dim}],
+                     src_table text,
+                     src_column text,
+                     src_rowid integer
+                 );"
+            ))?;
+        }
+        let identity = embedder.identity();
+        conn.execute(
+            "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
+             VALUES ('vec_dense', ?1, ?2, ?3, 'f32')
+             ON CONFLICT(vector_table) DO NOTHING",
+            stemmadb::rusqlite::params![identity.backend, identity.model, dim as i64],
+        )?;
+
+        for ((id, table, column, rowid), vector) in work.into_iter().zip(vectors) {
+            let blob: Vec<u8> = vector.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let inserted = conn.execute(
+                "INSERT INTO vec_dense (embedding, src_table, src_column, src_rowid)
+                 VALUES (?1, ?2, ?3, ?4)",
+                stemmadb::rusqlite::params![blob, table, column, rowid],
+            );
+            match inserted {
+                Ok(_) => {
+                    conn.execute(
+                        "UPDATE embed_queue SET status = 'done', error = '',
+                                updated_at = datetime('now')
+                         WHERE id = ?1",
+                        [id],
+                    )?;
+                    drained += 1;
+                }
+                Err(e) => {
+                    // Wrong dimension or other per-row rejection: this item
+                    // can never succeed against this table.
+                    conn.execute(
+                        "UPDATE embed_queue SET status = 'failed', error = ?2,
+                                updated_at = datetime('now')
+                         WHERE id = ?1",
+                        stemmadb::rusqlite::params![id, e.to_string()],
+                    )?;
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    let remaining: i64 = conn.query_row(
+        "SELECT count(*) FROM embed_queue WHERE status = 'pending'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(DrainStats {
+        drained,
+        failed,
+        remaining: remaining as usize,
+    })
+}
+
 fn count_tables(cols: &[TextColumn]) -> usize {
     let mut t: Vec<&str> = cols.iter().map(|c| c.table.as_str()).collect();
     t.sort_unstable();
@@ -326,5 +602,249 @@ mod tests {
         assert!(!again.rebuilt);
         let forced = build_lexical_index(&db, true).unwrap();
         assert!(forced.rebuilt);
+    }
+
+    /// Deterministic embedder: each text maps to a unit vector on a small
+    /// hypersphere, seeded by its bytes, so identical texts embed identically
+    /// and different texts land apart.
+    struct FakeEmbedder {
+        dim: usize,
+        fail: bool,
+    }
+
+    impl FakeEmbedder {
+        fn new(dim: usize) -> Self {
+            Self { dim, fail: false }
+        }
+        fn vector(&self, text: &str) -> Vec<f32> {
+            let mut state: u64 = 0xcbf29ce484222325;
+            for b in text.bytes() {
+                state ^= b as u64;
+                state = state.wrapping_mul(0x100000001b3);
+            }
+            // splitmix64 stream seeded by the text hash: the finalizer's
+            // nonlinearity keeps different texts' vectors uncorrelated.
+            let mut z = state;
+            let mut v: Vec<f32> = (0..self.dim)
+                .map(|_| {
+                    z = z.wrapping_add(0x9e3779b97f4a7c15);
+                    let mut x = z;
+                    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                    x ^= x >> 31;
+                    (x as f64 / u64::MAX as f64) as f32 - 0.5
+                })
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+            v
+        }
+    }
+
+    impl stemma_embed::Embedder for FakeEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            if self.fail {
+                return Err(stemma_embed::Error::Http("fake endpoint down".into()));
+            }
+            Ok(texts.iter().map(|t| self.vector(t)).collect())
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                backend: "fake".into(),
+                model: "fake-embedder".into(),
+                dimension: self.dim,
+            }
+        }
+    }
+
+    /// A corpus with actual documents: three long bodies (>= DOC_MIN_LEN)
+    /// and short values that must stay out of the queue.
+    fn doc_db() -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let body = |topic: &str| {
+            format!(
+                "Article concerning {topic}. This body exists to cross the document \
+                 threshold, so it repeats itself with modest dignity: {topic}, again \
+                 {topic}, considered from every angle a regulation writer can afford, \
+                 until the two-hundred character mark is safely behind it and the \
+                 classifier files it as a document rather than a value."
+            )
+        };
+        db.conn()
+            .execute_batch(&format!(
+                "CREATE TABLE src.articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+                 INSERT INTO src.articles VALUES
+                    (1, 'Coastal permits', '{a}'),
+                    (2, 'Insurance filings', '{b}'),
+                    (3, 'Water rights', '{c}');",
+                a = body("coastal development permits"),
+                b = body("insurance filing deadlines"),
+                c = body("appropriative water rights"),
+            ))
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    fn queue_counts(db: &StemmaDb) -> (i64, i64, i64) {
+        let count = |status: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT count(*) FROM embed_queue WHERE status = ?1",
+                    [status],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        (count("pending"), count("done"), count("failed"))
+    }
+
+    #[test]
+    fn enqueue_finds_exactly_the_missing_docs() {
+        let db = doc_db();
+        let queued = enqueue_missing_embeddings(&db).unwrap();
+        assert_eq!(queued, 3, "three doc bodies, no vectors yet");
+        assert_eq!(queue_counts(&db), (3, 0, 0));
+        // Only body cells qualify; titles are values.
+        let non_body: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM embed_queue WHERE src_column != 'body'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(non_body, 0);
+        // Re-enqueue with items still pending is a no-op.
+        assert_eq!(enqueue_missing_embeddings(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn drain_populates_vec_dense_and_is_idempotent() {
+        let db = doc_db();
+        let embedder = FakeEmbedder::new(8);
+        enqueue_missing_embeddings(&db).unwrap();
+        let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!(stats.drained, 3);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.remaining, 0);
+        assert_eq!(queue_counts(&db), (0, 3, 0));
+
+        let vectors: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors, 3);
+        let (backend, model, dim): (String, String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT backend, model, dimension FROM model_registry
+                 WHERE vector_table = 'vec_dense'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (backend.as_str(), model.as_str(), dim),
+            ("fake", "fake-embedder", 8)
+        );
+
+        // The full cycle again: nothing to queue, nothing to drain.
+        assert_eq!(enqueue_missing_embeddings(&db).unwrap(), 0);
+        let again = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!((again.drained, again.failed, again.remaining), (0, 0, 0));
+        let vectors_again: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors_again, 3, "idempotent: no duplicate vectors");
+    }
+
+    #[test]
+    fn mismatched_registry_identity_refuses_and_fails_items() {
+        let db = doc_db();
+        db.conn()
+            .execute(
+                "INSERT INTO model_registry (vector_table, backend, model, dimension)
+                 VALUES ('vec_dense', 'staged', 'some-other-model', 1024)",
+                [],
+            )
+            .unwrap();
+        enqueue_missing_embeddings(&db).unwrap();
+        let err = drain_embed_queue(&db, &FakeEmbedder::new(8), EMBED_BATCH).unwrap_err();
+        assert!(matches!(err, Error::ModelMismatch { .. }), "got {err}");
+        let (pending, done, failed) = queue_counts(&db);
+        assert_eq!((pending, done, failed), (0, 0, 3));
+        let note: String = db
+            .conn()
+            .query_row("SELECT error FROM embed_queue LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            note.contains("some-other-model"),
+            "error note names the model: {note}"
+        );
+    }
+
+    #[test]
+    fn embed_failures_respect_the_retry_budget() {
+        let db = doc_db();
+        enqueue_missing_embeddings(&db).unwrap();
+        let broken = FakeEmbedder { dim: 8, fail: true };
+        for attempt in 1..=EMBED_MAX_ATTEMPTS {
+            let err = drain_embed_queue(&db, &broken, EMBED_BATCH).unwrap_err();
+            assert!(matches!(err, Error::Embed(_)), "attempt {attempt}: {err}");
+        }
+        // Budget spent: the next drain sweeps the items into `failed` and
+        // reports an empty queue instead of looping forever.
+        let stats = drain_embed_queue(&db, &broken, EMBED_BATCH).unwrap();
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (0, 3, 0));
+        assert_eq!(queue_counts(&db), (0, 0, 3));
+    }
+
+    #[test]
+    fn knn_over_drained_vectors_returns_sane_neighbors() {
+        let db = doc_db();
+        let embedder = FakeEmbedder::new(8);
+        enqueue_missing_embeddings(&db).unwrap();
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+
+        // Query with the exact stored document text: its own vector must be
+        // the nearest neighbor at cosine ~1 (cos = 1 - d^2/2 on unit vectors,
+        // as in resolve's dense channel).
+        let target: String = db
+            .conn()
+            .query_row(
+                "SELECT value FROM lex_values WHERE src_rowid = 2 AND is_doc = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v = embedder.vector(&target);
+        let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let hits: Vec<(i64, f64)> = db
+            .conn()
+            .prepare(
+                "SELECT src_rowid, distance FROM vec_dense
+                 WHERE embedding MATCH ?1 AND k = 3",
+            )
+            .unwrap()
+            .query_map([blob], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        let (top_rowid, top_dist) = hits[0];
+        assert_eq!(top_rowid, 2);
+        let cos = 1.0 - (top_dist * top_dist) / 2.0;
+        assert!(cos > 0.999, "self-similarity should be ~1, got {cos}");
+        // The other documents are real but distant neighbors.
+        for (rowid, dist) in &hits[1..] {
+            let cos = 1.0 - (dist * dist) / 2.0;
+            assert_ne!(*rowid, 2);
+            assert!(
+                cos < 0.99,
+                "distinct docs must not collapse: {rowid} at {cos}"
+            );
+        }
     }
 }
