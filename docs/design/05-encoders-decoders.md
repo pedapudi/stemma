@@ -3,13 +3,14 @@
 **What is built, as of this writing:** the `Embedder` trait and its
 OpenAI-compatible backend ([`stemma-embed`](../../crates/stemma-embed/src/lib.rs)),
 the `vec_staging` → `vec_dense` promotion path with its `model_registry`
-write, the targeted dense retrieval channel inside the pipeline, and the
-consumption pattern (MCP surface and reference agent). The mechanics of the
-built parts are specified in
+write, **index-time embedding through the queue** (enqueue at startup, an
+async drain through the `Embedder`), the targeted dense retrieval channel
+inside the pipeline, and the consumption pattern (MCP surface and reference
+agent). The mechanics of the built parts are specified in
 [02-data-model.md](02-data-model.md#vec_staging-and-vec_dense) and
 [03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted);
 this document gives the *why*, and everything it describes beyond those
-mechanics — index-time embedding through the queue, online blue-green swaps,
+mechanics — online blue-green swaps, re-embedding on data change,
 cross-encoder reranking, and the entire decoder half — is **designed, not
 built**. `stemma-lm` is still a one-line placeholder.
 
@@ -156,19 +157,27 @@ semantic similarity, and it is invisible unless the identity is recorded.
 
 ### What gets embedded
 
-The unit is the **serialized row**, not the raw cell. `embed_queue.serialized`
-holds the text that the embedder will see, produced at ingest time. For a
-value-shaped table that is a compact rendering of the row's identifying
-columns; for a document-shaped table it is the document, chunked if it
-exceeds the encoder's context.
+**As built: documents, raw, one vector per document cell.** The queue path
+embeds exactly the cells the lexical index classified `is_doc` — long text
+that mentions resolve *into* — and embeds them verbatim, with no instruction
+prefix. That is the asymmetric convention of instruction-tuned retrieval
+encoders: `format_query()` decorates the query-time mention, documents stay
+raw, and applying the instruction on the document side would desert the
+space the queries live in. Short values are deliberately not embedded: the
+exact and trigram channels already serve them, and dense retrieval pays its
+full-scan cost only where meaning is spread through prose. Documents longer
+than the encoder's context are truncated by the endpoint today — chunking is
+designed, not built.
 
-Serializing the row rather than the cell is what makes the dense channel
-complementary to the lexical one rather than redundant with it. The lexical
-channels index cells because evidence must cite `(table, column, value)`. The
-dense channel embeds rows because *"the Seattle office"* is about a row, and
-the semantic content that makes `offices` row 17 the right answer is spread
-across `name` and `city`. Candidates from the dense channel therefore arrive
-at row granularity and are attributed to a representative column when fused.
+The *designed* unit is broader: the **serialized row**.
+`embed_queue.serialized` holds the text the embedder will see when it is
+set; document items leave it empty and the drain fetches the stored value
+from `lex_values`, so the store keeps one copy of each document. For a
+value-shaped table the designed serialization is a compact rendering of the
+row's identifying columns — *"the Seattle office"* is about a row, and the
+semantic content that makes `offices` row 17 the right answer is spread
+across `name` and `city`. That serialization pass does not exist yet; the
+column is where its output will land.
 
 ### Two ways vectors get in
 
@@ -180,24 +189,43 @@ exists because the vectors for the first corpus already existed; it does not
 require an embedding service at all, and it is what makes an offline-computed
 1024-dimension map usable in minutes rather than GPU-hours.
 
-**Designed: the queue and the drain.**
+**Built: the queue and the drain.** This is the path a corpus without
+pre-computed vectors needs. At server startup, when an embedder is
+configured, each database gets a background task on its own store connection
+(the store is WAL, so serving never blocks on it):
 
-```sql
-INSERT INTO embed_queue (src_table, src_rowid, serialized) VALUES (…)
-ON CONFLICT (src_table, src_rowid) DO UPDATE SET serialized = …
-```
+1. `stemma_ingest::enqueue_missing_embeddings` inserts a pending
+   `embed_queue` item for every document cell with no `vec_dense` vector —
+   idempotent via the unique provenance key, and a `done` item is only reset
+   if its vector has since disappeared.
+2. `stemma_ingest::drain_embed_queue` repeats until the queue is empty:
+   take a batch of 32 pending items (least-retried first), fetch their raw
+   document text, embed through the `Embedder`, insert into `vec_dense` —
+   creating the vec0 table at the embedder's observed dimension and its
+   `model_registry` row on first use — and mark the items `done`. Progress
+   (`queued`, `drained`, `failed`, `remaining`) is logged per batch, and the
+   task exits when the queue is empty; there is no polling loop.
 
-Ingest enqueues and returns. An async worker drains in batches through the
-`Embedder`, writes into the current vector table, and deletes the queue rows
-it consumed. This is the path a corpus without pre-computed vectors needs,
-and nothing drains the queue today.
+Model identity is checked before any embedding work: if `model_registry`
+already binds `vec_dense` to a *different* model, the drain marks every
+pending item `failed` with the mismatch spelled out and errors — refusing
+loudly beats mixing vector spaces. A staged table and a live embedder of the
+*same* model compose: the drain tops up whatever staging did not cover.
 
-The failure semantics are the point: **writes never wait on a model.** If the
-embedder is down, slow, or being replaced, the queue grows and retrieval
-degrades to lexical-plus-KG. Ingest still completes, resolution still works,
-and nothing surfaces an error to the user for a channel that is one of four.
-The `UNIQUE (src_table, src_rowid)` constraint makes re-enqueueing idempotent,
-so a crashed drain is recovered by restarting it.
+The failure semantics are the point: **writes never wait on a model.** If
+the embedder is down, slow, or being replaced, items stay pending (bounded
+by a retry budget of `EMBED_MAX_ATTEMPTS = 3`, after which they are marked
+`failed` with an error note rather than retried forever) and retrieval
+degrades to lexical-plus-KG. Resolution still works, the next server start
+picks the queue back up, and the queue's status column keeps the whole
+story queryable in plain SQL.
+
+Honest limits of what is built: the drain runs at startup and exits — no
+watcher notices data changes afterward, and re-embedding after an edit means
+restarting the server; there is no online re-embed and no blue-green
+generation swap (the next section is still designed, not built); and only
+documents flow through the queue — the value-shaped serialized-row path has
+a column reserved and no code.
 
 ### Query-time requirements
 

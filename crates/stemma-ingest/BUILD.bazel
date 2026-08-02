@@ -6,6 +6,7 @@ rust_library(
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/stemma-embed",
         "//crates/stemmadb",
         "@crates//:serde",
         "@crates//:thiserror",

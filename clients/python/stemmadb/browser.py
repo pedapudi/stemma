@@ -293,9 +293,18 @@ class StoreBrowser:
                 cols = [d[0] for d in cur.description]
                 meta["model_registry"] = [dict(zip(cols, r)) for r in cur.fetchall()]
             if "embed_queue" in names:
-                meta["embed_queue"] = conn.execute(
-                    "SELECT count(*) FROM embed_queue"
-                ).fetchone()[0]
+                # v4 stores track item status; the panel number is the
+                # pending backlog, not the lifetime ledger. Older stores
+                # (no status column) fall back to the raw row count.
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(embed_queue)")}
+                if "status" in cols:
+                    meta["embed_queue"] = conn.execute(
+                        "SELECT count(*) FROM embed_queue WHERE status = 'pending'"
+                    ).fetchone()[0]
+                else:
+                    meta["embed_queue"] = conn.execute(
+                        "SELECT count(*) FROM embed_queue"
+                    ).fetchone()[0]
             if "lex_values" in names:
                 values, tables, columns = conn.execute(
                     "SELECT count(*), count(DISTINCT src_table), "

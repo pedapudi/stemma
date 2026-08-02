@@ -38,20 +38,25 @@ let conn = db.conn();
 
 `StemmaDb::open_in_memory()` gives a throwaway store+source pair for tests.
 
-## Store schema (version 1)
+## Store schema (version 4)
 
 - **`model_registry`** — one row per vector table: `(vector_table, backend,
   model, revision, dimension, quantization, created_at)`. Embeddings from
   different models are never comparable, so a model change creates a *new*
   vector table, backfills it asynchronously, and swaps atomically (blue-green).
   Nothing ever mixes vector spaces in place.
-- **`embed_queue`** — rows awaiting (re-)embedding: `(src_table, src_rowid,
-  serialized)`. Ingest enqueues; an async worker drains through the Embedder
-  backend. Writes never wait on a model, and if the embedder is down the
-  system degrades to lexical-only retrieval instead of failing.
+- **`embed_queue`** — document cells awaiting (re-)embedding:
+  `(src_table, src_column, src_rowid, serialized, status, attempts, error)`,
+  status `pending → done | failed`. Ingest enqueues; an async worker drains
+  through the Embedder backend in batches, with a retry budget. Writes never
+  wait on a model, and if the embedder is down the system degrades to
+  lexical-only retrieval instead of failing.
+- **`query_log`** / **`chat_log`** — per-database operational history,
+  written by the resolution server and the console respectively.
 
-Schema changes bump `STORE_SCHEMA_VERSION`; an on-disk mismatch is a hard
-error telling the user to re-ingest (derived state, so this is cheap).
+Schema changes bump `STORE_SCHEMA_VERSION`; a store from a *newer* build is a
+hard error telling the user to re-ingest (derived state, so this is cheap),
+while an older store is migrated in place at open.
 
 ## Invariants
 

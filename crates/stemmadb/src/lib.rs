@@ -16,7 +16,7 @@ use rusqlite::Connection;
 pub use rusqlite;
 
 /// Schema version of the .stemmadb store, kept in `PRAGMA user_version`.
-pub const STORE_SCHEMA_VERSION: i32 = 3;
+pub const STORE_SCHEMA_VERSION: i32 = 4;
 
 /// Name under which the user database is attached.
 pub const SRC_SCHEMA: &str = "src";
@@ -48,7 +48,11 @@ pub fn register_extensions() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
         let rc = rusqlite::ffi::sqlite3_auto_extension(Some(sqlite3_vec_init));
-        assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "registering sqlite-vec failed");
+        assert_eq!(
+            rc,
+            rusqlite::ffi::SQLITE_OK,
+            "registering sqlite-vec failed"
+        );
     });
 }
 
@@ -102,6 +106,25 @@ impl StemmaDb {
         // is applying the full schema and stamping the new version. Only a
         // store from the FUTURE is an error.
         if found < STORE_SCHEMA_VERSION {
+            // v4 reshaped embed_queue (per-column work items, status/attempt
+            // tracking); the old shape had a narrower unique key, which no
+            // ALTER can widen. The queue is transient work state — pre-v4
+            // nothing ever drained or enqueued — so the migration drops the
+            // old shape and lets SCHEMA_SQL recreate it. Guarded by shape,
+            // not version, so it runs exactly when the old table exists.
+            let old_queue: i64 = self
+                .conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM sqlite_master WHERE name = 'embed_queue')
+                            AND NOT (SELECT count(*) FROM pragma_table_info('embed_queue')
+                                     WHERE name = 'status')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if old_queue != 0 {
+                self.conn.execute_batch("DROP TABLE embed_queue;")?;
+            }
             self.conn.execute_batch(SCHEMA_SQL)?;
             // v3: history attribution. ALTERs are not idempotent, so they are
             // guarded per-version rather than living in SCHEMA_SQL.
@@ -170,16 +193,27 @@ CREATE TABLE IF NOT EXISTS model_registry (
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 ) STRICT;
 
--- Rows awaiting (re-)embedding. Writes never wait on the embedder: ingest
+-- Cells awaiting (re-)embedding. Writes never wait on the embedder: ingest
 -- enqueues here and an async worker drains through the Embedder backend.
+-- `serialized` is the text the embedder will see; empty means "fetch the
+-- stored value from lex_values at drain time" (documents are large and
+-- already stored once). Status is pending → done | failed, with `attempts`
+-- bounding retries and `error` recording why a failed item failed; counts
+-- per status are one GROUP BY away.
 CREATE TABLE IF NOT EXISTS embed_queue (
     id           INTEGER PRIMARY KEY,
     src_table    TEXT NOT NULL,
+    src_column   TEXT NOT NULL,
     src_rowid    INTEGER NOT NULL,
-    serialized   TEXT NOT NULL,
+    serialized   TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT NOT NULL DEFAULT '',
     enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (src_table, src_rowid)
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (src_table, src_column, src_rowid)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS embed_queue_status ON embed_queue(status);
 
 -- v2: operational history. Query history is written by the resolution
 -- server; chat history by the console/agents. Both are per-database working
@@ -236,6 +270,49 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {t}");
         }
+    }
+
+    #[test]
+    fn migrates_old_embed_queue_shape() {
+        let dir = std::env::temp_dir().join(format!("stemmadb-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        Connection::open(&user).unwrap();
+        {
+            // A pre-v4 store: embed_queue in its original shape, no status.
+            let c = Connection::open(&store).unwrap();
+            c.execute_batch(
+                "CREATE TABLE embed_queue (
+                     id INTEGER PRIMARY KEY,
+                     src_table TEXT NOT NULL,
+                     src_rowid INTEGER NOT NULL,
+                     serialized TEXT NOT NULL,
+                     enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     UNIQUE (src_table, src_rowid)
+                 ) STRICT;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        let v: i32 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, STORE_SCHEMA_VERSION);
+        for col in ["src_column", "status", "attempts", "error"] {
+            let n: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('embed_queue') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "missing embed_queue column {col}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

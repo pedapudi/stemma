@@ -103,11 +103,15 @@ vector table can always be traced back to a running service. `dimension` and
 `quantization` are recorded rather than inferred because `vec0` needs both
 at DDL time and a mismatch is otherwise a silent correctness bug.
 
-The table is written by `stemma_ingest::build_dense_index`, which inserts or
-updates exactly one row, keyed `vector_table = 'vec_dense'`, with
-`backend = 'staged'` when the vectors arrived from an external loader rather
-than from a live embedder. `revision` is left at its default and
-`quantization` at `'f32'`. `StoreBrowser.store_meta()` surfaces the whole
+The table is written from two places, both keyed `vector_table = 'vec_dense'`:
+`stemma_ingest::build_dense_index` upserts the row at promotion, with
+`backend = 'staged'` when the vectors arrived from an external loader, and
+`stemma_ingest::drain_embed_queue` inserts it (if absent) on the first drained
+batch, carrying the live embedder's `(backend, model)` identity and observed
+dimension. The `model` string is the vector-space identity the drain checks
+against; `backend` records how vectors arrived, so staged vectors and a live
+embedder of the same model share a table. `revision` is left at its default
+and `quantization` at `'f32'`. `StoreBrowser.store_meta()` surfaces the whole
 table to the console.
 
 ### `vec_staging` and `vec_dense`
@@ -186,27 +190,50 @@ Four honest observations about this shape:
 CREATE TABLE IF NOT EXISTS embed_queue (
     id           INTEGER PRIMARY KEY,
     src_table    TEXT NOT NULL,
+    src_column   TEXT NOT NULL,
     src_rowid    INTEGER NOT NULL,
-    serialized   TEXT NOT NULL,
+    serialized   TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'pending',   -- pending | done | failed
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT NOT NULL DEFAULT '',
     enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (src_table, src_rowid)
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (src_table, src_column, src_rowid)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS embed_queue_status ON embed_queue(status);
 ```
 
-The write path never waits on a model. Ingest enqueues `(src_table,
-src_rowid, serialized)` — `serialized` is the row rendered to the text the
-embedder will see — and an async worker drains the queue through the
-`Embedder` backend. The `UNIQUE (src_table, src_rowid)` constraint makes
-enqueue idempotent: re-ingesting a row that is already queued is a no-op
-upsert rather than a duplicate embedding job.
+The write path never waits on a model. `stemma_ingest::enqueue_missing_embeddings`
+inserts one pending item per document cell (`lex_values.is_doc = 1`) that has
+no vector in `vec_dense` — documents only, because dense retrieval pays off
+where mentions resolve *into* long text, and short values are already served
+by the lexical channels. `stemma_ingest::drain_embed_queue` then works the
+queue in batches through the `Embedder` backend. The unique key over the
+provenance triple makes enqueue idempotent: an item already pending is a
+no-op, and an item once `done` is only reset to pending if its vector has
+since disappeared.
+
+`serialized` is the text the embedder will see. It is empty for document
+items — the drain fetches the stored value from `lex_values` at embed time
+rather than duplicating megabyte documents into the queue — and exists so a
+future value-shaped serialization (a row rendered to text) has somewhere to
+live.
+
+The item lifecycle is `pending → done | failed`, and every transition keeps
+the table honestly queryable — `SELECT status, count(*) FROM embed_queue
+GROUP BY status` is the whole observability story, and the console's store
+panel shows the pending backlog. `failed` is reached three ways, each with an
+`error` note: the embedding call failed `attempts` times
+(`EMBED_MAX_ATTEMPTS = 3` — a retry budget, not a forever loop), the source
+text vanished from `lex_values` (index rebuilt out from under the queue), or
+the `model_registry` row for `vec_dense` names a *different* model than the
+configured embedder — in which case the drain refuses the entire queue and
+errors loudly rather than mixing vector spaces.
 
 The failure semantics matter more than the schema: if the embedder is down,
-the queue grows and retrieval degrades to lexical-only. It does not fail.
-
-*Today: created, drained by nothing.* The dense channel that exists is fed by
-external staging (`vec_staging`, above), not by this queue — so the
-index-time embedding path is still unbuilt even though the query-time one is
-not.
+the queue keeps its pending items (with their attempt counts) and retrieval
+degrades to lexical-only. It does not fail, and the next server start picks
+the queue back up.
 
 ### `query_log`
 
@@ -295,8 +322,8 @@ store deletes the history with the rest of the derived state.
 ## Migration discipline
 
 The store schema version lives in `PRAGMA user_version`, exposed as
-`stemmadb::STORE_SCHEMA_VERSION` (currently **3**). `init_store_schema()`
-implements the whole policy in fifteen lines:
+`stemmadb::STORE_SCHEMA_VERSION` (currently **4**). `init_store_schema()`
+implements the whole policy in a few lines:
 
 ```rust
 let found: i32 = pragma_query_value("user_version");
@@ -304,6 +331,9 @@ if found > STORE_SCHEMA_VERSION {
     return Err(Error::StoreVersionMismatch { found, supported });
 }
 if found < STORE_SCHEMA_VERSION {
+    if /* embed_queue exists without a status column */ {
+        conn.execute_batch("DROP TABLE embed_queue;")?;   // v4, guarded by shape
+    }
     conn.execute_batch(SCHEMA_SQL)?;        // idempotent, whole schema
     if found == 2 { /* guarded ALTERs */ }
     conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -330,7 +360,13 @@ The rules:
 4. **Additive only.** No column is ever dropped or retyped, and no table is
    renamed. This is affordable precisely because the store is derived: if a
    change ever genuinely needs to be destructive, the answer is to bump the
-   version and let the user re-ingest.
+   version and let the user re-ingest. v4 is the one exercised case:
+   reshaping `embed_queue` (per-column items, status tracking) widened its
+   unique key, which no `ALTER` can do, so the migration drops and recreates
+   the table — safe because the queue is transient work state that nothing
+   pre-v4 ever populated, and guarded by *shape* (`embed_queue` present
+   without a `status` column) rather than by version, so it runs exactly
+   when the old table exists.
 
 ### Shape-change self-healing below the version
 
@@ -706,9 +742,9 @@ flagged `value_truncated` — transport economy, with the full value always one
 | `ResolveResponse.rewritten_query` | declared, always `""` |
 | `ResolveOptions.{source, session}` | live — written to `query_log` |
 | `ResolveOptions.{max_candidates_per_mention, allow_lm, min_confidence}` | declared, **accepted and ignored by the server** |
-| `model_registry` | live — one `vec_dense` row written at promotion |
+| `model_registry` | live — one `vec_dense` row written at promotion or first drain |
 | `vec_staging` → `vec_dense` | live (external staging, promoted at startup) |
-| `embed_queue` | created, drained by nothing |
+| `embed_queue` | live — filled by `enqueue_missing_embeddings`, drained through the `Embedder` at server startup |
 
 Everything in the "declared" rows is designed-but-unbuilt. The proto carries
 them now so that the wire format does not need a breaking change when the
