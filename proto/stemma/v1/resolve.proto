@@ -65,6 +65,9 @@ message TraceCandidate {
   // For document-shaped values: a match snippet with ⟨⟩ marking hit terms.
   string snippet = 10;
   bool is_doc = 11;
+  // True when the LM adjudication band chose this candidate; the choice is
+  // applied as a reorder, so an adjudicated candidate sits at the front.
+  bool adjudicated = 12;
 }
 
 message TraceSpan {

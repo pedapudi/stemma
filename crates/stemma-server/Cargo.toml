@@ -12,6 +12,7 @@ serde_json = "1.0.151"
 stemma-embed = { version = "0.1.0", path = "../stemma-embed" }
 stemma-ingest = { version = "0.1.0", path = "../stemma-ingest" }
 stemma-kg = { version = "0.1.0", path = "../stemma-kg" }
+stemma-lm = { version = "0.1.0", path = "../stemma-lm" }
 stemma-proto = { version = "0.1.0", path = "../stemma-proto" }
 stemma-resolve = { version = "0.1.0", path = "../stemma-resolve" }
 stemmadb = { version = "0.1.0", path = "../stemmadb" }

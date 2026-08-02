@@ -42,6 +42,16 @@ struct Args {
     /// Model name for --embed-endpoint.
     #[arg(long)]
     embed_model: Option<String>,
+
+    /// OpenAI-compatible /v1/chat/completions base URL enabling the LM
+    /// adjudication band (e.g. http://host:8080/v1). Absent = no LM;
+    /// resolution is fully local.
+    #[arg(long)]
+    lm_endpoint: Option<String>,
+
+    /// Model name for --lm-endpoint.
+    #[arg(long)]
+    lm_model: Option<String>,
 }
 
 /// The stemma config file (config.json). The server reads `databases` and
@@ -58,11 +68,12 @@ struct ConfigFile {
 #[derive(serde::Deserialize, Default)]
 struct ServerSection {
     listen: Option<SocketAddr>,
-    embedder: Option<EmbedderSection>,
+    embedder: Option<EndpointSection>,
+    lm: Option<EndpointSection>,
 }
 
 #[derive(serde::Deserialize)]
-struct EmbedderSection {
+struct EndpointSection {
     endpoint: String,
     model: String,
 }
@@ -97,6 +108,10 @@ fn merge_config(args: &mut Args) -> anyhow::Result<()> {
         args.embed_endpoint.get_or_insert(e.endpoint);
         args.embed_model.get_or_insert(e.model);
     }
+    if let Some(l) = cfg.server.lm {
+        args.lm_endpoint.get_or_insert(l.endpoint);
+        args.lm_model.get_or_insert(l.model);
+    }
     Ok(())
 }
 
@@ -116,6 +131,7 @@ struct Resolver {
     // pipeline lands.
     dbs: HashMap<String, Mutex<StemmaDb>>,
     embedder: Option<stemma_embed::OpenAiEmbedder>,
+    lm: Option<Box<dyn stemma_lm::LmBackend>>,
 }
 
 impl Resolver {
@@ -129,7 +145,13 @@ impl Resolver {
             .embedder
             .as_ref()
             .map(|e| e as &dyn stemma_embed::Embedder);
-        let trace = stemma_resolve::resolve(&db, &req.query, embedder).map_err(|e| match e {
+        // options.allow_lm gates the adjudication band per request: off, the
+        // resolution is purely lexical/dense/KG and fully local.
+        let lm = match req.options.as_ref().map(|o| o.allow_lm) {
+            Some(true) => self.lm.as_deref(),
+            _ => None,
+        };
+        let trace = stemma_resolve::resolve_full(&db, &req.query, embedder, lm).map_err(|e| match e {
             stemma_resolve::Error::IndexMissing => Status::failed_precondition(e.to_string()),
             other => Status::internal(other.to_string()),
         })?;
@@ -240,9 +262,17 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
+    let lm = match (&args.lm_endpoint, &args.lm_model) {
+        (Some(ep), Some(m)) => {
+            tracing::info!(endpoint = %ep, model = %m, "adjudication band enabled");
+            Some(stemma_lm::backend_for(ep, m))
+        }
+        _ => None,
+    };
+
     tracing::info!(listen = %listen, "stemma-server starting");
     tonic::transport::Server::builder()
-        .add_service(ResolveServiceServer::new(Resolver { dbs, embedder }))
+        .add_service(ResolveServiceServer::new(Resolver { dbs, embedder, lm }))
         .serve(listen)
         .await?;
     Ok(())
