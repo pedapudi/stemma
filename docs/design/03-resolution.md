@@ -9,12 +9,15 @@ Everything below describes
 [`crates/stemma-resolve/src/lib.rs`](../../crates/stemma-resolve/src/lib.rs)
 — the lexical cascade over the index built by
 [`stemma-ingest`](../../crates/stemma-ingest/src/lib.rs), the knowledge-graph
-assists from [`stemma-kg`](../../crates/stemma-kg/src/lib.rs), and the dense
-channel through [`stemma-embed`](../../crates/stemma-embed/src/lib.rs).
-Collective disambiguation and the LM band are designed in
-[04-knowledge-graph.md](04-knowledge-graph.md#designed-instance-layer-and-collective-disambiguation)
-and [05-encoders-decoders.md](05-encoders-decoders.md); they are not built,
-and nothing in this document depends on them.
+assists from [`stemma-kg`](../../crates/stemma-kg/src/lib.rs) (including
+collective disambiguation over join paths,
+[stage 6b](#stage-6b--collective-disambiguation-over-join-paths)), and the
+dense channel through
+[`stemma-embed`](../../crates/stemma-embed/src/lib.rs), and the LM
+adjudication band through [`stemma-lm`](../../crates/stemma-lm/src/lib.rs)
+(constrained select-among-k with an explicit nil, ambiguous mentions only —
+see [05-encoders-decoders.md](05-encoders-decoders.md)). Mention expansion
+remains designed, not built.
 
 The entry points are:
 
@@ -47,6 +50,13 @@ Every tunable in the pipeline, with its source and its job:
 | `DOC_MIN_LEN` | 200 | stemma-ingest | Values at least this long are classified `is_doc` |
 | KG bonus | 0.04 / matched co-term | stemma-resolve | Coherence increment, capped at 0.9 |
 | KG span nudge | ×1.08 | stemma-resolve | Selection preference for spans matching a KG entity |
+| `MAX_TUPLE_MENTIONS` | 4 | stemma-resolve | Provisional mentions entering joint tuple scoring |
+| `MAX_TUPLE_K` | 4 | stemma-resolve | Candidates per mention in joint tuple scoring |
+| `MAX_PATH_HOPS` | 2 | stemma-resolve | fk/inferred_fk hops allowed on a connecting schema path |
+| `MAX_PATHS_PER_PAIR` | 4 | stemma-resolve | Schema paths probed per table pair |
+| `COHERENCE_BOOST` | 0.15 | stemma-resolve | Boost for instance-verified candidates of the winning tuple |
+| `COHERENCE_CAP` | 0.9 | stemma-resolve | Coherence never lifts a candidate into the exact band |
+| `ADJUDICATION_MARGIN` | 0.08 | stemma-resolve | Top-two gap under which a mention routes to LM adjudication |
 | `STOPWORDS` | 29 words | stemma-resolve | Never a mention alone; allowed inside longer spans |
 
 `RRF_K = 4.0` is far below the k = 60 of the original formulation [Cormack 2009]. That is deliberate and is discussed under
@@ -187,7 +197,7 @@ nodes (48 single terms, 40 phrases), so `kg_alias` fires on common terms
 Code of Regulations Title*, *Revenue and Taxation Code*) but not on
 *coastal permit*. The mechanism is real; the vocabulary is currently too
 small for it to fire often. Widening it is discussed in
-[04-knowledge-graph.md](04-knowledge-graph.md#designed-instance-layer-and-collective-disambiguation).
+[04-knowledge-graph.md](04-knowledge-graph.md#designed-instance-layer).
 
 ## Stage 4 — candidate generation, three channels
 
@@ -613,6 +623,72 @@ the strength of containing terms the corpus's own co-occurrence graph
 associates with *facility*. The `kg` channel appears in the trace and in the
 gRPC evidence, so the reordering is inspectable rather than mysterious.
 
+## Stage 6b — collective disambiguation over join paths
+
+The associative mention — *"Chen's team"* — is not resolvable span by span:
+there are two Chens, and each scores on its own lexical evidence. The *pair*
+is resolvable, because only one Chen connects to the team. This stage scores
+candidate tuples across mentions jointly — the AIDA-lineage move
+[Hoffart 2011; Phan 2019], in the bounded form specified in
+[04-knowledge-graph.md](04-knowledge-graph.md#built-collective-disambiguation-over-join-paths).
+It runs between per-span fusion and final selection, and only when the store
+has a compiled graph.
+
+1. **Provisional mentions.** The same greedy non-overlapping walk that
+   [stage 7](#stage-7--greedy-non-overlapping-selection) will run (identical
+   ordering key, no statuses committed) yields the provisional mention set.
+   The strongest `MAX_TUPLE_MENTIONS = 4` enter; fewer than two, and the
+   stage is a no-op.
+2. **Candidate shortlists.** The top `MAX_TUPLE_K = 4` candidates of each.
+3. **Pairwise coherence, two gates.** For each cross-mention candidate pair
+   whose tables differ:
+   - *Schema path.* The tables must be connected by `fk`/`inferred_fk`
+     edges within `MAX_PATH_HOPS = 2` hops. Path search is a
+     `KnowledgeStore` trait method (`table_paths`), so graph SQL stays in
+     the kg backend; at most `MAX_PATHS_PER_PAIR = 4` paths per table pair,
+     shortest first, cached per pair.
+   - *Instance link — the decisive gate.* A `LIMIT 1` join against the
+     read-only user database, anchored by rowid at both ends, verifies that
+     the two actual rows connect along the path (`teams` #43 really has
+     `lead_id = 2`). Probes run only for pairs a schema path survived. A
+     schema path alone contributes nothing: in a small schema every table
+     pair is connected within two hops, so only the data discriminates.
+4. **Joint scoring.** Every tuple in the product of the shortlists is
+   scored: sum of local fused scores plus `COHERENCE_BOOST` per verified
+   pair. At most 4⁴ tuples with at most six pair lookups each — exhaustive
+   enumeration is microseconds; no beam search is warranted.
+5. **The boost.** Each verified candidate of the winning tuple gains
+   `COHERENCE_BOOST = 0.15` once, capped at `COHERENCE_CAP = 0.9` so
+   coherence never lifts a candidate into the exact band, and never lowers a
+   score already above the cap. The connecting path is recorded on
+   `Candidate.coherence` — `people #2 ←lead_id— teams #43`, with `←`/`→`
+   following the fk's own orientation and `?` marking inferred joins — which
+   the JSON trace serializes and `TraceCandidate.coherence` carries over
+   gRPC. Affected spans re-sort, and stage 7 orders on the boosted scores.
+
+**Why 0.15.** The gap this boost exists to overturn is between adjacent-rank
+rivals of the same span in the value branch — two fuzzy name matches, one
+ranked above the other by RRF and length affinity — which on the worked
+cases below is ≈ 0.12. The boost must clear that; it must not approach the
+0.9 exact floor's authority, which the cap enforces separately.
+
+**A real reordering.** Mini corpus, query *"what did Chen's Billing team
+ship"*. `Billing` resolves exactly (teams #43, Dana Chen's team); `Chen`
+matches both people:
+
+| candidate | lexical score | coherence | final |
+|---|---:|---|---:|
+| `people.name #1` `'Wei Chen'` | 0.550 | — | 0.550 |
+| `people.name #2` `'Dana Chen'` | 0.427 | `people #2 ←lead_id— teams #43` (+0.15) | **0.577** |
+
+Length affinity ranks Wei first (shorter value); the verified `lead_id` link
+to the co-mention's team reverses it. The partner candidate (`Billing`,
+1.000) carries the same evidence string; its score is above the cap and is
+unchanged. Regression tests:
+`collective_disambiguation_prefers_connected_chen`,
+`without_kg_the_lexical_chen_wins`,
+`coherence_evidence_reaches_trace_and_proto`.
+
 ## Stage 7 — greedy non-overlapping selection
 
 Spans still marked `selected` (that is: not skipped, with at least one
@@ -726,6 +802,13 @@ The knowledge-coherence probes are cheap individually (a point lookup joined
 to a single-row FTS match) but there can be up to 4 × 32 = 128 of them per
 span.
 
+Collective disambiguation adds at most C(4, 2) = 6 path searches (cached per
+table pair, an in-memory walk over the fk edge list) and, for pairs a schema
+path survived, one `LIMIT 1` join per path per candidate pair — a hard
+ceiling of 6 × 16 × 4 = 384 point queries, in practice a handful because
+same-table pairs are skipped and most table pairs share one cached path
+list.
+
 **Measured, on the legal corpus** (92,696 documents, 370,784 indexed cells,
 4.2 GB store, debug build, warm page cache):
 
@@ -778,16 +861,24 @@ the trigram index; it is not currently consulted for them.
 **Greedy selection is local.** Spans are assigned byte ranges one at a time
 by descending score. A single high-scoring wrong long span can block two
 correct short ones, and nothing reconsiders. The principled fix is joint
-selection over segmentations, which is the same machinery collective
-disambiguation needs; at query scale (2–4 mentions × ~10 candidates)
-exhaustive joint scoring is microseconds [Hoffart 2011].
+selection over segmentations; the tuple scorer of
+[stage 6b](#stage-6b--collective-disambiguation-over-join-paths) is that
+machinery, but it currently takes the greedy segmentation as given rather
+than optimizing over segmentations, so a wrong segmentation still starves it
+of the right mentions.
 
-**Mentions are scored independently.** There is no interaction between
-mentions at all today. *"Chen's team"* resolves `Chen` and `team` as
-unrelated spans; nothing checks that the selected Chen has an edge to any
-team. This is the largest gap between what is built and what is designed, and
-it is what [04-knowledge-graph.md](04-knowledge-graph.md#designed-instance-layer-and-collective-disambiguation)
-is about.
+**Collective disambiguation is pairwise, bounded, and unweighted.** Mentions
+are no longer scored fully independently — stage 6b jointly scores candidate
+tuples over fk paths, and *"Chen's Billing team"* now selects the Chen with a
+verified path to the Billing team — but the machinery is deliberately
+narrow: at most 4 mentions × 4 candidates, paths of ≤ 2 fk/inferred_fk hops
+(4 per table pair), and a constant `COHERENCE_BOOST` rather than
+path-length- or edge-confidence-weighted scoring. Instance-level probes are
+existence checks; a connection through *any* row of an intermediate table
+counts. The `KgPath` evidence message on the Resolve response remains
+unemitted — the evidence travels as the rendered `coherence` string on the
+trace. And without per-record entity nodes (the designed instance layer),
+coherence reaches only candidates that are rows of fk-connected tables.
 
 **Boundary stopwords are not trimmed.** A span is skipped only when *all* its
 tokens are stopwords, so *"appeals of"* and *"of coastal"* are enumerated,

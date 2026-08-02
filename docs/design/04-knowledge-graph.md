@@ -23,13 +23,21 @@ pub trait KnowledgeStore {
     fn upsert_edge(&self, edge: &Edge) -> Result<()>;
     fn remove_by_key_prefixes(&self, prefixes: &[String]) -> Result<()>;
     fn stats(&self) -> Result<KgStats>;
+    fn table_paths(&self, from: &str, to: &str, max_hops: usize, limit: usize)
+        -> Result<Vec<Vec<PathHop>>>;
 }
 ```
 
-Four methods, one of which — `remove_by_key_prefixes` — exists purely to
-express *the unit of incremental recompilation*. That is not an accident of
-the SQLite backend leaking through; it is the operation any backend must
-support for stemma's maintenance model to work, so it belongs on the trait.
+`remove_by_key_prefixes` exists purely to express *the unit of incremental
+recompilation*. That is not an accident of the SQLite backend leaking
+through; it is the operation any backend must support for stemma's
+maintenance model to work, so it belongs on the trait.
+
+`table_paths` is the first query-side method, added with collective
+disambiguation: bounded simple-path search between two tables over
+`fk`/`inferred_fk` edges, shortest first, each hop carrying the fk's column
+pair, its provenance (`inferred`), and the traversal direction — everything
+a consumer needs to rebuild the join without touching graph SQL.
 
 The first (and only) backend is `SqliteKnowledgeStore`, three tables inside
 the `.stemmadb` store. The invariant that makes the seam real: **graph SQL
@@ -37,10 +45,10 @@ never leaves this module.** The resolution pipeline's two knowledge queries
 are the one deliberate exception, discussed and justified
 [below](#how-the-graph-feeds-resolution-today).
 
-Query-side methods — neighbours, bounded path search, subgraph extraction —
-are named in the trait's doc comment as the additions that land with
-collective disambiguation. They are deliberately absent rather than stubbed:
-an unimplemented trait method is a lie about capability that consumers write
+The remaining query-side methods — neighbours, subgraph extraction — are
+named in the trait's doc comment as the additions that land with the
+instance layer. They are deliberately absent rather than stubbed: an
+unimplemented trait method is a lie about capability that consumers write
 code against.
 
 ## Layers
@@ -537,7 +545,7 @@ edge is a hole in the evidence chain.
 
 ## How the graph feeds resolution today
 
-Three live consumers, plus two derived surfaces.
+Four live consumers, plus two derived surfaces.
 
 ### 1. Mention detection — `kg_alias` spans
 
@@ -571,7 +579,18 @@ graph's co-occurring neighbours of *facility* and #42595 contains none. The
 lexical channels ranked them the other way round; the corpus's own topical
 structure broke the tie.
 
-### 3. Query suggestions
+### 3. Collective disambiguation — join paths plus instance probes
+
+Detailed in
+[03-resolution.md](03-resolution.md#stage-6b--collective-disambiguation-over-join-paths)
+and [below](#built-collective-disambiguation-over-join-paths). In short: the
+`fk`/`inferred_fk` edges answer, through the trait's `table_paths` method,
+whether two candidates' tables connect within two hops; a `LIMIT 1` probe
+against the user database then verifies the two actual rows connect along
+that path, and verified candidates of the winning tuple earn a boost with
+the path recorded as evidence.
+
+### 4. Query suggestions
 
 `StoreBrowser.examples()` mines the strongest `cooccurs` pairs (ordered by
 `props.$.docs`) into two-word query suggestions, and the highest-count
@@ -579,7 +598,7 @@ structure broke the tie.
 are therefore generated *from the corpus*, not authored — a new database gets
 sensible starting queries with no configuration.
 
-### 4. Orientation surfaces
+### 5. Orientation surfaces
 
 The MCP `knowledge_graph` tool returns a digest — table nodes with row
 counts, the 30 most central characteristic terms, and every `fk`/`inferred_fk`
@@ -588,16 +607,71 @@ unfamiliar corpus". The console's graph view renders the whole thing.
 
 ### A note on the layering exception
 
-The resolution pipeline issues those two knowledge queries directly against
-`kg_nodes` and `kg_edges` rather than through the `KnowledgeStore` trait, and
-guards each with an existence check on `sqlite_master`. That is a real
-deviation from the invariant that graph SQL stays in its backend, taken
-knowingly: the trait has no read-side methods yet, and adding
-`is_entity(label)` / `neighbours(label)` to it is the correct fix. It is
-listed here because a design document that describes the invariant without
-naming its one violation is describing a different codebase.
+The resolution pipeline's mention-detection and term-coherence queries
+(consumers 1 and 2) go directly against `kg_nodes` and `kg_edges` rather
+than through the `KnowledgeStore` trait, each guarded by an existence check
+on `sqlite_master`. That is a real deviation from the invariant that graph
+SQL stays in its backend, taken knowingly. Collective disambiguation shows
+the correct pattern — its path search went onto the trait as `table_paths`
+from the start — and adding `is_entity(label)` / `neighbours(label)` is the
+fix for the two older queries. The exception is listed here because a design
+document that describes the invariant without naming its violations is
+describing a different codebase.
 
-## Designed: instance layer and collective disambiguation
+## Built: collective disambiguation over join paths
+
+The unsolved case in text-to-SQL value linking is the *associative* mention:
+*Chen's team*, *the crown's holdings*. Neither mention is resolvable alone —
+there are two Chens — but the **pair** is: the right Chen is the one with a
+path to the team. Collective entity linking solved this shape of problem
+more than a decade ago [Hoffart 2011; Phan 2019]: score candidate
+*tuples* jointly,
+
+$$
+\hat{c} = \arg\max_{c \in C_1 \times \cdots \times C_m}
+\sum_{i} s_i(c_i)
++ \sum_{i<j} \mathrm{coh}(c_i, c_j)
+$$
+
+where `s_i` is the local fused score from
+[03-resolution.md](03-resolution.md). This landed as
+[stage 6b](03-resolution.md#stage-6b--collective-disambiguation-over-join-paths)
+of the pipeline. What was actually built, with its bounds stated plainly:
+
+- **The mention set is the provisional greedy selection**, capped at the
+  strongest `MAX_TUPLE_MENTIONS = 4` mentions with `MAX_TUPLE_K = 4`
+  candidates each. Joint scoring re-ranks candidates *within* that
+  segmentation; it does not subsume the greedy segmentation pass, which the
+  design had hoped it eventually would. That remains open.
+- **`coh` is binary, not weighted.** Two candidates cohere when their tables
+  are connected by a `fk`/`inferred_fk` path of at most `MAX_PATH_HOPS = 2`
+  edges (via the trait's `table_paths`, at most `MAX_PATHS_PER_PAIR = 4`
+  paths per table pair) **and** a `LIMIT 1` probe against the read-only user
+  database confirms the two rows actually connect along one of those paths.
+  A verified pair contributes a flat `COHERENCE_BOOST = 0.15`; path length
+  and edge confidence are not yet weighed in, and a schema path without an
+  instance link contributes nothing — in a small schema everything is within
+  two hops of everything, so only the data discriminates.
+- **The scale argument held.** A query has 2–4 mentions with 4 candidates
+  each, so exhaustive joint scoring is at most 4⁴ tuples with six pair
+  lookups each — microseconds, no approximation, no beam search. The
+  expensive part is the instance probes, bounded by pairwise caching to
+  6 × 16 × 4 point queries in the worst case.
+- **Every joint decision is inspectable**, but not yet via the `KgPath`
+  proto message the design named. The winning tuple's verified candidates
+  carry a rendered path — `people #2 ←lead_id— teams #43` — on
+  `Candidate.coherence`, serialized in the JSON trace and on
+  `TraceCandidate.coherence` over the Explain RPC. Structured `KgPath`
+  evidence on the Resolve response is still unemitted.
+
+The regression case is the mini corpus's two Chens: *"what did Chen's
+Billing team ship"* ranked Wei Chen above Dana Chen on lexical evidence
+(0.550 vs 0.427, length affinity); the verified `lead_id` link between Dana
+and the Billing team now reverses it (0.577 vs 0.550), with the path on the
+winner. Without a compiled graph the stage is skipped entirely and the
+lexical ordering stands.
+
+## Designed: instance layer
 
 Everything in this section is **designed, not built**.
 
@@ -621,44 +695,12 @@ specific person, the aliases each is known by. The instance layer adds:
   [05-encoders-decoders.md](05-encoders-decoders.md#where-tuned-encoders-matter-most-the-instance-layer).
 
 The instance layer is what turns `kg_alias` from a coarse "this span is a
-corpus term" into "this span is a known surface form of record 17".
-
-### Collective disambiguation over join paths
-
-The unsolved case in text-to-SQL value linking is the *associative* mention:
-*Chen's team*, *the crown's holdings*. Neither mention is resolvable alone —
-there are two Chens — but the **pair** is: the right Chen is the one with a
-path to some team.
-
-Collective entity linking solved this shape of problem more than a decade ago
-[Hoffart 2011; Phan 2019]. Score candidate *tuples* jointly:
-
-$$
-\hat{c} = \arg\max_{c \in C_1 \times \cdots \times C_m}
-\sum_{i} \bigl[\lambda_1 s_i(c_i) + \lambda_2 \mathrm{prior}(c_i)\bigr]
-+ \lambda_3 \sum_{i<j} \mathrm{coh}(c_i, c_j)
-$$
-
-where `s_i` is the local fused score from
-[03-resolution.md](03-resolution.md), and `coh` is knowledge-graph coherence
-— for stemma, a bounded path search between the two candidates' records over
-`fk` and `inferred_fk` edges, weighted by path length and edge confidence.
-
-The scale argument is what makes this practical: a query has 2–4 mentions
-with ~10 candidates each, so exhaustive joint scoring is 10² to 10⁴ pair
-evaluations. That is microseconds — no approximation, no beam search, no
-iterative message passing. The expensive part is the bounded path search, and
-it is bounded precisely so it stays cheap.
-
-Landing this requires the query-side `KnowledgeStore` methods (neighbours,
-bounded path search, subgraph extraction), and it subsumes the greedy
-selection of [stage 7](03-resolution.md#stage-7--greedy-non-overlapping-selection):
-once tuples are scored jointly, segmentation can be part of the same
-optimization instead of a separate greedy pass.
-
-Each joint decision produces a `KgPath` evidence message — node labels and
-edge labels along the connecting path — so a collective decision is as
-inspectable as a lexical one.
+corpus term" into "this span is a known surface form of record 17". For
+collective disambiguation it is the upgrade path from *rows of fk-connected
+tables* to *entities with aliases*: today the joint scorer can only connect
+candidates that are rows reachable through the join graph, and a mention
+prior (`λ₂ prior(cᵢ)` in the collective-linking formulation) has nothing to
+attach to until records are entities.
 
 ### KG-guided expansion
 
@@ -673,9 +715,10 @@ Two further uses of the compiled graph, both cheap:
   instead of a model call.
 - **Schema-path priors.** The join graph tells the resolver which tables are
   reachable from which; a mention that resolves into a table with no path to
-  the tables the other mentions resolved into is probably wrong. This is the
-  same coherence signal as above, applied at the schema level rather than the
-  instance level, and it needs only the edges that already exist.
+  the tables the other mentions resolved into is probably wrong. The built
+  stage 6b uses reachability only as a *gate* before instance probes and only
+  ever adds score; the designed prior is the negative direction — penalizing
+  the unreachable — and it needs only the edges that already exist.
 
 ## Parameter summary
 

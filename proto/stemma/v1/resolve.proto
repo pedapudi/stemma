@@ -68,6 +68,10 @@ message TraceCandidate {
   // True when the LM adjudication band chose this candidate; the choice is
   // applied as a reorder, so an adjudicated candidate sits at the front.
   bool adjudicated = 12;
+  // Instance-level connection to a co-mention's candidate, verified in the
+  // user database during collective disambiguation — a human-readable path
+  // like "people #2 ←lead_id— teams #43". Empty when no such evidence.
+  string coherence = 13;
 }
 
 message TraceSpan {

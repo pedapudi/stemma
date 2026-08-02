@@ -507,7 +507,7 @@
         "bzlTransitiveDigest": "jz2R21bj99KzTKk+R+1EC75am/vBLzWFhYRRN/Qjivk=",
         "usagesDigest": "ckRX49YV+cHCFREaX6KIuCdeMLkmYw3s/Z2rcQLH5Z8=",
         "recordedFileInputs": {
-          "@@//Cargo.lock": "63a3b28c58c26405488ab17afbacec5de94e1fab44227ee2927370f14ad97da3",
+          "@@//Cargo.lock": "6d205824a3364f1f65ba67f5e4477ae16a77fdca4657a34455cc68f426518eb4",
           "@@//Cargo.toml": "1f602ad00415fc0699ebee6cd61e9337afd4601ac41188a73485d2ef8384eb5b",
           "@@//crates/stemma-embed/Cargo.toml": "bca143b5a367e75a2fd3f4df5d79d350bd1d73ce340de47ad53fd01f08bf2e8c",
           "@@//crates/stemma-eval/Cargo.toml": "41acbe501b4cc3ed18c9fe005fe75daa8fbb466c55b53cbea6aa273bf70bfd83",
@@ -515,7 +515,7 @@
           "@@//crates/stemma-kg/Cargo.toml": "026d74fe8d4e89353d4cda0ed1015974ea3c465455334bba7184ff6e8d140f9f",
           "@@//crates/stemma-lm/Cargo.toml": "be2aa4230142c6872dd9902114a6e2079e72776e570043884094276bea9b4952",
           "@@//crates/stemma-proto/Cargo.toml": "dbf1432a5f947097e58cc5b104583a09b3dedc5d472ad9b982d61f3c31488b42",
-          "@@//crates/stemma-resolve/Cargo.toml": "5445f94233abff14ac57939b6a6bc6aba00fe9a3ebd83880b1cda71e324c8f1d",
+          "@@//crates/stemma-resolve/Cargo.toml": "e07c546d9e480be6f4f16bf39568fd4a7618084fb125f5d989659015fa1dd36e",
           "@@//crates/stemma-server/Cargo.toml": "d09c15c6853d5921a4e25f8d2891268cd43742ea5e42aea99f085714a4126270",
           "@@//crates/stemmadb/Cargo.toml": "848b29bd116c9f86bbaf881ef594308039f4dc4ffce336cce1ce288485ba93f0",
           "@@//tools/proto-gen/Cargo.toml": "788281b6e98f079245afffe4a6574a45b914c920a158d010ff780d3f6779ad13"

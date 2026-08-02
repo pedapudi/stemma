@@ -71,6 +71,11 @@ pub struct TraceCandidate {
     /// applied as a reorder, so an adjudicated candidate sits at the front.
     #[prost(bool, tag = "12")]
     pub adjudicated: bool,
+    /// Instance-level connection to a co-mention's candidate, verified in the
+    /// user database during collective disambiguation — a human-readable path
+    /// like "people #2 ←lead_id— teams #43". Empty when no such evidence.
+    #[prost(string, tag = "13")]
+    pub coherence: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraceSpan {
