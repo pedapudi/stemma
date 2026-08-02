@@ -1061,6 +1061,7 @@ function renderTrace(out, trace) {
     "exact",
     "bm25",
     "trigram",
+    "dense",
     "kg"
   ];
   const chanRow = el("span", {
@@ -1260,7 +1261,7 @@ function renderTrace(out, trace) {
   }
   out.append(el("div", {
     class: "sql-caption"
-  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, kg \xB7 click a mention row for detail`), lineage, field, alsoBox);
+  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, dense, kg \xB7 click a mention row for detail`), lineage, field, alsoBox);
 }
 function renderMiniTrace(trace) {
   const box = el("div", {

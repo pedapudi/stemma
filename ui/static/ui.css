@@ -778,6 +778,8 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .hc-ch-bm25 { color: var(--ink); border-color: var(--flat); }
 .hc-ch-trigram { color: var(--ink-soft); border-color: var(--rule); }
 .hc-ch-kg { color: var(--brand-accent); border-color: var(--brand-accent); background: color-mix(in srgb, var(--brand-accent) 10%, transparent); }
+/* dense = vector-space evidence: accent-ink blend, dashed — kin to kg but not compiled */
+.hc-ch-dense { color: color-mix(in srgb, var(--brand-accent) 60%, var(--ink)); border-color: color-mix(in srgb, var(--brand-accent) 55%, var(--ink)); border-style: dashed; background: color-mix(in srgb, var(--brand-accent) 6%, transparent); }
 .hc-verdict { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); text-transform: uppercase; letter-spacing: .06em; }
 .hc-ok { color: var(--good); }
 .hc-no { color: var(--bad); }

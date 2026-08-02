@@ -27,6 +27,15 @@ struct Args {
     /// store is created next to the user DB as <path>.stemmadb.
     #[arg(long = "db", value_parser = parse_db_spec)]
     dbs: Vec<(String, PathBuf)>,
+
+    /// OpenAI-compatible /v1/embeddings base URL enabling the dense channel
+    /// (e.g. http://host:8081/v1). Absent = lexical + kg only.
+    #[arg(long)]
+    embed_endpoint: Option<String>,
+
+    /// Model name for --embed-endpoint.
+    #[arg(long)]
+    embed_model: Option<String>,
 }
 
 fn parse_db_spec(s: &str) -> Result<(String, PathBuf), String> {
@@ -44,6 +53,7 @@ struct Resolver {
     // resolution is read-mostly. Revisit with a connection pool when the
     // pipeline lands.
     dbs: HashMap<String, Mutex<StemmaDb>>,
+    embedder: Option<stemma_embed::OpenAiEmbedder>,
 }
 
 impl Resolver {
@@ -53,7 +63,11 @@ impl Resolver {
             .get(&req.database)
             .ok_or_else(|| Status::not_found(format!("unknown database {:?}", req.database)))?;
         let db = db.lock().expect("stemmadb lock poisoned");
-        let trace = stemma_resolve::resolve_lexical(&db, &req.query).map_err(|e| match e {
+        let embedder = self
+            .embedder
+            .as_ref()
+            .map(|e| e as &dyn stemma_embed::Embedder);
+        let trace = stemma_resolve::resolve(&db, &req.query, embedder).map_err(|e| match e {
             stemma_resolve::Error::IndexMissing => Status::failed_precondition(e.to_string()),
             other => Status::internal(other.to_string()),
         })?;
@@ -125,6 +139,18 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("indexing {name}"))?;
         let kg = stemma_kg::compile(&db, false)
             .with_context(|| format!("compiling knowledge graph for {name}"))?;
+        let dense = stemma_ingest::build_dense_index(&db)
+            .with_context(|| format!("promoting dense index for {name}"))?;
+        if let Some(d) = &dense {
+            tracing::info!(
+                name,
+                vectors = d.vectors,
+                dim = d.dimension,
+                model = %d.model,
+                promoted = d.promoted,
+                "dense index"
+            );
+        }
         tracing::info!(
             name,
             user_db = %user_db.display(),
@@ -140,9 +166,17 @@ async fn main() -> anyhow::Result<()> {
         dbs.insert(name.clone(), Mutex::new(db));
     }
 
+    let embedder = match (&args.embed_endpoint, &args.embed_model) {
+        (Some(ep), Some(m)) => {
+            tracing::info!(endpoint = %ep, model = %m, "dense channel enabled");
+            Some(stemma_embed::OpenAiEmbedder::new(ep, m))
+        }
+        _ => None,
+    };
+
     tracing::info!(listen = %args.listen, "stemma-server starting");
     tonic::transport::Server::builder()
-        .add_service(ResolveServiceServer::new(Resolver { dbs }))
+        .add_service(ResolveServiceServer::new(Resolver { dbs, embedder }))
         .serve(args.listen)
         .await?;
     Ok(())

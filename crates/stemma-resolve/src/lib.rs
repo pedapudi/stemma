@@ -35,6 +35,9 @@ const PER_CHANNEL_LIMIT: usize = 8;
 const SELECT_THRESHOLD: f64 = 0.35;
 /// Max selected candidates per mention.
 const TOP_K: usize = 5;
+/// Dense KNN is a full scan of the vector table per probe; spend it only on
+/// spans the lexical channels left uncertain, at most this many per query.
+const DENSE_MAX_SPANS: usize = 4;
 
 /// Stopwords: never a mention on their own (still allowed inside longer spans).
 const STOPWORDS: &[&str] = &[
@@ -111,8 +114,18 @@ pub struct Trace {
     pub elapsed_ms: f64,
 }
 
-/// Resolve `query` against the lexical index, returning the full trace.
+/// Resolve `query` against the lexical index alone.
 pub fn resolve_lexical(db: &StemmaDb, query: &str) -> Result<Trace> {
+    resolve(db, query, None)
+}
+
+/// Resolve `query` with every available channel. The embedder is optional
+/// and fallible: absent or down, resolution is lexical+kg only.
+pub fn resolve(
+    db: &StemmaDb,
+    query: &str,
+    embedder: Option<&dyn stemma_embed::Embedder>,
+) -> Result<Trace> {
     let started = std::time::Instant::now();
     let conn = db.conn();
 
@@ -129,6 +142,26 @@ pub fn resolve_lexical(db: &StemmaDb, query: &str) -> Result<Trace> {
 
     let tokens = tokenize(query);
     let mut spans = enumerate_spans(query, &tokens);
+
+    // With a dense channel available, the whole query is itself a semantic
+    // unit: mentions like "getting fired from a state job" have no lexical
+    // anchor at any n-gram width, but the full phrase lands near the right
+    // documents in vector space. Give the full query its own span and let
+    // greedy selection arbitrate — strong lexical anchors (exact ≈ 0.9)
+    // outrank it and mark it overlapped; anchor-free semantic queries are
+    // won by it, which also suppresses incidental substring junk.
+    if embedder.is_some() && tokens.len() > MAX_SPAN_TOKENS {
+        let (start, end) = (tokens[0].start, tokens[tokens.len() - 1].end);
+        spans.push(Span {
+            id: spans.len(),
+            text: query[start..end].to_string(),
+            start,
+            end,
+            status: "selected".into(),
+            candidates: Vec::new(),
+            kg_alias: false,
+        });
+    }
 
     // KG-assisted mention detection: spans matching a compiled phrase/term
     // entity are marked and favored in selection — multi-word entities like
@@ -152,11 +185,66 @@ pub fn resolve_lexical(db: &StemmaDb, query: &str) -> Result<Trace> {
         }
     }
 
+    // Phase 1: lexical raw hits for every live span.
+    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> =
+        std::collections::HashMap::new();
+    for span in spans.iter() {
+        if span.status == "skipped" {
+            continue;
+        }
+        raw.insert(span.id, gather_lexical_hits(db, &span.text)?);
+    }
+
+    // Phase 2: the dense channel, targeted. KNN over vec0 is a full scan of
+    // the vector table per probe, so it is spent only where lexical evidence
+    // is thin — spans without an exact hit — longest spans first, capped.
+    // One batched embedding call; failures degrade, never abort.
+    if let Some(embedder) = embedder {
+        let has_dense: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_dense > 0 {
+            let mut targets: Vec<&Span> = spans
+                .iter()
+                .filter(|s| s.status != "skipped")
+                .filter(|s| {
+                    raw.get(&s.id)
+                        .map(|h| !h.iter().any(|x| x.channel == "exact"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            targets.sort_by_key(|s| std::cmp::Reverse(s.end - s.start));
+            targets.truncate(DENSE_MAX_SPANS);
+            let texts: Vec<String> = targets
+                .iter()
+                .map(|s| stemma_embed::format_query(&s.text))
+                .collect();
+            let ids: Vec<usize> = targets.iter().map(|s| s.id).collect();
+            match embedder.embed(&texts) {
+                Ok(vecs) => {
+                    for (id, v) in ids.into_iter().zip(vecs) {
+                        let hits = dense_hits(db, &v)?;
+                        raw.entry(id).or_default().extend(hits);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "dense channel degraded"),
+            }
+        }
+    }
+
+    // Phase 3: fuse and refine.
     for span in spans.iter_mut() {
         if span.status == "skipped" {
             continue;
         }
-        span.candidates = gather_candidates(db, &span.text)?;
+        let hits = raw.remove(&span.id).unwrap_or_default();
+        let mut candidates = fuse(&span.text, hits);
+        apply_kg_coherence(db, &span.text, &mut candidates)?;
+        span.candidates = candidates;
         if span.candidates.is_empty() {
             span.status = "no_candidates".into();
         } else if span.candidates[0].score < SELECT_THRESHOLD {
@@ -245,7 +333,7 @@ struct RawHit {
     snippet: Option<String>,
 }
 
-fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
+fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
     let conn = db.conn();
     let mut hits: Vec<RawHit> = Vec::new();
 
@@ -339,9 +427,59 @@ fn gather_candidates(db: &StemmaDb, span: &str) -> Result<Vec<Candidate>> {
         }
     }
 
-    let mut candidates = fuse(span, hits);
-    apply_kg_coherence(db, span, &mut candidates)?;
-    Ok(candidates)
+    Ok(hits)
+}
+
+/// Dense KNN over vec0. Documents were embedded whole; the span vector
+/// carries the retrieval instruction. L2 on unit vectors → cos = 1 − d²/2.
+fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
+    let conn = db.conn();
+    let mut hits = Vec::new();
+    let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_table, src_column, src_rowid, distance FROM vec_dense
+         WHERE embedding MATCH ?1 AND k = ?2",
+    )?;
+    let rows = stmt.query_map(
+        stemmadb::rusqlite::params![blob, PER_CHANNEL_LIMIT as i64],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        },
+    );
+    if let Ok(rows) = rows {
+        for (rank, row) in rows.enumerate() {
+            let Ok((table, column, rowid, dist)) = row else {
+                continue;
+            };
+            let cosine = 1.0 - (dist * dist) / 2.0;
+            let looked: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT value, is_doc FROM lex_values
+                     WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3",
+                    stemmadb::rusqlite::params![table, column, rowid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            let (value, is_doc) = looked.unwrap_or((String::new(), 1));
+            hits.push(RawHit {
+                table,
+                column,
+                rowid,
+                value,
+                channel: "dense",
+                rank,
+                raw: cosine,
+                is_doc: is_doc != 0,
+                snippet: None,
+            });
+        }
+    }
+    Ok(hits)
 }
 
 /// The GraphRAG-lite assist: when the span's tokens are characteristic terms
@@ -471,7 +609,7 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
             // Normalize: three channels at rank 0 -> 1.0 (docs never have the
             // exact channel, so their base tops out at 2/3).
             let base = (rrf / (3.0 / RRF_K)).min(1.0);
-            let score = if has_exact {
+            let mut score = if has_exact {
                 // Exact matches are definitionally right about the value.
                 (0.9 + 0.1 * base).min(1.0)
             } else if g.is_doc {
@@ -483,6 +621,19 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                     (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
                 (base * (0.4 + 0.6 * affinity)).min(1.0)
             };
+            // The dense channel's cosine is absolute evidence, not a rank:
+            // calibrate it to the score scale and let it floor the fusion —
+            // a 0.6 cosine match must survive having no lexical company.
+            if let Some(best_cos) = g
+                .channels
+                .iter()
+                .filter(|c| c.channel == "dense")
+                .map(|c| c.raw)
+                .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x))))
+            {
+                let calibrated = (((best_cos - 0.30) / 0.30).clamp(0.0, 1.0)) * 0.78;
+                score = score.max(calibrated);
+            }
             let (value, value_truncated) = truncate_value(&g.value);
             Candidate {
                 table,

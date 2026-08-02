@@ -147,6 +147,92 @@ pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DenseStats {
+    pub vectors: usize,
+    pub dimension: usize,
+    pub model: String,
+    pub promoted: bool,
+}
+
+/// Promotes externally staged vectors into the vec0 dense index.
+///
+/// Loaders (e.g. eval/legal/load_vectors.py) write rows into `vec_staging`
+/// — a plain table, writable without the sqlite-vec extension — and this
+/// pass, running inside the extension-bearing process, creates the `vec0`
+/// virtual table, moves the vectors in, records the model identity in
+/// `model_registry`, and drops the staging table. One model per dense
+/// table, always: mixed identities in staging are a hard error.
+pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
+    let conn = db.conn();
+    let staged: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'vec_staging'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if staged == 0 {
+        // No staging: report the existing dense index if one is registered.
+        let existing: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT model, dimension FROM model_registry WHERE vector_table = 'vec_dense'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        return Ok(existing.map(|(model, dim)| {
+            let vectors: i64 = conn
+                .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
+                .unwrap_or(0);
+            DenseStats {
+                vectors: vectors as usize,
+                dimension: dim as usize,
+                model,
+                promoted: false,
+            }
+        }));
+    }
+
+    let identities: Vec<(String, i64)> = conn
+        .prepare("SELECT DISTINCT model, dim FROM vec_staging")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let (model, dim) = match identities.as_slice() {
+        [one] => one.clone(),
+        _ => panic!("vec_staging holds mixed model identities: {identities:?}"),
+    };
+
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS vec_dense;
+         CREATE VIRTUAL TABLE vec_dense USING vec0(
+             embedding float[{dim}],
+             src_table text,
+             src_column text,
+             src_rowid integer
+         );"
+    ))?;
+    let moved = conn.execute(
+        "INSERT INTO vec_dense (embedding, src_table, src_column, src_rowid)
+         SELECT embedding, src_table, src_column, src_rowid FROM vec_staging",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
+         VALUES ('vec_dense', 'staged', ?1, ?2, 'f32')
+         ON CONFLICT(vector_table) DO UPDATE SET model = ?1, dimension = ?2",
+        stemmadb::rusqlite::params![model, dim],
+    )?;
+    conn.execute_batch("DROP TABLE vec_staging;")?;
+
+    Ok(Some(DenseStats {
+        vectors: moved,
+        dimension: dim as usize,
+        model,
+        promoted: true,
+    }))
+}
+
 fn count_tables(cols: &[TextColumn]) -> usize {
     let mut t: Vec<&str> = cols.iter().map(|c| c.table.as_str()).collect();
     t.sort_unstable();

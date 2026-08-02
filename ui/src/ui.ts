@@ -915,7 +915,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
     restyle();
   });
 
-  const channels = ["exact", "bm25", "trigram", "kg"];
+  const channels = ["exact", "bm25", "trigram", "dense", "kg"];
   const chanRow = el("span", { class: "sf-channels" },
     channels.map((ch) => {
       const chip = el("button", {
@@ -1069,7 +1069,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
 
   out.append(
     el("div", { class: "sql-caption" },
-      `resolved in ${trace.elapsed_ms.toFixed(1)} ms · ${trace.spans.length} spans enumerated · channels: exact, bm25, trigram, kg · click a mention row for detail`),
+      `resolved in ${trace.elapsed_ms.toFixed(1)} ms · ${trace.spans.length} spans enumerated · channels: exact, bm25, trigram, dense, kg · click a mention row for detail`),
     lineage,
     field,
     alsoBox,

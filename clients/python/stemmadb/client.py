@@ -18,7 +18,7 @@ class StemmaClient:
     ...     trace = c.explain("what did Chen's team ship", database="mini")
     """
 
-    def __init__(self, target: str = "127.0.0.1:50051", timeout: float = 10.0):
+    def __init__(self, target: str = "127.0.0.1:50051", timeout: float = 30.0):
         self._channel = grpc.insecure_channel(target)
         self._stub = resolve_pb2_grpc.ResolveServiceStub(self._channel)
         self._timeout = timeout
