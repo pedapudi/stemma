@@ -1454,7 +1454,7 @@ function renderChatRail() {
       class: "rail-transcript"
     }, el("div", {
       class: "empty"
-    }, "\u2014 talk to the data by proxy needs a model: restart the console with --lm-endpoint http://host:port/v1 --lm-model <name> (any openai-compatible server: vllm, llama.cpp, litellm; bearer token via LM_API_KEY)")));
+    }, "\u2014 talk to the data by proxy needs a model: set console.lm in config.json (endpoint, model, api_key) or restart the console with --lm-endpoint http://host:port/v1 --lm-model <name> (any openai-compatible server: vllm, llama.cpp, litellm)")));
     return;
   }
   if (!chatLog.has(key)) {

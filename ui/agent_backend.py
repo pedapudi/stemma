@@ -30,10 +30,12 @@ from stemma_agent.agent import build_agent  # noqa: E402
 
 
 class AgentChat:
-    def __init__(self, dbs: dict[str, str], grpc: str, endpoint: str, model: str):
+    def __init__(self, dbs: dict[str, str], grpc: str, endpoint: str, model: str,
+                 api_key: str = ""):
         self.dbs = dbs
         self.model_name = model
-        self.agent = build_agent(dbs, grpc=grpc, lm_endpoint=endpoint, lm_model=model)
+        self.agent = build_agent(dbs, grpc=grpc, lm_endpoint=endpoint,
+                                 lm_model=model, api_key=api_key)
         self.sessions = InMemorySessionService()
         self.runner = Runner(
             agent=self.agent, app_name="stemma-console", session_service=self.sessions

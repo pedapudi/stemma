@@ -7,16 +7,26 @@ Resolve API.
 ## Starting
 
 ```sh
+bazel run //crates/stemma-server -- --config config.json
+# or fully by flags:
 bazel run //crates/stemma-server -- \
   --listen 127.0.0.1:50051 \
   --db mini=/path/to/mini.db \
   --db careg=eval/careg/data/careg.db
 ```
 
+- `--config` — a stemma `config.json`; the server reads `databases` and
+  `server.*` (listen address, embedder endpoint/model for the dense channel).
+  Flags override the file, field by field. Relative database paths resolve
+  against the file's directory. One file describes one deployment — the
+  console and the MCP server read their own sections of the same file.
+  Configuration never comes from environment variables.
 - `--listen` — address to bind (default `127.0.0.1:50051`).
 - `--db name=path` — repeatable. `name` is the logical handle clients put in
   `ResolveRequest.database`; the sidecar store is created as
   `<path minus extension>.stemmadb` next to the user DB.
+- `--embed-endpoint`, `--embed-model` — OpenAI-compatible `/v1/embeddings`
+  endpoint enabling the dense channel; absent = lexical + kg only.
 
 Startup logs confirm each registration, including the linked sqlite-vec
 version:

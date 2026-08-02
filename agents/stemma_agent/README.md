@@ -11,10 +11,12 @@ How to build an agent on stemmadb, in three moves:
 
 ```sh
 pip install google-adk litellm 'mcp<2' -e clients/python
-export STEMMADB_DBS=legal=/path/legal.db
-export STEMMA_LM_ENDPOINT=http://host:8080/v1 STEMMA_LM_MODEL=<name>
-adk run agents/stemma_agent
+adk run agents/stemma_agent   # configured by the repo's config.json
 ```
+
+Configuration is the repository's `config.json` (`databases` +
+`console.lm`); `build_agent()` takes everything as explicit arguments for
+programmatic use. Never environment variables.
 
 The stemma console's chat rail is a frontend over exactly this agent
 (`ui/agent_backend.py`): transcripts persist in the store's `chat_log`, and

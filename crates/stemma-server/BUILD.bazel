@@ -14,6 +14,8 @@ rust_binary(
         "//crates/stemmadb",
         "@crates//:anyhow",
         "@crates//:clap",
+        "@crates//:serde",
+        "@crates//:serde_json",
         "@crates//:tokio",
         "@crates//:tonic",
         "@crates//:tracing",

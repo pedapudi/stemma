@@ -187,10 +187,11 @@ server. The console works against a corpus whose server is down; only
 resolution needs the server. This is a direct consequence of the storage
 model — everything stemma knows is in two plain SQLite files.
 
-**The MCP server is a child of its client**, launched over stdio with
-`STEMMADB_GRPC` and `STEMMADB_DBS` in its environment. It holds no state of
-its own: a `StemmaClient` for resolution and a `StoreBrowser` per database
-for everything else.
+**The MCP server is a child of its client**, launched over stdio with its
+server address and database registrations as command-line arguments
+(`--grpc`, `--db name=path`, or `--config`). It holds no state of its own: a
+`StemmaClient` for resolution and a `StoreBrowser` per database for
+everything else.
 
 **Models are out of process, on their own protocols.** The *embedder* is
 reached by `stemma-server` over the OpenAI-compatible `/v1/embeddings`
@@ -347,8 +348,9 @@ with one implementation. Structured output (JSON-schema, enum over candidate
 ids) is a capability flag with validate-and-retry fallback.
 
 The reference agent already demonstrates the protocol choice paying off:
-`agents/stemma_agent/agent.py` takes `STEMMA_LM_ENDPOINT` and
-`STEMMA_LM_MODEL` and works against any of those servers unchanged.
+`agents/stemma_agent/agent.py` takes an endpoint and model (from
+`config.json`'s `console.lm` or as explicit arguments) and works against any
+of those servers unchanged.
 
 ## External surfaces
 
@@ -416,7 +418,7 @@ framework.
 
 `ResolveOptions.source` and `ResolveOptions.session` are written to
 `query_log` on every query. The console passes `"console"`, the MCP tool
-passes `"mcp"` plus `STEMMADB_SESSION`. History is therefore attributable per
+passes `"mcp"` plus its `--session` tag. History is therefore attributable per
 caller and per conversation, queryable with ordinary SQL, and stored beside
 the corpus it is about. See
 [02-data-model.md](02-data-model.md#query_log).

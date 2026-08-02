@@ -14,10 +14,12 @@ The pattern, in three moves:
 Anything that speaks MCP — other agent frameworks, IDEs, chat apps — gets the
 same tools the same way; this file is just the smallest complete example.
 
+Configuration is explicit: build_agent() takes everything as arguments, and
+the `adk run` entrypoint reads the repository's config.json (databases +
+console.lm). Never environment variables.
+
 Standalone (ADK web/cli):
-    export STEMMADB_DBS=legal=/path/to/legal.db
-    export STEMMA_LM_ENDPOINT=http://host:8080/v1 STEMMA_LM_MODEL=qwen3.5-35b
-    adk run agents/stemma_agent
+    adk run agents/stemma_agent      # uses the repo's config.json
 """
 
 from __future__ import annotations
@@ -32,7 +34,9 @@ from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from mcp import StdioServerParameters
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_MCP_SERVER = os.path.join(_HERE, "..", "..", "integrations", "mcp", "stemmadb_mcp.py")
+_REPO = os.path.dirname(os.path.dirname(_HERE))
+_MCP_SERVER = os.path.join(_REPO, "integrations", "mcp", "stemmadb_mcp.py")
+sys.path.insert(0, os.path.join(_REPO, "clients", "python"))
 
 INSTRUCTION = """You are the stemma data assistant.
 
@@ -58,21 +62,17 @@ def build_agent(
     api_key: str = "",
 ) -> LlmAgent:
     """An LlmAgent wired to the stemmadb MCP server for the given databases."""
-    lm_endpoint = lm_endpoint or os.environ.get("STEMMA_LM_ENDPOINT", "")
-    lm_model = lm_model or os.environ.get("STEMMA_LM_MODEL", "")
     if not (lm_endpoint and lm_model):
         raise ValueError("an OpenAI-compatible endpoint and model are required")
 
+    mcp_args = [os.path.abspath(_MCP_SERVER), "--grpc", grpc]
+    for name, path in sorted(dbs.items()):
+        mcp_args += ["--db", f"{name}={path}"]
     toolset = McpToolset(
         connection_params=StdioConnectionParams(
             server_params=StdioServerParameters(
                 command=sys.executable,
-                args=[os.path.abspath(_MCP_SERVER)],
-                env={
-                    **os.environ,
-                    "STEMMADB_GRPC": grpc,
-                    "STEMMADB_DBS": ",".join(f"{k}={v}" for k, v in dbs.items()),
-                },
+                args=mcp_args,
             ),
             timeout=30,
         )
@@ -81,7 +81,7 @@ def build_agent(
     model = LiteLlm(
         model=f"openai/{lm_model}",
         api_base=lm_endpoint,
-        api_key=api_key or os.environ.get("LM_API_KEY", "x"),
+        api_key=api_key or "x",  # LiteLLM insists on a token; local servers ignore it
         temperature=0.2,
         # reasoning off for tool rounds: the evidence trail is the reasoning
         # (silently ignored by endpoints without thinking modes)
@@ -98,16 +98,25 @@ def build_agent(
     )
 
 
-def _dbs_from_env() -> dict[str, str]:
-    out: dict[str, str] = {}
-    for part in filter(None, os.environ.get("STEMMADB_DBS", "").split(",")):
-        name, _, path = part.partition("=")
-        if name and path:
-            out[name] = path
-    return out
+def _agent_from_config() -> LlmAgent | None:
+    """`adk run` / `adk web` entrypoint: built from the repo's config.json."""
+    from stemmadb import find_config, load_config
+
+    path = find_config(_REPO)
+    if path is None:
+        return None
+    cfg = load_config(path)
+    console = cfg.get("console") or {}
+    lm = console.get("lm") or {}
+    if not (cfg.get("databases") and lm.get("endpoint") and lm.get("model")):
+        return None
+    return build_agent(
+        cfg["databases"],
+        grpc=console.get("grpc", "127.0.0.1:50051"),
+        lm_endpoint=lm["endpoint"],
+        lm_model=lm["model"],
+        api_key=lm.get("api_key", ""),
+    )
 
 
-# `adk run` / `adk web` entrypoint (configured entirely by environment).
-root_agent = None
-if _dbs_from_env() and os.environ.get("STEMMA_LM_ENDPOINT"):
-    root_agent = build_agent(_dbs_from_env())
+root_agent = _agent_from_config()

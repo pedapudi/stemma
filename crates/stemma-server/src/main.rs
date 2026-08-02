@@ -19,9 +19,15 @@ use tonic::{Request, Response, Status};
 #[derive(Parser, Debug)]
 #[command(name = "stemma-server", about = "stemma resolution service")]
 struct Args {
-    /// Address to listen on.
-    #[arg(long, default_value = "127.0.0.1:50051")]
-    listen: SocketAddr,
+    /// Path to a stemma config.json; flags below override its fields.
+    /// Configuration comes from the file and flags only — never from
+    /// environment variables.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Address to listen on (default 127.0.0.1:50051).
+    #[arg(long)]
+    listen: Option<SocketAddr>,
 
     /// Databases to serve, as name=path/to/user.db (repeatable). The sidecar
     /// store is created next to the user DB as <path>.stemmadb.
@@ -36,6 +42,62 @@ struct Args {
     /// Model name for --embed-endpoint.
     #[arg(long)]
     embed_model: Option<String>,
+}
+
+/// The stemma config file (config.json). The server reads `databases` and
+/// `server.*`; the console and MCP server read their own sections of the
+/// same file, so one file describes one deployment.
+#[derive(serde::Deserialize, Default)]
+struct ConfigFile {
+    #[serde(default)]
+    databases: std::collections::BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    server: ServerSection,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ServerSection {
+    listen: Option<SocketAddr>,
+    embedder: Option<EmbedderSection>,
+}
+
+#[derive(serde::Deserialize)]
+struct EmbedderSection {
+    endpoint: String,
+    model: String,
+}
+
+/// Flags override the file; relative database paths in the file resolve
+/// against the file's directory, so the config means the same thing from
+/// any working directory.
+fn merge_config(args: &mut Args) -> anyhow::Result<()> {
+    let Some(path) = &args.config else {
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    let cfg: ConfigFile = serde_json::from_str(&text)
+        .with_context(|| format!("parsing config {}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    if args.listen.is_none() {
+        args.listen = cfg.server.listen;
+    }
+    if args.dbs.is_empty() {
+        args.dbs = cfg
+            .databases
+            .into_iter()
+            .map(|(name, p)| {
+                let p = if p.is_absolute() { p } else { base.join(p) };
+                (name, p)
+            })
+            .collect();
+    }
+    if let Some(e) = cfg.server.embedder {
+        args.embed_endpoint.get_or_insert(e.endpoint);
+        args.embed_model.get_or_insert(e.model);
+    }
+    Ok(())
 }
 
 fn parse_db_spec(s: &str) -> Result<(String, PathBuf), String> {
@@ -128,7 +190,11 @@ impl ResolveService for Resolver {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+    merge_config(&mut args)?;
+    let listen = args
+        .listen
+        .unwrap_or_else(|| "127.0.0.1:50051".parse().unwrap());
 
     let mut dbs = HashMap::new();
     for (name, user_db) in &args.dbs {
@@ -174,10 +240,10 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    tracing::info!(listen = %args.listen, "stemma-server starting");
+    tracing::info!(listen = %listen, "stemma-server starting");
     tonic::transport::Server::builder()
         .add_service(ResolveServiceServer::new(Resolver { dbs, embedder }))
-        .serve(args.listen)
+        .serve(listen)
         .await?;
     Ok(())
 }

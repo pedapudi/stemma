@@ -35,7 +35,7 @@ class ChatRequest(BaseModel):
 def create_app(
     dbs: dict[str, str],
     grpc_target: str,
-    lm_cfg: tuple[str, str] | None = None,  # (endpoint, model)
+    lm_cfg: tuple[str, str, str] | None = None,  # (endpoint, model, api_key)
 ) -> FastAPI:
     app = FastAPI(title="stemma console", docs_url=None, redoc_url=None)
     browsers = {name: StoreBrowser(path) for name, path in dbs.items()}
@@ -44,7 +44,7 @@ def create_app(
     if lm_cfg:
         from agent_backend import AgentChat
 
-        agent_chat = AgentChat(dbs, grpc_target, lm_cfg[0], lm_cfg[1])
+        agent_chat = AgentChat(dbs, grpc_target, lm_cfg[0], lm_cfg[1], api_key=lm_cfg[2])
 
     def browser(name: str) -> StoreBrowser:
         b = browsers.get(name)
@@ -136,7 +136,8 @@ def create_app(
         if agent_chat is None:
             raise HTTPException(
                 503,
-                "no LM configured — start the console with --lm-endpoint/--lm-model "
+                "no LM configured — set console.lm in config.json or pass "
+                "--lm-endpoint/--lm-model "
                 "(any OpenAI-compatible endpoint: vLLM, llama.cpp, LiteLLM, …)",
             )
         browser(name)

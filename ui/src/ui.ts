@@ -1257,10 +1257,10 @@ function renderChatRail(): void {
   if (!state.cfg?.lm) {
     rail.append(el("div", { class: "rail-transcript" },
       el("div", { class: "empty" },
-        "— talk to the data by proxy needs a model: restart the console with " +
+        "— talk to the data by proxy needs a model: set console.lm in " +
+        "config.json (endpoint, model, api_key) or restart the console with " +
         "--lm-endpoint http://host:port/v1 --lm-model <name> " +
-        "(any openai-compatible server: vllm, llama.cpp, litellm; " +
-        "bearer token via LM_API_KEY)")));
+        "(any openai-compatible server: vllm, llama.cpp, litellm)")));
     return;
   }
 
