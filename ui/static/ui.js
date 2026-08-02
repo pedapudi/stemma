@@ -1441,135 +1441,165 @@ function renderTrace(out, trace) {
     host.append(el("div", {
       class: "subhead",
       style: "margin-top:18px"
-    }, "score assembly"), el("div", {
+    }, "verdicts"), el("div", {
       class: "sql-caption"
-    }, "per mention: each candidate's score at every stage of the pipeline \xB7 the winner in accent"));
-    for (const sp of mentionSpans) host.append(assembly(sp));
+    }, "per mention: what the evidence was, which mechanism decided it, and who lost"));
+    for (const sp of mentionSpans) host.append(verdict(sp));
     if (!mentionSpans.length) {
       host.append(el("div", {
         class: "empty"
-      }, "\u2014 no mentions to assemble"));
+      }, "\u2014 no mentions, no verdicts"));
     }
   }
-  function assembly(sp) {
-    const W = 660, H = 150, L = 40, R = 90, T = 14, B = 26;
-    const sx = (i) => L + i * (W - L - R) / 3;
-    const sy = (v) => T + (1 - Math.min(1, v)) * (H - T - B);
+  function stages(sp, c) {
     const spanChars = [
       ...sp.text
     ].length;
-    const svg = svgEl("svg", {
-      class: "asm",
-      viewBox: `0 0 ${W} ${H}`,
-      width: "100%",
-      preserveAspectRatio: "xMinYMin meet"
+    const nonKg = c.channels.filter((ch) => ch.channel !== "kg");
+    const rrf = nonKg.reduce((s, ch) => s + 1 / (4 + ch.rank), 0);
+    const base = Math.min(rrf * 4 / 3, 1);
+    const hasExact = c.channels.some((ch) => ch.channel === "exact");
+    const valChars = Math.max(1, [
+      ...c.value
+    ].length + (c.value_truncated ? 40 : 0));
+    const branch = hasExact ? Math.min(0.9 + 0.1 * base, 1) : c.is_doc ? Math.min(base * 0.85, 0.85) : base * (0.4 + 0.6 * Math.sqrt(spanChars / Math.max(valChars, spanChars)));
+    const cos = c.channels.filter((ch) => ch.channel === "dense").reduce((m, ch) => Math.max(m, ch.raw), -1);
+    const calibrated = cos >= 0 ? Math.min(Math.max((cos - 0.3) / 0.3, 0), 1) * 0.78 : 0;
+    return {
+      base,
+      branch,
+      cos,
+      calibrated,
+      hasExact
+    };
+  }
+  function verdict(sp) {
+    const w = sp.candidates.find((c) => c.selected) ?? sp.candidates[0];
+    const box = el("div", {
+      class: "why"
     });
-    for (const v of [
-      0,
-      0.5,
-      1
-    ]) {
-      svg.append(svgEl("line", {
-        class: "asm-grid",
-        x1: L,
-        x2: W - R,
-        y1: sy(v),
-        y2: sy(v)
-      }));
-      const t = svgEl("text", {
-        class: "asm-tick",
-        x: L - 5,
-        y: sy(v) + 3,
-        "text-anchor": "end"
-      });
-      t.textContent = v.toFixed(1);
-      svg.append(t);
+    if (!w) {
+      box.append(el("div", {
+        class: "why-head"
+      }, el("span", {
+        class: "sf-mention"
+      }, sp.text), el("span", {
+        class: "sql-caption"
+      }, " \u2014 unresolved")));
+      return box;
     }
-    svg.append(svgEl("line", {
-      class: "asm-thresh",
-      x1: L,
-      x2: W - R,
-      y1: sy(0.35),
-      y2: sy(0.35)
+    const s = stages(sp, w);
+    const meter = el("span", {
+      class: "why-meter"
+    }, el("i", {
+      style: `width:${Math.round(Math.min(1, w.score) * 100)}%`
     }));
-    const th = svgEl("text", {
-      class: "asm-tick asm-thresh-t",
-      x: W - R + 4,
-      y: sy(0.35) + 3
-    });
-    th.textContent = "threshold";
-    svg.append(th);
-    const stations = [
-      "fused",
-      "branch",
-      "dense",
-      "final"
-    ];
-    stations.forEach((s, i) => {
-      const t = svgEl("text", {
-        class: "asm-station",
-        x: sx(i),
-        y: H - 8,
-        "text-anchor": "middle"
-      });
-      t.textContent = s;
-      svg.append(t);
-    });
-    const cands = sp.candidates.slice(0, 4);
-    const topIdx = cands.findIndex((c) => c.selected);
-    cands.forEach((c, ci) => {
-      const nonKg = c.channels.filter((ch) => ch.channel !== "kg");
-      const rrf = nonKg.reduce((s, ch) => s + 1 / (4 + ch.rank), 0);
-      const base = Math.min(rrf * 4 / 3, 1);
-      const hasExact = c.channels.some((ch) => ch.channel === "exact");
-      const valChars = Math.max(1, [
-        ...c.value
-      ].length + (c.value_truncated ? 40 : 0));
-      const branch = hasExact ? Math.min(0.9 + 0.1 * base, 1) : c.is_doc ? Math.min(base * 0.85, 0.85) : base * (0.4 + 0.6 * Math.sqrt(spanChars / Math.max(valChars, spanChars)));
-      const bestCos = c.channels.filter((ch) => ch.channel === "dense").reduce((m, ch) => Math.max(m, ch.raw), -1);
-      const calibrated = bestCos >= 0 ? Math.min(Math.max((bestCos - 0.3) / 0.3, 0), 1) * 0.78 : 0;
-      const dense = Math.max(branch, calibrated);
-      const pts = [
-        base,
-        branch,
-        dense,
-        c.score
-      ];
-      const isTop = ci === topIdx;
-      const line = svgEl("polyline", {
-        class: "asm-line" + (isTop ? " top" : ""),
-        points: pts.map((v, i) => `${sx(i)},${sy(v)}`).join(" ")
-      });
-      hov(line, hovCandidate(c));
-      line.addEventListener("click", () => showCard(sp, c));
-      svg.append(line);
-      pts.forEach((v, i) => {
-        svg.append(svgEl("circle", {
-          class: "asm-dot" + (isTop ? " top" : ""),
-          cx: sx(i),
-          cy: sy(v),
-          r: isTop ? 3.4 : 2.4
-        }));
-      });
-      if (isTop) {
-        const label = svgEl("text", {
-          class: "asm-final",
-          x: sx(3) + 8,
-          y: sy(c.score) + 3
-        });
-        label.textContent = c.score.toFixed(2) + (c.coherence ? " \u2B21" : "") + (c.adjudicated ? " \u2696" : "");
-        svg.append(label);
-      }
-    });
-    return el("div", {
-      class: "asm-box"
-    }, el("div", {
-      class: "asm-head"
+    const head = el("div", {
+      class: "why-head"
     }, el("span", {
       class: "sf-mention"
     }, sp.text), el("span", {
-      class: "sql-caption"
-    }, cands[topIdx] ? ` \u2192 ${cands[topIdx].table}.${cands[topIdx].column} #${cands[topIdx].rowid}` : " \u2192 unresolved")), svg);
+      class: "why-arrow"
+    }, "\u2192"), el("button", {
+      class: "why-ref mono",
+      onclick: () => showCard(sp, w)
+    }, `${w.table}.${w.column} #${w.rowid}`), meter, el("span", {
+      class: "why-score mono"
+    }, w.score.toFixed(2)));
+    box.append(head);
+    if (w.is_doc && w.snippet) {
+      box.append(el("div", {
+        class: "why-snip"
+      }, snippetNode(w.snippet)));
+    } else if (!w.is_doc) {
+      box.append(el("div", {
+        class: "why-snip mono"
+      }, `\u201C${w.value}\u201D`));
+    }
+    box.append(el("div", {
+      class: "why-line"
+    }, el("span", {
+      class: "why-k"
+    }, "evidence"), el("span", {
+      class: "hc-chips"
+    }, w.channels.map((ch) => {
+      const chip = el("span", {
+        class: `hc-ch hc-ch-${ch.channel}`
+      }, ch.channel === "dense" ? `dense \xB7 cos ${ch.raw.toFixed(2)}` : ch.channel === "kg" ? `kg +${ch.raw.toFixed(2)}` : `${ch.channel} \xB7 rank ${ch.rank + 1}`);
+      return chip;
+    }))));
+    const mech = [];
+    if (s.hasExact) {
+      mech.push(el("div", {
+        class: "why-line"
+      }, el("span", {
+        class: "why-k"
+      }, "decided by"), el("span", null, "exact match \u2014 the mention equals the stored value, floor 0.9")));
+    } else if (s.calibrated > s.branch + 5e-3) {
+      mech.push(el("div", {
+        class: "why-line"
+      }, el("span", {
+        class: "why-k"
+      }, "decided by"), el("span", null, `semantic floor \u2014 cos ${s.cos.toFixed(2)} calibrates to ${s.calibrated.toFixed(2)}, above the lexical case (${s.branch.toFixed(2)})`)));
+    } else {
+      mech.push(el("div", {
+        class: "why-line"
+      }, el("span", {
+        class: "why-k"
+      }, "decided by"), el("span", null, w.is_doc ? "fused lexical evidence under document scoring (length is not held against it)" : "fused lexical evidence with length affinity")));
+    }
+    if (w.coherence) {
+      mech.push(el("div", {
+        class: "why-line why-coh"
+      }, el("span", {
+        class: "why-k"
+      }, "coherence"), el("span", {
+        class: "mono"
+      }, `\u2B21 ${w.coherence} `), el("span", {
+        class: "why-soft"
+      }, "\u2014 verified in the data, +0.15")));
+    }
+    if (w.adjudicated) {
+      mech.push(el("div", {
+        class: "why-line"
+      }, el("span", {
+        class: "why-k"
+      }, "adjudicated"), el("span", null, "\u2696 the lm chose this among near-ties (gap < 0.08)")));
+    }
+    box.append(...mech);
+    const r = sp.candidates.filter((c) => c !== w)[0];
+    if (r) {
+      const rs = stages(sp, r);
+      let why;
+      if (w.coherence && !r.coherence) why = "no verified join path";
+      else if (s.hasExact && !rs.hasExact) why = "no exact match";
+      else if (s.calibrated > s.branch && rs.cos < s.cos) {
+        why = rs.cos >= 0 ? `weaker semantic match (cos ${rs.cos.toFixed(2)})` : "no dense evidence";
+      } else if (r.channels.length < w.channels.length) why = "fewer channels agreed";
+      else why = "lower fused evidence";
+      const rlabel = r.is_doc ? `${r.table} #${r.rowid}` : `\u201C${r.value.slice(0, 32)}\u201D`;
+      const rrow = el("div", {
+        class: "why-line why-rival"
+      }, el("span", {
+        class: "why-k"
+      }, "beat"), el("button", {
+        class: "why-ref mono",
+        onclick: () => showCard(sp, r)
+      }, `${rlabel} \xB7 ${r.score.toFixed(2)}`), el("span", {
+        class: "why-soft"
+      }, ` \u2014 ${why}`));
+      hov(rrow, hovCandidate(r));
+      box.append(rrow);
+    } else {
+      box.append(el("div", {
+        class: "why-line why-rival"
+      }, el("span", {
+        class: "why-k"
+      }, "beat"), el("span", {
+        class: "why-soft"
+      }, "no rival \u2014 the only candidate")));
+    }
+    return box;
   }
   function buildSpace() {
     const host = panels.space.node;
@@ -1594,105 +1624,100 @@ function renderTrace(out, trace) {
     ].sort((a, b) => b.cos - a.cos);
     host.append(el("div", {
       class: "subhead"
-    }, "semantic neighborhood"), el("div", {
+    }, "semantic spectrum"), el("div", {
       class: "sql-caption"
-    }, "dense-channel evidence at true cosine distance from the query \xB7 nearer is more similar"));
+    }, "every dense-retrieved record on the cosine axis \xB7 right is nearer the query \xB7 one lane per table"));
     if (!hits.length) {
       host.append(el("div", {
         class: "empty"
       }, "\u2014 no dense evidence in this trajectory: the embedder was absent, or every span had exact lexical anchors"));
       return;
     }
-    const S = 640, cx = S / 2, cy = 240, R = 200;
-    const rOf = (cos) => Math.max(16, Math.min(R, (0.68 - cos) / 0.38 * R));
-    const svg = svgEl("svg", {
-      class: "spc",
-      viewBox: `0 0 ${S} ${cy + R * 0.55}`,
-      width: "100%",
-      preserveAspectRatio: "xMidYMin meet"
+    const LO = 0.26, HI = 0.74;
+    const xOf = (cos) => Math.max(1.5, Math.min(98.5, (cos - LO) / (HI - LO) * 100));
+    const spec = el("div", {
+      class: "spec"
     });
-    for (const cos of [
-      0.6,
-      0.5,
-      0.4,
-      0.3
-    ]) {
-      svg.append(svgEl("circle", {
-        class: "spc-ring",
-        cx,
-        cy,
-        r: rOf(cos)
+    const marks = [
+      [
+        0.3,
+        "0.30 \xB7 calibration floor"
+      ],
+      [
+        0.4,
+        "0.40"
+      ],
+      [
+        0.5,
+        "0.50"
+      ],
+      [
+        0.6,
+        "0.60 \xB7 strong"
+      ]
+    ];
+    const grid = el("div", {
+      class: "spec-grid"
+    });
+    for (const [cos, label] of marks) {
+      grid.append(el("i", {
+        class: "spec-rule",
+        style: `left:${xOf(cos)}%`
       }));
-      const t = svgEl("text", {
-        class: "spc-ringlab",
-        x: cx + rOf(cos) + 4,
-        y: cy + 3
-      });
-      t.textContent = `cos ${cos.toFixed(1)}`;
-      svg.append(t);
+      grid.append(el("span", {
+        class: "spec-rulelab",
+        style: `left:${xOf(cos)}%`
+      }, label));
     }
+    spec.append(grid);
     const tables = [
       ...new Set(hits.map((h) => h.c.table))
-    ];
-    const perTable = new Map(tables.map((t) => [
-      t,
-      hits.filter((h) => h.c.table === t)
-    ]));
-    let a0 = -210;
-    const span = 240;
-    const total = hits.length;
+    ].sort((a, b) => hits.filter((h) => h.c.table === b).length - hits.filter((h) => h.c.table === a).length);
     for (const t of tables) {
-      const mine = perTable.get(t);
-      const width = mine.length / total * span;
-      mine.forEach((h, i) => {
-        const ang = (a0 + (i + 0.5) / mine.length * width) * Math.PI / 180;
-        const r = rOf(h.cos);
-        const x = cx + r * Math.cos(ang), y = cy + r * Math.sin(ang);
-        if (h.c.selected) {
-          svg.append(svgEl("line", {
-            class: "spc-spoke",
-            x1: cx,
-            y1: cy,
-            x2: x,
-            y2: y
-          }));
-        }
-        const dot = svgEl("circle", {
-          class: "spc-dot" + (h.c.selected ? " sel" : ""),
-          cx: x,
-          cy: y,
-          r: h.c.selected ? 5 : 3.5
+      const mine = hits.filter((h) => h.c.table === t);
+      const lane = el("div", {
+        class: "spec-lane"
+      });
+      for (const [cos] of marks) {
+        lane.append(el("i", {
+          class: "spec-rule",
+          style: `left:${xOf(cos)}%`
+        }));
+      }
+      const placed = [];
+      for (const h of mine) {
+        const x = xOf(h.cos);
+        const row = placed.filter((p) => Math.abs(p - x) < 2.2).length;
+        placed.push(x);
+        const dot = el("button", {
+          class: "spec-dot" + (h.c.selected ? " sel" : ""),
+          style: `left:${x}%; top:${8 + Math.min(row, 3) * 9}px`
         });
         hov(dot, `<div class="hc-head"><span class="hc-ref">for \u201C${esc(h.sp.text)}\u201D</span><span class="hc-score">cos ${h.cos.toFixed(3)}</span></div>` + hovCandidate(h.c));
-        dot.addEventListener("click", () => showCard(h.sp, h.c));
-        svg.append(dot);
-      });
-      const mid = (a0 + width / 2) * Math.PI / 180;
-      const lt = svgEl("text", {
-        class: "spc-table",
-        x: cx + (R + 16) * Math.cos(mid),
-        y: cy + (R + 16) * Math.sin(mid),
-        "text-anchor": "middle"
-      });
-      lt.textContent = t;
-      svg.append(lt);
-      a0 += width;
+        dot.addEventListener("click", (e) => {
+          e.stopPropagation();
+          showCard(h.sp, h.c);
+        });
+        lane.append(dot);
+      }
+      const bestMine = mine[0];
+      spec.append(el("div", {
+        class: "spec-row"
+      }, el("span", {
+        class: "spec-lab"
+      }, el("b", null, t), el("i", null, `${mine.length} \xB7 best ${bestMine.cos.toFixed(2)}`)), lane));
     }
-    svg.append(svgEl("circle", {
-      class: "spc-query",
-      cx,
-      cy,
-      r: 5
-    }));
-    const q = svgEl("text", {
-      class: "spc-qlab",
-      x: cx,
-      y: cy + 18,
-      "text-anchor": "middle"
-    });
-    q.textContent = "query";
-    svg.append(q);
-    host.append(svg);
+    spec.append(el("div", {
+      class: "spec-axis"
+    }, el("span", {
+      class: "spec-end"
+    }, "\u2190 noise"), el("span", {
+      class: "spec-end spec-near"
+    }, "nearer the query \u2192")));
+    host.append(spec, el("div", {
+      class: "sql-caption",
+      style: "margin-top:6px"
+    }, "accent dots were selected as mentions \xB7 grey dots are the retrieved-but-outranked field \xB7 click any dot for its card"));
   }
   for (const [k, p] of Object.entries(panels)) p.node.hidden = k !== mode;
   if (mode !== "field" && !panels[mode].built) {

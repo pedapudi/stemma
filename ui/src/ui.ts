@@ -1228,97 +1228,134 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       el("i", { class: "lat-key lat-skipped" }), " skipped"));
     host.append(lat);
 
-    /* -- score assembly: how each winner's number was actually made — the
-     * fused base, the branch envelope, the dense floor, coherence and
-     * adjudication — as a slope chart, rivals alongside. -- */
-    host.append(el("div", { class: "subhead", style: "margin-top:18px" }, "score assembly"),
+    /* -- verdicts: why each winner won, narrated from the trace — the
+     * channels that fired, the mechanism that decided it, and who was
+     * beaten and why. Typography over abstraction. -- */
+    host.append(el("div", { class: "subhead", style: "margin-top:18px" }, "verdicts"),
       el("div", { class: "sql-caption" },
-        "per mention: each candidate's score at every stage of the pipeline · the winner in accent"));
-    for (const sp of mentionSpans) host.append(assembly(sp));
+        "per mention: what the evidence was, which mechanism decided it, and who lost"));
+    for (const sp of mentionSpans) host.append(verdict(sp));
     if (!mentionSpans.length) {
-      host.append(el("div", { class: "empty" }, "— no mentions to assemble"));
+      host.append(el("div", { class: "empty" }, "— no mentions, no verdicts"));
     }
   }
 
-  function assembly(sp: TraceSpan): HTMLElement {
-    const W = 660, H = 150, L = 40, R = 90, T = 14, B = 26;
-    const sx = (i: number) => L + (i * (W - L - R)) / 3;
-    const sy = (v: number) => T + (1 - Math.min(1, v)) * (H - T - B);
+  /* the scoring stages, recomputed client-side from the trace (mirrors
+   * fuse(): rrf base, branch envelope, calibrated cosine floor) */
+  function stages(sp: TraceSpan, c: TraceCandidate) {
     const spanChars = [...sp.text].length;
-    const svg = svgEl("svg", {
-      class: "asm", viewBox: `0 0 ${W} ${H}`, width: "100%",
-      preserveAspectRatio: "xMinYMin meet",
-    });
-    // y grid + threshold
-    for (const v of [0, 0.5, 1]) {
-      svg.append(svgEl("line", { class: "asm-grid", x1: L, x2: W - R, y1: sy(v), y2: sy(v) }));
-      const t = svgEl("text", { class: "asm-tick", x: L - 5, y: sy(v) + 3, "text-anchor": "end" });
-      t.textContent = v.toFixed(1);
-      svg.append(t);
-    }
-    svg.append(svgEl("line", {
-      class: "asm-thresh", x1: L, x2: W - R, y1: sy(0.35), y2: sy(0.35),
-    }));
-    const th = svgEl("text", { class: "asm-tick asm-thresh-t", x: W - R + 4, y: sy(0.35) + 3 });
-    th.textContent = "threshold";
-    svg.append(th);
-    const stations = ["fused", "branch", "dense", "final"];
-    stations.forEach((s, i) => {
-      const t = svgEl("text", { class: "asm-station", x: sx(i), y: H - 8, "text-anchor": "middle" });
-      t.textContent = s;
-      svg.append(t);
-    });
+    const nonKg = c.channels.filter((ch) => ch.channel !== "kg");
+    const rrf = nonKg.reduce((s, ch) => s + 1 / (4 + ch.rank), 0);
+    const base = Math.min((rrf * 4) / 3, 1);
+    const hasExact = c.channels.some((ch) => ch.channel === "exact");
+    const valChars = Math.max(1, [...c.value].length + (c.value_truncated ? 40 : 0));
+    const branch = hasExact
+      ? Math.min(0.9 + 0.1 * base, 1)
+      : c.is_doc
+        ? Math.min(base * 0.85, 0.85)
+        : base * (0.4 + 0.6 * Math.sqrt(spanChars / Math.max(valChars, spanChars)));
+    const cos = c.channels.filter((ch) => ch.channel === "dense")
+      .reduce((m, ch) => Math.max(m, ch.raw), -1);
+    const calibrated = cos >= 0
+      ? Math.min(Math.max((cos - 0.3) / 0.3, 0), 1) * 0.78 : 0;
+    return { base, branch, cos, calibrated, hasExact };
+  }
 
-    const cands = sp.candidates.slice(0, 4);
-    const topIdx = cands.findIndex((c) => c.selected);
-    cands.forEach((c, ci) => {
-      const nonKg = c.channels.filter((ch) => ch.channel !== "kg");
-      const rrf = nonKg.reduce((s, ch) => s + 1 / (4 + ch.rank), 0);
-      const base = Math.min((rrf * 4) / 3, 1);
-      const hasExact = c.channels.some((ch) => ch.channel === "exact");
-      const valChars = Math.max(1, [...c.value].length + (c.value_truncated ? 40 : 0));
-      const branch = hasExact
-        ? Math.min(0.9 + 0.1 * base, 1)
-        : c.is_doc
-          ? Math.min(base * 0.85, 0.85)
-          : base * (0.4 + 0.6 * Math.sqrt(spanChars / Math.max(valChars, spanChars)));
-      const bestCos = c.channels.filter((ch) => ch.channel === "dense")
-        .reduce((m, ch) => Math.max(m, ch.raw), -1);
-      const calibrated = bestCos >= 0
-        ? Math.min(Math.max((bestCos - 0.3) / 0.3, 0), 1) * 0.78 : 0;
-      const dense = Math.max(branch, calibrated);
-      const pts = [base, branch, dense, c.score];
-      const isTop = ci === topIdx;
-      const line = svgEl("polyline", {
-        class: "asm-line" + (isTop ? " top" : ""),
-        points: pts.map((v, i) => `${sx(i)},${sy(v)}`).join(" "),
-      });
-      hov(line as unknown as HTMLElement, hovCandidate(c));
-      (line as unknown as HTMLElement).addEventListener("click", () => showCard(sp, c));
-      svg.append(line);
-      pts.forEach((v, i) => {
-        svg.append(svgEl("circle", {
-          class: "asm-dot" + (isTop ? " top" : ""),
-          cx: sx(i), cy: sy(v), r: isTop ? 3.4 : 2.4,
-        }));
-      });
-      if (isTop) {
-        const label = svgEl("text", {
-          class: "asm-final", x: sx(3) + 8, y: sy(c.score) + 3,
-        });
-        label.textContent = c.score.toFixed(2)
-          + (c.coherence ? " ⬡" : "") + (c.adjudicated ? " ⚖" : "");
-        svg.append(label);
-      }
-    });
-    return el("div", { class: "asm-box" },
-      el("div", { class: "asm-head" },
+  function verdict(sp: TraceSpan): HTMLElement {
+    const w = sp.candidates.find((c) => c.selected) ?? sp.candidates[0];
+    const box = el("div", { class: "why" });
+    if (!w) {
+      box.append(el("div", { class: "why-head" },
         el("span", { class: "sf-mention" }, sp.text),
-        el("span", { class: "sql-caption" },
-          cands[topIdx]
-            ? ` → ${cands[topIdx].table}.${cands[topIdx].column} #${cands[topIdx].rowid}`
-            : " → unresolved")),
-      svg);
+        el("span", { class: "sql-caption" }, " — unresolved")));
+      return box;
+    }
+    const s = stages(sp, w);
+    const meter = el("span", { class: "why-meter" },
+      el("i", { style: `width:${Math.round(Math.min(1, w.score) * 100)}%` }));
+    const head = el("div", { class: "why-head" },
+      el("span", { class: "sf-mention" }, sp.text),
+      el("span", { class: "why-arrow" }, "→"),
+      el("button", {
+        class: "why-ref mono", onclick: () => showCard(sp, w),
+      }, `${w.table}.${w.column} #${w.rowid}`),
+      meter,
+      el("span", { class: "why-score mono" }, w.score.toFixed(2)));
+    box.append(head);
+    if (w.is_doc && w.snippet) {
+      box.append(el("div", { class: "why-snip" }, snippetNode(w.snippet)));
+    } else if (!w.is_doc) {
+      box.append(el("div", { class: "why-snip mono" }, `“${w.value}”`));
+    }
+
+    // evidence: the channels that fired, in their own hues
+    box.append(el("div", { class: "why-line" },
+      el("span", { class: "why-k" }, "evidence"),
+      el("span", { class: "hc-chips" },
+        w.channels.map((ch) => {
+          const chip = el("span", { class: `hc-ch hc-ch-${ch.channel}` },
+            ch.channel === "dense" ? `dense · cos ${ch.raw.toFixed(2)}`
+              : ch.channel === "kg" ? `kg +${ch.raw.toFixed(2)}`
+                : `${ch.channel} · rank ${ch.rank + 1}`);
+          return chip;
+        }))));
+
+    // the mechanism that decided it
+    const mech: HTMLElement[] = [];
+    if (s.hasExact) {
+      mech.push(el("div", { class: "why-line" },
+        el("span", { class: "why-k" }, "decided by"),
+        el("span", null, "exact match — the mention equals the stored value, floor 0.9")));
+    } else if (s.calibrated > s.branch + 0.005) {
+      mech.push(el("div", { class: "why-line" },
+        el("span", { class: "why-k" }, "decided by"),
+        el("span", null,
+          `semantic floor — cos ${s.cos.toFixed(2)} calibrates to ${s.calibrated.toFixed(2)}, above the lexical case (${s.branch.toFixed(2)})`)));
+    } else {
+      mech.push(el("div", { class: "why-line" },
+        el("span", { class: "why-k" }, "decided by"),
+        el("span", null, w.is_doc
+          ? "fused lexical evidence under document scoring (length is not held against it)"
+          : "fused lexical evidence with length affinity")));
+    }
+    if (w.coherence) {
+      mech.push(el("div", { class: "why-line why-coh" },
+        el("span", { class: "why-k" }, "coherence"),
+        el("span", { class: "mono" }, `⬡ ${w.coherence} `),
+        el("span", { class: "why-soft" }, "— verified in the data, +0.15")));
+    }
+    if (w.adjudicated) {
+      mech.push(el("div", { class: "why-line" },
+        el("span", { class: "why-k" }, "adjudicated"),
+        el("span", null, "⚖ the lm chose this among near-ties (gap < 0.08)")));
+    }
+    box.append(...mech);
+
+    // who lost, and why
+    const r = sp.candidates.filter((c) => c !== w)[0];
+    if (r) {
+      const rs = stages(sp, r);
+      let why: string;
+      if (w.coherence && !r.coherence) why = "no verified join path";
+      else if (s.hasExact && !rs.hasExact) why = "no exact match";
+      else if (s.calibrated > s.branch && rs.cos < s.cos) {
+        why = rs.cos >= 0 ? `weaker semantic match (cos ${rs.cos.toFixed(2)})` : "no dense evidence";
+      } else if (r.channels.length < w.channels.length) why = "fewer channels agreed";
+      else why = "lower fused evidence";
+      const rlabel = r.is_doc ? `${r.table} #${r.rowid}` : `“${r.value.slice(0, 32)}”`;
+      const rrow = el("div", { class: "why-line why-rival" },
+        el("span", { class: "why-k" }, "beat"),
+        el("button", { class: "why-ref mono", onclick: () => showCard(sp, r) },
+          `${rlabel} · ${r.score.toFixed(2)}`),
+        el("span", { class: "why-soft" }, ` — ${why}`));
+      hov(rrow, hovCandidate(r));
+      box.append(rrow);
+    } else {
+      box.append(el("div", { class: "why-line why-rival" },
+        el("span", { class: "why-k" }, "beat"),
+        el("span", { class: "why-soft" }, "no rival — the only candidate")));
+    }
+    return box;
   }
 
   /* -- space · the dense channel's neighborhood: the query at the center,
@@ -1341,67 +1378,74 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       }
     }
     const hits = [...best.values()].sort((a, b) => b.cos - a.cos);
-    host.append(el("div", { class: "subhead" }, "semantic neighborhood"),
+    host.append(el("div", { class: "subhead" }, "semantic spectrum"),
       el("div", { class: "sql-caption" },
-        "dense-channel evidence at true cosine distance from the query · nearer is more similar"));
+        "every dense-retrieved record on the cosine axis · right is nearer the query · one lane per table"));
     if (!hits.length) {
       host.append(el("div", { class: "empty" },
         "— no dense evidence in this trajectory: the embedder was absent, or every span had exact lexical anchors"));
       return;
     }
-    const S = 640, cx = S / 2, cy = 240, R = 200;
-    const rOf = (cos: number) => Math.max(16, Math.min(R, ((0.68 - cos) / 0.38) * R));
-    const svg = svgEl("svg", {
-      class: "spc", viewBox: `0 0 ${S} ${cy + R * 0.55}`, width: "100%",
-      preserveAspectRatio: "xMidYMin meet",
-    });
-    for (const cos of [0.6, 0.5, 0.4, 0.3]) {
-      svg.append(svgEl("circle", { class: "spc-ring", cx, cy, r: rOf(cos) }));
-      const t = svgEl("text", { class: "spc-ringlab", x: cx + rOf(cos) + 4, y: cy + 3 });
-      t.textContent = `cos ${cos.toFixed(1)}`;
-      svg.append(t);
+
+    // cosine → x%, over the observed working range of the encoder
+    const LO = 0.26, HI = 0.74;
+    const xOf = (cos: number) =>
+      Math.max(1.5, Math.min(98.5, ((cos - LO) / (HI - LO)) * 100));
+
+    const spec = el("div", { class: "spec" });
+    // the reference grid: calibration lines every lane shares
+    const marks: [number, string][] = [
+      [0.30, "0.30 · calibration floor"], [0.40, "0.40"],
+      [0.50, "0.50"], [0.60, "0.60 · strong"],
+    ];
+    const grid = el("div", { class: "spec-grid" });
+    for (const [cos, label] of marks) {
+      grid.append(el("i", { class: "spec-rule", style: `left:${xOf(cos)}%` }));
+      grid.append(el("span", { class: "spec-rulelab", style: `left:${xOf(cos)}%` }, label));
     }
-    // tables get angular sectors sized by hit count, on the upper arc
-    const tables = [...new Set(hits.map((h) => h.c.table))];
-    const perTable = new Map(tables.map((t) => [t, hits.filter((h) => h.c.table === t)]));
-    let a0 = -210;
-    const span = 240;
-    const total = hits.length;
+    spec.append(grid);
+
+    const tables = [...new Set(hits.map((h) => h.c.table))]
+      .sort((a, b) => hits.filter((h) => h.c.table === b).length -
+        hits.filter((h) => h.c.table === a).length);
     for (const t of tables) {
-      const mine = perTable.get(t) as Hit[];
-      const width = (mine.length / total) * span;
-      mine.forEach((h, i) => {
-        const ang = ((a0 + ((i + 0.5) / mine.length) * width) * Math.PI) / 180;
-        const r = rOf(h.cos);
-        const x = cx + r * Math.cos(ang), y = cy + r * Math.sin(ang);
-        if (h.c.selected) {
-          svg.append(svgEl("line", { class: "spc-spoke", x1: cx, y1: cy, x2: x, y2: y }));
-        }
-        const dot = svgEl("circle", {
-          class: "spc-dot" + (h.c.selected ? " sel" : ""),
-          cx: x, cy: y, r: h.c.selected ? 5 : 3.5,
+      const mine = hits.filter((h) => h.c.table === t);
+      const lane = el("div", { class: "spec-lane" });
+      for (const [cos] of marks) {
+        lane.append(el("i", { class: "spec-rule", style: `left:${xOf(cos)}%` }));
+      }
+      // stack colliding dots downward instead of overplotting
+      const placed: number[] = [];
+      for (const h of mine) {
+        const x = xOf(h.cos);
+        const row = placed.filter((p) => Math.abs(p - x) < 2.2).length;
+        placed.push(x);
+        const dot = el("button", {
+          class: "spec-dot" + (h.c.selected ? " sel" : ""),
+          style: `left:${x}%; top:${8 + Math.min(row, 3) * 9}px`,
         });
-        hov(dot as unknown as HTMLElement,
+        hov(dot,
           `<div class="hc-head"><span class="hc-ref">for “${esc(h.sp.text)}”</span>` +
           `<span class="hc-score">cos ${h.cos.toFixed(3)}</span></div>` + hovCandidate(h.c));
-        (dot as unknown as HTMLElement).addEventListener("click", () => showCard(h.sp, h.c));
-        svg.append(dot);
-      });
-      const mid = ((a0 + width / 2) * Math.PI) / 180;
-      const lt = svgEl("text", {
-        class: "spc-table",
-        x: cx + (R + 16) * Math.cos(mid), y: cy + (R + 16) * Math.sin(mid),
-        "text-anchor": "middle",
-      });
-      lt.textContent = t;
-      svg.append(lt);
-      a0 += width;
+        dot.addEventListener("click", (e: Event) => {
+          e.stopPropagation();
+          showCard(h.sp, h.c);
+        });
+        lane.append(dot);
+      }
+      const bestMine = mine[0];
+      spec.append(el("div", { class: "spec-row" },
+        el("span", { class: "spec-lab" },
+          el("b", null, t),
+          el("i", null, `${mine.length} · best ${bestMine.cos.toFixed(2)}`)),
+        lane));
     }
-    svg.append(svgEl("circle", { class: "spc-query", cx, cy, r: 5 }));
-    const q = svgEl("text", { class: "spc-qlab", x: cx, y: cy + 18, "text-anchor": "middle" });
-    q.textContent = "query";
-    svg.append(q);
-    host.append(svg);
+    spec.append(el("div", { class: "spec-axis" },
+      el("span", { class: "spec-end" }, "← noise"),
+      el("span", { class: "spec-end spec-near" }, "nearer the query →")));
+    host.append(spec,
+      el("div", { class: "sql-caption", style: "margin-top:6px" },
+        "accent dots were selected as mentions · grey dots are the retrieved-but-outranked field · click any dot for its card"));
   }
 
   for (const [k, p] of Object.entries(panels)) p.node.hidden = k !== mode;
