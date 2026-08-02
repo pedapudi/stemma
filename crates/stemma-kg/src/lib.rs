@@ -74,9 +74,25 @@ pub struct KgStats {
     pub recompiled_tables: usize,
 }
 
-/// The backend-agnostic knowledge store. Query-side methods (neighbors,
-/// bounded path search, subgraph extraction) join as collective
-/// disambiguation lands; keep additions here, not on concrete backends.
+/// One fk/inferred_fk hop on a schema path between tables. The fk's own
+/// orientation is `src_table.src_column → dst_table.dst_column`; `forward`
+/// records whether the path traverses it in that direction, so a consumer
+/// can rebuild the join either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathHop {
+    pub src_table: String,
+    pub src_column: String,
+    pub dst_table: String,
+    pub dst_column: String,
+    /// True for `inferred_fk` edges (discovered, not declared).
+    pub inferred: bool,
+    /// True when the path walks the fk referencing → referenced.
+    pub forward: bool,
+}
+
+/// The backend-agnostic knowledge store. Remaining query-side methods
+/// (neighbors, subgraph extraction) join as the instance layer lands; keep
+/// additions here, not on concrete backends.
 pub trait KnowledgeStore {
     fn upsert_node(&self, node: &Node) -> Result<()>;
     fn upsert_edge(&self, edge: &Edge) -> Result<()>;
@@ -84,6 +100,17 @@ pub trait KnowledgeStore {
     /// edges touching them. The unit of incremental recompilation.
     fn remove_by_key_prefixes(&self, prefixes: &[String]) -> Result<()>;
     fn stats(&self) -> Result<KgStats>;
+    /// Simple paths between two tables over fk/inferred_fk edges, at most
+    /// `max_hops` edges each, shortest first, at most `limit` paths. Edges
+    /// are traversable in both directions; each hop keeps the fk's own
+    /// orientation.
+    fn table_paths(
+        &self,
+        from: &str,
+        to: &str,
+        max_hops: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<PathHop>>>;
 }
 
 /// SQLite backend: kg_nodes/kg_edges/kg_meta inside the .stemmadb store.
@@ -196,6 +223,103 @@ impl KnowledgeStore for SqliteKnowledgeStore<'_> {
             edges: edges as usize,
             recompiled_tables: 0,
         })
+    }
+
+    fn table_paths(
+        &self,
+        from: &str,
+        to: &str,
+        max_hops: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<PathHop>>> {
+        if from == to || max_hops == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT ns.label, nd.label, e.label, e.kind FROM kg_edges e
+             JOIN kg_nodes ns ON ns.id = e.src
+             JOIN kg_nodes nd ON nd.id = e.dst
+             WHERE e.kind IN ('fk', 'inferred_fk')
+               AND ns.kind = 'table' AND nd.kind = 'table'",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut hops: Vec<PathHop> = Vec::new();
+        for row in rows {
+            let (src_table, dst_table, label, kind) = row?;
+            // Edge labels encode the column pair: "office_id → id" for
+            // declared fks, "dept →? id" for inferred ones.
+            let Some((from_col, to_col)) = label.split_once('→') else {
+                continue;
+            };
+            hops.push(PathHop {
+                src_table,
+                src_column: from_col.trim().to_string(),
+                dst_table,
+                dst_column: to_col.trim_start_matches('?').trim().to_string(),
+                inferred: kind == "inferred_fk",
+                forward: true,
+            });
+        }
+
+        // Depth-first enumeration of simple paths. Table graphs are tens of
+        // nodes; `max_hops` and `limit` bound the walk, no index needed.
+        fn walk(
+            hops: &[PathHop],
+            here: &str,
+            to: &str,
+            max_hops: usize,
+            visited: &mut Vec<String>,
+            path: &mut Vec<PathHop>,
+            found: &mut Vec<Vec<PathHop>>,
+        ) {
+            if path.len() >= max_hops {
+                return;
+            }
+            for h in hops {
+                let (next, forward) = if h.src_table == here {
+                    (h.dst_table.as_str(), true)
+                } else if h.dst_table == here {
+                    (h.src_table.as_str(), false)
+                } else {
+                    continue;
+                };
+                if visited.iter().any(|v| v == next) {
+                    continue;
+                }
+                let mut hop = h.clone();
+                hop.forward = forward;
+                path.push(hop);
+                if next == to {
+                    found.push(path.clone());
+                } else {
+                    visited.push(next.to_string());
+                    walk(hops, next, to, max_hops, visited, path, found);
+                    visited.pop();
+                }
+                path.pop();
+            }
+        }
+        let mut found = Vec::new();
+        walk(
+            &hops,
+            from,
+            to,
+            max_hops,
+            &mut vec![from.to_string()],
+            &mut Vec::new(),
+            &mut found,
+        );
+        found.sort_by_key(|p| p.len());
+        found.truncate(limit);
+        Ok(found)
     }
 }
 
@@ -1013,6 +1137,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(uncentral, 0);
+    }
+
+    #[test]
+    fn bounded_paths_over_fk_edges() {
+        let db = ingested_mini("paths");
+        compile(&db, false).unwrap();
+        let store = SqliteKnowledgeStore::new(&db).unwrap();
+        let paths = store.table_paths("people", "teams", 2, 8).unwrap();
+        // Shortest first: the direct teams.lead_id → people.id fk, traversed
+        // in reverse (people is the referenced side).
+        let direct = &paths[0];
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].src_table, "teams");
+        assert_eq!(direct[0].src_column, "lead_id");
+        assert_eq!(direct[0].dst_column, "id");
+        assert!(!direct[0].forward);
+        assert!(!direct[0].inferred);
+        // Membership is the two-hop alternative: people ← team_members → teams.
+        assert!(paths
+            .iter()
+            .any(|p| p.len() == 2 && p.iter().all(|h| h.src_table == "team_members")));
+        // The hop bound and the trivial cases hold.
+        assert!(store.table_paths("people", "teams", 0, 8).unwrap().is_empty());
+        assert!(store.table_paths("people", "people", 2, 8).unwrap().is_empty());
+        assert_eq!(store.table_paths("people", "teams", 2, 1).unwrap().len(), 1);
     }
 
     #[test]

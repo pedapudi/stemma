@@ -8,6 +8,7 @@ rust_library(
     deps = [
         "//crates/stemma-embed",
         "//crates/stemma-ingest",
+        "//crates/stemma-kg",
         "//crates/stemma-proto",
         "//crates/stemmadb",
         "@crates//:serde",

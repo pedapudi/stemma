@@ -3,7 +3,9 @@
 //! Current stage of the roadmap: the lexical cascade (milestone 2) — span
 //! enumeration, exact + BM25 + trigram candidate generation over the lexical
 //! index built by stemma-ingest, reciprocal-rank fusion, and greedy
-//! non-overlapping mention selection.
+//! non-overlapping mention selection — plus the knowledge-graph assists:
+//! KG-aided mention detection, the term-coherence bonus, and collective
+//! disambiguation of candidate tuples over join paths.
 //!
 //! Every resolution produces a full [`Trace`]: not just what was selected but
 //! everything that was considered and why it lost — near-miss candidates,
@@ -18,6 +20,8 @@ use stemmadb::StemmaDb;
 pub enum Error {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] stemmadb::rusqlite::Error),
+    #[error("knowledge store error: {0}")]
+    Kg(#[from] stemma_kg::Error),
     #[error("lexical index missing — run ingest first")]
     IndexMissing,
 }
@@ -38,6 +42,26 @@ const TOP_K: usize = 5;
 /// Dense KNN is a full scan of the vector table per probe; spend it only on
 /// spans the lexical channels left uncertain, at most this many per query.
 const DENSE_MAX_SPANS: usize = 4;
+/// Collective disambiguation jointly scores at most this many provisional
+/// mentions (strongest first): tuple count is bounded by
+/// MAX_TUPLE_K^MAX_TUPLE_MENTIONS.
+const MAX_TUPLE_MENTIONS: usize = 4;
+/// Top candidates per mention entering joint tuple scoring.
+const MAX_TUPLE_K: usize = 4;
+/// A schema path connecting two candidates' tables may use at most this
+/// many fk/inferred_fk edges.
+const MAX_PATH_HOPS: usize = 2;
+/// Schema paths probed per table pair. Instance probes are LIMIT-1 joins
+/// and run only on pairs a schema path survived, at most this many each.
+const MAX_PATHS_PER_PAIR: usize = 4;
+/// Added to both candidates of an instance-verified pair in the winning
+/// tuple. Sized above the RRF gap between adjacent-rank rivals of the same
+/// span in the value branch (≈0.12) so a verified connection can overturn
+/// a purely lexical ordering; capped by COHERENCE_CAP.
+const COHERENCE_BOOST: f64 = 0.15;
+/// Coherence never lifts a candidate into the exact band (0.9+): if the
+/// user typed the stored value, they meant the stored value.
+const COHERENCE_CAP: f64 = 0.9;
 
 /// Stopwords: never a mention on their own (still allowed inside longer spans).
 const STOPWORDS: &[&str] = &[
@@ -86,6 +110,10 @@ pub struct Candidate {
     pub is_doc: bool,
     /// FTS snippet with ⟨⟩ marking hit terms — document candidates only.
     pub snippet: Option<String>,
+    /// Instance-level connection to a co-mention's candidate, verified in
+    /// the user database during collective disambiguation — a human-readable
+    /// path like "people #2 ←lead_id— teams #43".
+    pub coherence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +279,11 @@ pub fn resolve(
             span.status = "weak".into();
         }
     }
+
+    // Phase 4: collective disambiguation — candidates of the provisional
+    // mentions are scored jointly against the knowledge graph and the data,
+    // before final selection orders on the boosted scores.
+    apply_collective_coherence(db, &mut spans)?;
 
     let mentions = select_mentions(&mut spans);
 
@@ -566,6 +599,239 @@ fn apply_kg_coherence(db: &StemmaDb, span: &str, candidates: &mut [Candidate]) -
     Ok(())
 }
 
+/// Collective disambiguation (AIDA-lineage joint tuple scoring): the
+/// associative mention — "Chen's team" — is unresolvable span by span when
+/// there are two Chens, but the *pair* is: the right Chen is the one with a
+/// path to the team. Candidate tuples across the provisional mentions are
+/// scored as local score sum plus pairwise coherence, and the winning
+/// tuple's connected candidates earn COHERENCE_BOOST with the connecting
+/// path recorded as evidence. Coherence between two candidates requires a
+/// schema path between their tables (fk/inferred_fk, ≤ MAX_PATH_HOPS) AND
+/// an instance probe showing the two rows actually connect along it.
+fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
+    use stemma_kg::KnowledgeStore;
+    let has_kg: i64 = db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_kg == 0 {
+        return Ok(());
+    }
+
+    // Provisional mentions: the same greedy walk select_mentions runs later,
+    // without committing statuses. `selection_order` is strongest-first, so
+    // truncation keeps the strongest mentions.
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let mut winners: Vec<usize> = Vec::new();
+    for i in selection_order(spans) {
+        let (start, end) = (spans[i].start, spans[i].end);
+        if taken.iter().any(|&(s, e)| start < e && s < end) {
+            continue;
+        }
+        taken.push((start, end));
+        winners.push(i);
+    }
+    winners.truncate(MAX_TUPLE_MENTIONS);
+    if winners.len() < 2 {
+        return Ok(());
+    }
+    winners.sort_by_key(|&i| spans[i].start); // evidence reads in query order
+
+    let store = stemma_kg::SqliteKnowledgeStore::new(db)?;
+    let ks: Vec<usize> = winners
+        .iter()
+        .map(|&i| spans[i].candidates.len().min(MAX_TUPLE_K))
+        .collect();
+
+    // Pairwise verification, cached: schema paths once per table pair, then
+    // for each surviving candidate pair a LIMIT-1 probe per path until one
+    // verifies. Everything downstream reads this map.
+    let mut path_cache: std::collections::HashMap<
+        (String, String),
+        Vec<Vec<stemma_kg::PathHop>>,
+    > = std::collections::HashMap::new();
+    let mut verified: std::collections::HashMap<(usize, usize, usize, usize), String> =
+        std::collections::HashMap::new();
+    for p in 0..winners.len() {
+        for q in p + 1..winners.len() {
+            for a in 0..ks[p] {
+                for b in 0..ks[q] {
+                    let ca = &spans[winners[p]].candidates[a];
+                    let cb = &spans[winners[q]].candidates[b];
+                    if ca.table == cb.table {
+                        continue;
+                    }
+                    let key = (ca.table.clone(), cb.table.clone());
+                    if !path_cache.contains_key(&key) {
+                        let paths =
+                            store.table_paths(&key.0, &key.1, MAX_PATH_HOPS, MAX_PATHS_PER_PAIR)?;
+                        path_cache.insert(key.clone(), paths);
+                    }
+                    for path in &path_cache[&key] {
+                        if probe_instance_link(db, path, ca.rowid, cb.rowid)? {
+                            verified.insert(
+                                (p, q, a, b),
+                                render_kg_path(path, &ca.table, ca.rowid, cb.rowid),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if verified.is_empty() {
+        return Ok(());
+    }
+
+    // Exhaustive joint scoring: ≤ MAX_TUPLE_K^MAX_TUPLE_MENTIONS tuples,
+    // each with ≤ C(MAX_TUPLE_MENTIONS, 2) map lookups — microseconds.
+    let mut best: Option<(f64, Vec<usize>)> = None;
+    let mut idx = vec![0usize; winners.len()];
+    loop {
+        let mut score = 0.0;
+        for (m, &i) in winners.iter().enumerate() {
+            score += spans[i].candidates[idx[m]].score;
+        }
+        for p in 0..winners.len() {
+            for q in p + 1..winners.len() {
+                if verified.contains_key(&(p, q, idx[p], idx[q])) {
+                    score += COHERENCE_BOOST;
+                }
+            }
+        }
+        if best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((score, idx.clone()));
+        }
+        let mut m = 0;
+        while m < winners.len() {
+            idx[m] += 1;
+            if idx[m] < ks[m] {
+                break;
+            }
+            idx[m] = 0;
+            m += 1;
+        }
+        if m == winners.len() {
+            break;
+        }
+    }
+    let (_, tuple) = best.unwrap();
+
+    // Boost the winning tuple's verified candidates (once each) and record
+    // the path so the trajectory can show why the ordering changed.
+    let mut touched: Vec<usize> = Vec::new();
+    for p in 0..winners.len() {
+        for q in p + 1..winners.len() {
+            let Some(evidence) = verified.get(&(p, q, tuple[p], tuple[q])) else {
+                continue;
+            };
+            for (m, ci) in [(p, tuple[p]), (q, tuple[q])] {
+                let c = &mut spans[winners[m]].candidates[ci];
+                if c.coherence.is_none() {
+                    c.score = c.score.max((c.score + COHERENCE_BOOST).min(COHERENCE_CAP));
+                    c.coherence = Some(evidence.clone());
+                    touched.push(winners[m]);
+                }
+            }
+        }
+    }
+    for i in touched {
+        spans[i].candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    }
+    Ok(())
+}
+
+/// Verifies that two concrete rows connect along `path` in the user
+/// database: one LIMIT-1 join anchored by rowid at both ends, with the fk
+/// columns taken from the compiled graph's edges.
+fn probe_instance_link(
+    db: &StemmaDb,
+    path: &[stemma_kg::PathHop],
+    from_rowid: i64,
+    to_rowid: i64,
+) -> Result<bool> {
+    let Some(first) = path.first() else {
+        return Ok(false);
+    };
+    let start = if first.forward {
+        &first.src_table
+    } else {
+        &first.dst_table
+    };
+    let mut sql = format!("SELECT 1 FROM {}.\"{start}\" j0", stemmadb::SRC_SCHEMA);
+    for (i, hop) in path.iter().enumerate() {
+        let (next, cond) = if hop.forward {
+            (
+                &hop.dst_table,
+                format!(
+                    "j{i}.\"{}\" = j{}.\"{}\"",
+                    hop.src_column,
+                    i + 1,
+                    hop.dst_column
+                ),
+            )
+        } else {
+            (
+                &hop.src_table,
+                format!(
+                    "j{}.\"{}\" = j{i}.\"{}\"",
+                    i + 1,
+                    hop.src_column,
+                    hop.dst_column
+                ),
+            )
+        };
+        sql.push_str(&format!(
+            " JOIN {}.\"{next}\" j{} ON {cond}",
+            stemmadb::SRC_SCHEMA,
+            i + 1
+        ));
+    }
+    sql.push_str(&format!(
+        " WHERE j0.rowid = ?1 AND j{}.rowid = ?2 LIMIT 1",
+        path.len()
+    ));
+    let mut stmt = db.conn().prepare(&sql)?;
+    Ok(stmt.exists(stemmadb::rusqlite::params![from_rowid, to_rowid])?)
+}
+
+/// "people #2 ←lead_id— teams #43": the arrow points from referencing
+/// column to referenced table regardless of traversal direction, with "?"
+/// marking inferred (undeclared) joins. Intermediate tables carry no rowid —
+/// the probe checked existence, not a specific connecting row.
+fn render_kg_path(
+    path: &[stemma_kg::PathHop],
+    from_table: &str,
+    from_rowid: i64,
+    to_rowid: i64,
+) -> String {
+    let mut out = format!("{from_table} #{from_rowid}");
+    for (i, hop) in path.iter().enumerate() {
+        let next = if hop.forward {
+            &hop.dst_table
+        } else {
+            &hop.src_table
+        };
+        let node = if i + 1 == path.len() {
+            format!("{next} #{to_rowid}")
+        } else {
+            next.clone()
+        };
+        let q = if hop.inferred { "?" } else { "" };
+        if hop.forward {
+            out.push_str(&format!(" —{}{q}→ {node}", hop.src_column));
+        } else {
+            out.push_str(&format!(" ←{}{q}— {node}", hop.src_column));
+        }
+    }
+    out
+}
+
 /// Reciprocal-rank fusion across channels, with a length-affinity factor so
 /// short stored values that closely match the span outrank long documents
 /// that merely contain it.
@@ -648,6 +914,7 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 reject_reason: None,
                 is_doc: g.is_doc,
                 snippet: g.snippet,
+                coherence: None,
             }
         })
         .collect();
@@ -665,16 +932,14 @@ fn truncate_value(v: &str) -> (String, bool) {
     }
 }
 
-/// Greedy non-overlapping selection: strongest span wins its byte range;
-/// overlapping spans are marked "overlapped". Within a selected span, top-k
-/// candidates above threshold are selected, the rest annotated.
-fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
+/// Selection priority shared by collective disambiguation (provisional
+/// mentions) and final selection: strongest candidate first; KG-entity
+/// spans get a nudge (a compiled phrase is better evidence of mention-hood
+/// than raw match strength); longer span wins ties (more specific).
+fn selection_order(spans: &[Span]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..spans.len())
         .filter(|&i| spans[i].status == "selected")
         .collect();
-    // Strongest candidate first; KG-entity spans get a nudge (a compiled
-    // phrase is better evidence of mention-hood than raw match strength);
-    // longer span wins ties (more specific).
     order.sort_by(|&a, &b| {
         let key = |i: usize| {
             let s = spans[i].candidates.first().map(|c| c.score).unwrap_or(0.0);
@@ -683,7 +948,14 @@ fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
         key(b).total_cmp(&key(a))
             .then((spans[b].end - spans[b].start).cmp(&(spans[a].end - spans[a].start)))
     });
+    order
+}
 
+/// Greedy non-overlapping selection: strongest span wins its byte range;
+/// overlapping spans are marked "overlapped". Within a selected span, top-k
+/// candidates above threshold are selected, the rest annotated.
+fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
+    let order = selection_order(spans);
     let mut taken: Vec<(usize, usize)> = Vec::new();
     let mut mentions = Vec::new();
     for i in order {
@@ -804,6 +1076,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                         reject_reason: c.reject_reason.clone().unwrap_or_default(),
                         snippet: c.snippet.clone().unwrap_or_default(),
                         is_doc: c.is_doc,
+                        coherence: c.coherence.clone().unwrap_or_default(),
                         channels: c
                             .channels
                             .iter()
@@ -986,6 +1259,99 @@ mod tests {
         );
         // The coastal-permit doc (1) must outrank the insurance doc (2).
         assert_eq!(best.rowid, 1);
+    }
+
+    #[test]
+    fn collective_disambiguation_prefers_connected_chen() {
+        // The associative-mention case: "Chen" alone matches both Wei Chen
+        // and Dana Chen, and length affinity ranks Wei first. Only the
+        // knowledge graph plus the data connect Dana to the Billing team.
+        let db = readme_db("collective");
+        stemma_kg::compile(&db, false).unwrap();
+        let trace = resolve_lexical(&db, "what did Chen's Billing team ship").unwrap();
+        let chen = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Chen")
+            .expect("Chen mention");
+        let top = &chen.candidates[0];
+        assert!(
+            top.value.contains("Dana"),
+            "the Billing-connected Chen must win, got {:?}",
+            chen.candidates
+                .iter()
+                .map(|c| (c.value.as_str(), c.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(top.selected);
+        let evidence = top.coherence.as_deref().expect("coherence evidence");
+        assert!(
+            evidence.contains("people #2") && evidence.contains("teams #43"),
+            "got {evidence:?}"
+        );
+        // The rival Chen stays visible, unboosted, and now outranked.
+        let wei = chen
+            .candidates
+            .iter()
+            .find(|c| c.value.contains("Wei"))
+            .expect("Wei Chen near-miss");
+        assert!(wei.coherence.is_none());
+        assert!(wei.score < top.score);
+        // The partner mention carries the same evidence.
+        let billing = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Billing")
+            .expect("Billing mention");
+        assert_eq!(billing.candidates[0].coherence.as_deref(), Some(evidence));
+    }
+
+    #[test]
+    fn without_kg_the_lexical_chen_wins() {
+        // The ordering collective disambiguation exists to overturn: with no
+        // compiled graph, length affinity puts Wei Chen first and nothing
+        // carries coherence evidence.
+        let db = readme_db("nokgchen");
+        let trace = resolve_lexical(&db, "what did Chen's Billing team ship").unwrap();
+        let chen = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Chen")
+            .expect("Chen mention");
+        assert!(chen.candidates[0].value.contains("Wei"));
+        assert!(trace
+            .spans
+            .iter()
+            .flat_map(|s| &s.candidates)
+            .all(|c| c.coherence.is_none()));
+    }
+
+    #[test]
+    fn coherence_evidence_reaches_trace_and_proto() {
+        let db = readme_db("cohproto");
+        stemma_kg::compile(&db, false).unwrap();
+        let trace = resolve_lexical(&db, "what did Chen's Billing team ship").unwrap();
+        let json = serde_json::to_value(&trace).unwrap();
+        let in_json = json["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["candidates"].as_array().unwrap())
+            .any(|c| {
+                c["coherence"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("teams #43"))
+            });
+        assert!(in_json, "coherence must serialize in the JSON trace");
+        let explain = trace_to_explain_proto(&trace);
+        assert!(explain
+            .spans
+            .iter()
+            .flat_map(|s| &s.candidates)
+            .any(|c| c.coherence.contains("teams #43")));
     }
 
     #[test]

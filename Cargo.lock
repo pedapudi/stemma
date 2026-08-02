@@ -1410,6 +1410,7 @@ dependencies = [
  "serde_json",
  "stemma-embed",
  "stemma-ingest",
+ "stemma-kg",
  "stemma-proto",
  "stemmadb",
  "thiserror",

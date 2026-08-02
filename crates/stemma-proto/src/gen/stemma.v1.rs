@@ -67,6 +67,11 @@ pub struct TraceCandidate {
     pub snippet: ::prost::alloc::string::String,
     #[prost(bool, tag = "11")]
     pub is_doc: bool,
+    /// Instance-level connection to a co-mention's candidate, verified in the
+    /// user database during collective disambiguation — a human-readable path
+    /// like "people #2 ←lead_id— teams #43". Empty when no such evidence.
+    #[prost(string, tag = "12")]
+    pub coherence: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraceSpan {
