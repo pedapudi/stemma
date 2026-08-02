@@ -1025,92 +1025,10 @@ function renderTrace(out, trace) {
     }
   }
   requestAnimationFrame(drawLineage);
-  const THRESHOLD = 0.35;
-  let previewT = null;
-  const activeChannels = /* @__PURE__ */ new Set();
-  const allDots = [];
   const card = el("div", {
     class: "cand-card",
     hidden: ""
   });
-  function restyle() {
-    const t = previewT ?? THRESHOLD;
-    for (const { dot, c } of allDots) {
-      const wouldSelect = c.score >= t;
-      dot.classList.toggle("rej", !wouldSelect);
-      dot.classList.toggle("sel", wouldSelect && !dot.classList.contains("top"));
-      if (previewT !== null) dot.classList.remove("top");
-      const dimmed = activeChannels.size > 0 && !c.channels.some((ch) => activeChannels.has(ch.channel));
-      dot.classList.toggle("dim", dimmed);
-    }
-    threshRules.forEach((r) => {
-      r.style.left = `${t * 100}%`;
-    });
-    threshTick.style.left = `${t * 100}%`;
-    threshTick.textContent = previewT === null ? "threshold" : `preview ${t.toFixed(2)}`;
-    threshTick.classList.toggle("preview", previewT !== null);
-  }
-  const threshRules = [];
-  const threshTick = el("span", {
-    class: "sf-tick sf-thresh",
-    style: `left:${THRESHOLD * 100}%`
-  }, "threshold");
-  const axis = el("div", {
-    class: "sf-axis",
-    title: "click to preview a different threshold"
-  }, el("span", {
-    class: "sf-tick",
-    style: "left:0%"
-  }, "0"), threshTick, el("span", {
-    class: "sf-tick",
-    style: "left:100%"
-  }, "1"));
-  axis.addEventListener("click", (e) => {
-    const r = axis.getBoundingClientRect();
-    const t = Math.min(0.99, Math.max(0.01, (e.clientX - r.left) / r.width));
-    previewT = Math.abs(t - THRESHOLD) < 0.02 ? null : t;
-    restyle();
-  });
-  const channels = [
-    "exact",
-    "bm25",
-    "trigram",
-    "dense",
-    "kg"
-  ];
-  const chanRow = el("span", {
-    class: "sf-channels"
-  }, channels.map((ch) => {
-    const chip = el("button", {
-      class: "chip",
-      onclick: (e) => {
-        e.stopPropagation();
-        if (activeChannels.has(ch)) activeChannels.delete(ch);
-        else activeChannels.add(ch);
-        chip.classList.toggle("on-chan");
-        restyle();
-      }
-    }, ch);
-    return chip;
-  }), el("button", {
-    class: "chip",
-    onclick: (e) => {
-      e.stopPropagation();
-      previewT = null;
-      activeChannels.clear();
-      field.querySelectorAll(".on-chan").forEach((x) => x.classList.remove("on-chan"));
-      restyle();
-    }
-  }, "reset"));
-  const field = el("div", {
-    class: "scorefield"
-  });
-  field.append(el("div", {
-    class: "sf-head"
-  }, el("span", null, el("span", {
-    class: "sf-label subhead",
-    style: "margin:0"
-  }, "mention"), chanRow), axis));
   function showCard(sp, c) {
     hideHover();
     card.hidden = false;
@@ -1157,77 +1075,6 @@ function renderTrace(out, trace) {
       class: "sql-caption"
     }, `for mention \u201C${sp.text}\u201D`)));
   }
-  let openDetail = null;
-  let openRow = null;
-  for (const sp of mentionSpans) {
-    const rule = el("i", {
-      class: "sf-rule"
-    });
-    const trule = el("i", {
-      class: "sf-rule sf-rule-thresh",
-      style: `left:${THRESHOLD * 100}%`
-    });
-    threshRules.push(trule);
-    const strip = el("div", {
-      class: "sf-strip"
-    }, rule, trule);
-    const topIdx = sp.candidates.findIndex((c) => c.selected);
-    sp.candidates.forEach((c, i) => {
-      const cls = "sf-dot" + (c.selected ? i === topIdx ? " top" : " sel" : " rej");
-      const jitter = (i % 5 - 2) * 5;
-      const dot = el("span", {
-        class: cls,
-        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px; --th:${hueOf(c.table)}`,
-        onclick: (e) => {
-          e.stopPropagation();
-          showCard(sp, c);
-        }
-      });
-      hov(dot, hovCandidate(c));
-      allDots.push({
-        dot,
-        c
-      });
-      strip.append(dot);
-    });
-    const nSel = sp.candidates.filter((c) => c.selected).length;
-    const row = el("div", {
-      class: "sf-row"
-    }, el("span", {
-      class: "sf-label"
-    }, el("span", {
-      class: "sf-mention"
-    }, sp.text), sp.kg_alias ? el("span", {
-      class: "chip sf-kgchip",
-      title: "matches a knowledge-graph entity"
-    }, "kg") : null, el("span", {
-      class: "sf-count"
-    }, `${nSel}/${sp.candidates.length}`)), strip);
-    const detail = el("div", {
-      class: "sf-detail"
-    }, sp.candidates.map((c, i) => renderCandidate(c, i)));
-    row.addEventListener("click", () => {
-      hideHover();
-      const isOpen = openDetail === detail;
-      openDetail?.remove();
-      openRow?.classList.remove("open");
-      openDetail = null;
-      openRow = null;
-      if (!isOpen) {
-        row.after(detail);
-        row.classList.add("open");
-        openDetail = detail;
-        openRow = row;
-      }
-    });
-    field.append(row);
-  }
-  if (!mentionSpans.length) {
-    field.append(el("div", {
-      class: "empty"
-    }, "\u2014 no mentions resolved; the considered spans are below"));
-  }
-  field.append(card);
   const also = trace.spans.filter((s) => s.status !== "selected" && s.status !== "skipped").sort((a, b) => a.start - b.start);
   const alsoBox = el("details", {
     class: "alsoran section"
@@ -1313,12 +1160,6 @@ function renderTrace(out, trace) {
   }
   requestAnimationFrame(drawCoherence);
   const panels = {
-    field: {
-      node: field,
-      built: true,
-      build: () => {
-      }
-    },
     anatomy: {
       node: el("div", {
         class: "anatomy"
@@ -1335,8 +1176,8 @@ function renderTrace(out, trace) {
     }
   };
   const MODE_KEY = "stemma.trajmode";
-  let mode = localStorage.getItem(MODE_KEY) || "field";
-  if (!(mode in panels)) mode = "field";
+  let mode = localStorage.getItem(MODE_KEY) || "anatomy";
+  if (!(mode in panels)) mode = "anatomy";
   const modeBtns = /* @__PURE__ */ new Map();
   const modeBar = el(
     "div",
@@ -1758,13 +1599,13 @@ function renderTrace(out, trace) {
     }, "accent dots were selected as mentions \xB7 grey dots are the retrieved-but-outranked field \xB7 click any dot for its card"));
   }
   for (const [k, p] of Object.entries(panels)) p.node.hidden = k !== mode;
-  if (mode !== "field" && !panels[mode].built) {
+  if (!panels[mode].built) {
     panels[mode].build();
     panels[mode].built = true;
   }
   out.append(el("div", {
     class: "sql-caption"
-  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, dense, kg \xB7 click a mention row for detail`), lineage, modeBar, panels.field.node, panels.anatomy.node, panels.space.node, alsoBox);
+  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, dense, kg`), lineage, modeBar, panels.anatomy.node, panels.space.node, card, alsoBox);
 }
 var MAX_LAT_N = 4;
 function renderMiniTrace(trace) {
@@ -1823,37 +1664,6 @@ function renderMiniTrace(trace) {
     }, "\u2014 nothing resolved"));
   }
   return box;
-}
-function renderCandidate(c, rank) {
-  const mid = c.is_doc && c.snippet ? snippetNode(c.snippet) : el("span", {
-    class: "cand-val",
-    title: c.value
-  }, `\u201C${c.value}${c.value_truncated ? "\u2026" : ""}\u201D`);
-  const row = el("div", {
-    class: "cand " + (c.selected ? rank === 0 ? "sel-0" : "sel" : "rej")
-  }, el("span", {
-    class: "cand-id"
-  }, `${c.table}.${c.column} `, el("span", {
-    class: "rowid"
-  }, `#${c.rowid}`)), mid, el("span", {
-    class: "cand-right"
-  }, el("span", {
-    class: "cand-chips"
-  }, c.channels.map((ch) => el("span", {
-    class: "chip"
-  }, ch.channel === "kg" ? `kg +${ch.raw}` : ch.channel)), c.selected ? null : el("span", {
-    class: "pill bad"
-  }, (c.reject_reason || "rejected").replace(/_/g, " "))), el("span", {
-    style: "display:flex; gap:6px; align-items:center"
-  }, el("span", {
-    class: "meter"
-  }, el("span", {
-    style: `width:${Math.round(c.score * 100)}%`
-  })), el("span", {
-    class: "score"
-  }, c.score.toFixed(2)))));
-  hov(row, c.channels.map((ch) => ch.channel === "kg" ? `<b>kg</b> co-occurring terms matched: ${ch.raw}` : `<b>${esc(ch.channel)}</b> rank ${ch.rank + 1} \xB7 raw ${ch.raw.toFixed(3)}`).join("<br>") + (c.selected ? "" : `<hr>${esc(c.reject_reason.replace(/_/g, " "))}`));
-  return row;
 }
 var pendingTrace = null;
 function showTraceInMain(trace) {
