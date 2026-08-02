@@ -35,6 +35,12 @@
 
 ## Design
 
+- [Technical design](design/README.md) — the deep reference: system
+  decomposition and boundaries, the full store schema and migration
+  discipline, the resolution pipeline with its actual constants and scoring
+  mathematics, the knowledge compiler's algorithms, the designed dense
+  channel and LM band, and the evaluation protocol. Includes a shared
+  [bibliography](design/00-bibliography.md).
 - [Brand](brand.md) — the mark and its grammar, the wordmark, the one color
   rule (`currentColor` strokes, the dot is the only colored element), clear
   space and minimum sizes, and the voice/microcopy conventions. Assets live in

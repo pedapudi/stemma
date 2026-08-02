@@ -9,8 +9,9 @@ downstream consumer (a query generator, an agent, a human) builds on.
 ## Why this problem
 
 Error analyses on the BIRD text-to-SQL benchmark attribute the largest share of
-failures (~37%) to schema/value linking — finding the right table, column, and
-stored value — not to SQL logic. BIRD ships human-written "evidence" hints that
+failures — roughly a third, though the number varies by system analyzed — to
+schema/value linking: finding the right table, column, and stored value, not
+SQL logic. BIRD ships human-written "evidence" hints that
 pre-solve exactly this linking, and state-of-the-art systems lose >10%
 execution accuracy when the hints are removed (DIVER 2026, SEED 2025). The
 field's newest systems converge on *resolve-then-generate*: produce a verified

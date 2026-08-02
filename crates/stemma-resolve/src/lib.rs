@@ -606,8 +606,9 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
         .map(|((table, column, rowid), g)| {
             let has_exact = g.channels.iter().any(|c| c.channel == "exact");
             let rrf: f64 = g.channels.iter().map(|c| 1.0 / (RRF_K + c.rank as f64)).sum();
-            // Normalize: three channels at rank 0 -> 1.0 (docs never have the
-            // exact channel, so their base tops out at 2/3).
+            // Normalize: three channels at rank 0 -> 1.0. Docs never have the
+            // exact channel, but since dense landed they can still reach three
+            // (bm25 + trigram + dense), so their base can saturate too.
             let base = (rrf / (3.0 / RRF_K)).min(1.0);
             let mut score = if has_exact {
                 // Exact matches are definitionally right about the value.
