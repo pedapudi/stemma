@@ -854,12 +854,15 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       chip = el("button", {
         class: "sub-chip",
         title: `${top.table}.${top.column} #${top.rowid}`,
-        style: `--th:${hueOf(top.table)}`,
         onclick: (e: Event) => {
           e.stopPropagation();
           showCard(sp, top);
         },
-      }, label);
+      },
+        tablesSeen.length > 1
+          ? el("i", { class: "chip-dot", style: `background:${hueOf(top.table)}` })
+          : null,
+        label);
       hov(chip, hovCandidate(top));
     } else {
       chip = el("span", { class: "sub-chip sub-unresolved", title: "unresolved" }, sp.text);
@@ -1290,14 +1293,13 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       return box;
     }
     const s = stages(sp, w);
-    // the deciding mechanism colors the card's spine: exact = good,
-    // semantic floor = the dense hue, plain lexical = flat
+    // the deciding mechanism gets a hue: exact = good, semantic floor =
+    // the dense hue, plain lexical = flat — carried by a dot, never a rail
     const mechHue = s.hasExact
       ? "var(--good)"
       : s.calibrated > s.branch + 0.005
         ? "color-mix(in srgb, var(--brand-accent) 60%, var(--ink))"
         : "var(--flat)";
-    box.style.borderLeft = `3px solid ${mechHue}`;
     const meter = el("span", { class: "why-meter" },
       el("i", { style: `width:${Math.round(Math.min(1, w.score) * 100)}%` }));
     const head = el("div", { class: "why-head" },
@@ -1329,19 +1331,20 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
         }))));
 
     // the mechanism that decided it
+    const mechDot = () => el("i", { class: "why-dot", style: `background:${mechHue}` });
     const mech: HTMLElement[] = [];
     if (s.hasExact) {
       mech.push(el("div", { class: "why-line" },
-        el("span", { class: "why-k" }, "decided by"),
+        el("span", { class: "why-k" }, "decided by"), mechDot(),
         el("span", null, "exact match — the mention equals the stored value, floor 0.9")));
     } else if (s.calibrated > s.branch + 0.005) {
       mech.push(el("div", { class: "why-line" },
-        el("span", { class: "why-k" }, "decided by"),
+        el("span", { class: "why-k" }, "decided by"), mechDot(),
         el("span", null,
           `semantic floor — cos ${s.cos.toFixed(2)} calibrates to ${s.calibrated.toFixed(2)}, above the lexical case (${s.branch.toFixed(2)})`)));
     } else {
       mech.push(el("div", { class: "why-line" },
-        el("span", { class: "why-k" }, "decided by"),
+        el("span", { class: "why-k" }, "decided by"), mechDot(),
         el("span", null, w.is_doc
           ? "fused lexical evidence under document scoring (length is not held against it)"
           : "fused lexical evidence with length affinity")));

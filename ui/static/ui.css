@@ -925,6 +925,7 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .why-k { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-soft); flex: none; width: 84px; text-align: right; }
 .why-coh .mono { color: var(--brand-accent); }
 .why-adj > span:not(.why-k) { color: var(--caution); }
+.why-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; }
 .why-soft { color: var(--ink-soft); }
 .why-rival .why-ref { color: var(--ink-soft); }
 .why-rival .why-ref:hover { color: var(--ink); }
@@ -967,9 +968,9 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
   font-family: var(--mono); font-size: calc(11px * var(--fs));
   color: var(--accent); border: 1px solid var(--accent); border-radius: 4px;
   background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border-left: 3px solid var(--th, var(--accent));
   padding: 1px 7px; margin: 0 2px; cursor: pointer;
 }
+.chip-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
 .sub-chip:hover { background: var(--accent); color: var(--paper); }
 .sub-chip.sub-unresolved {
   color: var(--ink-faint); border: 1px dashed var(--flat); background: transparent; cursor: default;
