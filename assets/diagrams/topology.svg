@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1420 820" width="1420" height="820"
+     class="dg" role="img" aria-label="stemma process topology">
+  <title>stemma — topology</title>
+  <!-- single-svg theme adaptivity: strokes and text follow currentColor, the
+       accent dot follows the brand variable. a host that inlines this file can
+       drop the base color; standalone <img> use gets the media-query fallback. -->
+  <style>
+    .dg { color:#15181C; }
+    @media (prefers-color-scheme: dark) { .dg { color:#EDEFEA; } }
+    .dg .dot { fill:#2FA46A; }
+    @media (prefers-color-scheme: dark) { .dg .dot { fill:#3FB87A; } }
+    text { font-family:"JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; fill:currentColor; }
+    .t  { font-size:14px; font-weight:700; }
+    .bt { font-size:12px; font-weight:700; }
+    .n  { font-size:10.5px; }
+    .s  { font-size:9px; }
+    .m  { opacity:0.62; }
+    .f  { opacity:0.38; }
+    .box  { fill:none; stroke:currentColor; stroke-width:1.4; stroke-linejoin:round; }
+    .sub  { fill:none; stroke:currentColor; stroke-width:1.2; opacity:0.7; }
+    .file { fill:none; stroke:currentColor; stroke-width:1.2; stroke-linejoin:round; }
+    .edge { fill:none; stroke:currentColor; stroke-width:1.2; }
+    .fedge{ fill:none; stroke:currentColor; stroke-width:1.1; opacity:0.4; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+      <path d="M1.5 1 L6.5 4 L1.5 7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="46" class="t">stemma — topology</text>
+  <text x="40" y="66" class="s m">one deployment · processes, files, and what crosses each edge</text>
+
+  <!-- legend -->
+  <g>
+    <rect x="560" y="28" width="24" height="16" rx="5" class="box" stroke-width="1.2"/>
+    <text x="594" y="40" class="s m">process</text>
+    <path d="M700 28 L716 28 L724 36 L724 44 L700 44 Z M716 28 L716 36 L724 36" class="file"/>
+    <text x="734" y="40" class="s m">file</text>
+    <path d="M790 36 H818" class="edge" marker-end="url(#a)"/>
+    <text x="830" y="40" class="s m">call · label = protocol</text>
+    <path d="M990 36 H1018" class="fedge" marker-end="url(#a)"/>
+    <text x="1030" y="40" class="s m">config read</text>
+  </g>
+
+  <!-- browser -->
+  <rect x="40" y="110" width="150" height="70" rx="8" class="box"/>
+  <text x="56" y="138" class="bt">browser</text>
+  <text x="56" y="158" class="s m">human · web ui</text>
+
+  <!-- config.json -->
+  <path d="M40 240 L212 240 L230 258 L230 320 L40 320 Z M212 240 L212 258 L230 258" class="file"/>
+  <text x="56" y="266" class="bt">config.json</text>
+  <text x="56" y="284" class="s m">one file per deployment</text>
+  <text x="56" y="298" class="s m">read by server · console</text>
+  <text x="56" y="310" class="s m">· mcp · agent (standalone)</text>
+
+  <!-- console -->
+  <rect x="250" y="100" width="330" height="250" rx="8" class="box"/>
+  <text x="266" y="126" class="bt">console</text>
+  <text x="356" y="126" class="s m">python · ui/serve.py · http :8600</text>
+  <rect x="268" y="140" width="294" height="44" rx="5" class="sub"/>
+  <text x="280" y="158" class="n">fastapi /api/*</text>
+  <text x="280" y="176" class="s m">static ui · resolve · sql · graph · history</text>
+  <rect x="268" y="196" width="294" height="40" rx="5" class="sub"/>
+  <text x="280" y="213" class="n">storebrowser</text>
+  <text x="280" y="229" class="s m">direct sqlite · mode=ro only</text>
+  <rect x="268" y="248" width="294" height="86" rx="5" class="sub"/>
+  <text x="280" y="266" class="n">agentchat · adk runner</text>
+  <text x="280" y="282" class="s m">stemma_agent (LlmAgent) · litellm</text>
+  <text x="280" y="296" class="s m">writes chat_log · re-explains resolves</text>
+  <text x="280" y="312" class="s m">same agent runs standalone:</text>
+  <text x="280" y="324" class="s m">adk run agents/stemma_agent</text>
+
+  <!-- stemma-server -->
+  <rect x="720" y="100" width="290" height="260" rx="8" class="box"/>
+  <text x="736" y="126" class="bt">stemma-server</text>
+  <text x="900" y="126" class="s m">rust · tonic</text>
+  <rect x="738" y="140" width="254" height="36" rx="5" class="sub"/>
+  <text x="750" y="163" class="n">grpc :50051 · Resolve / Explain</text>
+  <rect x="738" y="188" width="254" height="36" rx="5" class="sub"/>
+  <text x="750" y="211" class="n">resolve pipeline &#8594; pipeline.svg</text>
+  <rect x="738" y="236" width="254" height="56" rx="5" class="sub"/>
+  <text x="750" y="254" class="n">startup, per registered db:</text>
+  <text x="750" y="272" class="s m">lexical ingest · kg compile ·</text>
+  <text x="750" y="284" class="s m">dense promote (vec_staging)</text>
+  <text x="750" y="318" class="s m">per resolve: query_log write</text>
+  <text x="750" y="334" class="s m">(source · session · elapsed_ms)</text>
+
+  <!-- embedding endpoint -->
+  <rect x="1150" y="110" width="230" height="90" rx="8" class="box"/>
+  <text x="1166" y="136" class="bt">embedding endpoint</text>
+  <text x="1166" y="156" class="s m">openai-compat · external</text>
+  <text x="1166" y="170" class="s m">optional: absent &#8594; lexical+kg</text>
+  <text x="1166" y="188" class="s m">e.g. vllm · llama.cpp · litellm</text>
+
+  <!-- lm endpoint -->
+  <rect x="1150" y="250" width="230" height="90" rx="8" class="box"/>
+  <text x="1166" y="276" class="bt">lm endpoint</text>
+  <text x="1166" y="296" class="s m">openai-compat · external</text>
+  <text x="1166" y="310" class="s m">optional: absent &#8594; no chat view</text>
+  <text x="1166" y="328" class="s m">console.lm in config.json</text>
+
+  <!-- mcp server -->
+  <rect x="250" y="450" width="330" height="130" rx="8" class="box"/>
+  <text x="266" y="476" class="bt">mcp server</text>
+  <text x="396" y="476" class="s m">python · stdio · fastmcp</text>
+  <text x="266" y="496" class="s m">integrations/mcp/stemmadb_mcp.py</text>
+  <text x="266" y="518" class="n">tools: resolve · sql · schema ·</text>
+  <text x="266" y="534" class="n">knowledge_graph</text>
+  <text x="266" y="556" class="s m">stemmaclient (grpc) · storebrowser (ro)</text>
+
+  <!-- files on disk -->
+  <rect x="700" y="628" width="510" height="140" rx="10" class="fedge" stroke-dasharray="none"/>
+  <text x="955" y="762" class="s f" text-anchor="middle">side by side on disk: &lt;name&gt;.db · &lt;name&gt;.stemmadb</text>
+  <path d="M720 650 L892 650 L910 668 L910 746 L720 746 Z M892 650 L892 668 L910 668" class="file"/>
+  <text x="736" y="678" class="bt">user.db</text>
+  <text x="736" y="698" class="s m">stock sqlite</text>
+  <text x="736" y="712" class="s m">attached ro · never written</text>
+  <path d="M960 650 L1172 650 L1190 668 L1190 746 L960 746 Z M1172 650 L1172 668 L1190 668" class="file"/>
+  <text x="976" y="678" class="bt">user.stemmadb</text>
+  <circle cx="1136" cy="674" r="3.2" class="dot"/>
+  <text x="976" y="698" class="s m">every derived artifact</text>
+  <text x="976" y="712" class="s m">sqlite · wal &#8594; store.svg</text>
+
+  <!-- edges -->
+  <!-- browser -> console -->
+  <path d="M190 145 H250" class="edge" marker-end="url(#a)"/>
+  <text x="220" y="137" class="s m" text-anchor="middle">http :8600</text>
+
+  <!-- console -> server (grpc) -->
+  <path d="M580 150 H720" class="edge" marker-end="url(#a)"/>
+  <text x="650" y="142" class="s m" text-anchor="middle">grpc · Explain</text>
+
+  <!-- server -> embedding endpoint -->
+  <path d="M1010 150 H1150" class="edge" marker-end="url(#a)"/>
+  <text x="1080" y="142" class="s m" text-anchor="middle">http /v1/embeddings</text>
+  <text x="1080" y="164" class="s f" text-anchor="middle">&#8804;1 batched call / query</text>
+
+  <!-- agentchat -> lm endpoint -->
+  <path d="M580 310 H650 V410 H1265 V346" class="edge" marker-end="url(#a)"/>
+  <text x="1120" y="402" class="s m" text-anchor="middle">http /v1/chat/completions · litellm</text>
+
+  <!-- agentchat -> mcp (stdio) -->
+  <path d="M415 350 V444" class="edge" marker-end="url(#a)"/>
+  <text x="427" y="404" class="s m">stdio · spawned subprocess</text>
+
+  <!-- mcp -> server (grpc) -->
+  <path d="M580 500 H800 V366" class="edge" marker-end="url(#a)"/>
+  <text x="655" y="514" class="s m">grpc · Explain (stemmaclient)</text>
+
+  <!-- server -> user.db (ro) -->
+  <path d="M750 360 V644" class="edge" marker-end="url(#a)"/>
+  <text x="758" y="556" class="s m">sqlite ro</text>
+  <text x="758" y="568" class="s m">ATTACH as src</text>
+
+  <!-- server -> store (rw) -->
+  <path d="M1000 360 V644" class="edge" marker-end="url(#a)"/>
+  <text x="1008" y="540" class="s m">sqlite rw · main</text>
+  <text x="1008" y="552" class="s m">ingest · kg · dense promote</text>
+  <text x="1008" y="564" class="s m">query_log per resolve</text>
+
+  <!-- console -> files (ro + chat_log rw) -->
+  <path d="M250 340 H120 V690 H694" class="edge" marker-end="url(#a)"/>
+  <text x="260" y="666" class="s m" text-anchor="middle">sqlite ro · storebrowser</text>
+  <text x="260" y="678" class="s m" text-anchor="middle">sqlite rw · chat_log only</text>
+
+  <!-- mcp -> files (ro) -->
+  <path d="M415 580 V720 H694" class="edge" marker-end="url(#a)"/>
+  <text x="550" y="712" class="s m" text-anchor="middle">sqlite ro · storebrowser</text>
+
+  <!-- config reads -->
+  <path d="M230 276 H244" class="fedge" marker-end="url(#a)"/>
+  <path d="M135 320 V425 H840 V366" class="fedge" marker-end="url(#a)"/>
+  <text x="470" y="438" class="s f">json read at start (--config / nearest config.json)</text>
+</svg>

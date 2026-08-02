@@ -8,6 +8,9 @@
 - [Walkthrough](walkthrough.md) — build it, load a corpus, query the Resolve
   API, look inside the `.stemmadb` store. Verified commands with expected
   output.
+- [Architecture, visually](architecture-visuals.md) — the topology, the
+  resolution pipeline, the store anatomy and one chat turn as diagrams, with
+  a walkthrough of every component and edge.
 
 ## User guide
 

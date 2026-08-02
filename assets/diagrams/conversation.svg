@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 950" width="1300" height="950"
+     class="dg" role="img" aria-label="stemma chat information flow, one turn">
+  <title>stemma — one chat turn</title>
+  <style>
+    .dg { color:#15181C; }
+    @media (prefers-color-scheme: dark) { .dg { color:#EDEFEA; } }
+    .dg .dot { fill:#2FA46A; }
+    @media (prefers-color-scheme: dark) { .dg .dot { fill:#3FB87A; } }
+    text { font-family:"JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; fill:currentColor; }
+    .t  { font-size:14px; font-weight:700; }
+    .bt { font-size:11px; font-weight:700; }
+    .n  { font-size:9.5px; }
+    .s  { font-size:8.5px; }
+    .m  { opacity:0.62; }
+    .f  { opacity:0.38; }
+    .box  { fill:none; stroke:currentColor; stroke-width:1.4; stroke-linejoin:round; }
+    .file { fill:none; stroke:currentColor; stroke-width:1.2; stroke-linejoin:round; }
+    .edge { fill:none; stroke:currentColor; stroke-width:1.2; }
+    .life { fill:none; stroke:currentColor; stroke-width:1; opacity:0.28; stroke-dasharray:2 5; }
+    .fedge{ fill:none; stroke:currentColor; stroke-width:1.1; opacity:0.4; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+      <path d="M1.5 1 L6.5 4 L1.5 7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="42" class="t">stemma — one chat turn</text>
+  <text x="40" y="62" class="s m">browser &#8594; console &#8594; agent &#8594; tools &#8594; models · and what lands in the store</text>
+
+  <!-- lifeline headers -->
+  <rect x="48" y="80" width="104" height="40" rx="7" class="box"/>
+  <text x="100" y="105" class="bt" text-anchor="middle">browser</text>
+  <rect x="230" y="80" width="140" height="40" rx="7" class="box"/>
+  <text x="300" y="98" class="bt" text-anchor="middle">console</text>
+  <text x="300" y="112" class="s m" text-anchor="middle">fastapi /api/chat</text>
+  <rect x="430" y="80" width="140" height="40" rx="7" class="box"/>
+  <text x="500" y="98" class="bt" text-anchor="middle">agentchat</text>
+  <text x="500" y="112" class="s m" text-anchor="middle">adk runner · litellm</text>
+  <rect x="630" y="80" width="140" height="40" rx="7" class="box"/>
+  <text x="700" y="98" class="bt" text-anchor="middle">lm endpoint</text>
+  <text x="700" y="112" class="s m" text-anchor="middle">/v1/chat/completions</text>
+  <rect x="812" y="80" width="136" height="40" rx="7" class="box"/>
+  <text x="880" y="98" class="bt" text-anchor="middle">mcp server</text>
+  <text x="880" y="112" class="s m" text-anchor="middle">stdio subprocess</text>
+  <rect x="990" y="80" width="140" height="40" rx="7" class="box"/>
+  <text x="1060" y="98" class="bt" text-anchor="middle">stemma-server</text>
+  <text x="1060" y="112" class="s m" text-anchor="middle">grpc :50051</text>
+  <path d="M1140 80 L1242 80 L1260 98 L1260 120 L1140 120 Z M1242 80 L1242 98 L1260 98" class="file"/>
+  <text x="1152" y="98" class="bt">user.stemmadb</text>
+  <text x="1152" y="112" class="s m">sqlite file</text>
+  <circle cx="1246" cy="108" r="3" class="dot"/>
+
+  <!-- lifelines -->
+  <path d="M100 120 V770" class="life"/>
+  <path d="M300 120 V770" class="life"/>
+  <path d="M500 120 V770" class="life"/>
+  <path d="M700 120 V770" class="life"/>
+  <path d="M880 120 V770" class="life"/>
+  <path d="M1060 120 V770" class="life"/>
+  <path d="M1200 120 V770" class="life"/>
+
+  <!-- messages -->
+  <path d="M100 160 H294" class="edge" marker-end="url(#a)"/>
+  <text x="197" y="152" class="s m" text-anchor="middle">POST /api/db/{db}/chat</text>
+
+  <path d="M300 194 H1194" class="edge" marker-end="url(#a)"/>
+  <text x="740" y="186" class="s m" text-anchor="middle">chat_log &#8592; user turn (sqlite rw)</text>
+
+  <path d="M300 228 H494" class="edge" marker-end="url(#a)"/>
+  <text x="397" y="220" class="s m" text-anchor="middle">send(db, text)</text>
+
+  <path d="M500 262 H694" class="edge" marker-end="url(#a)"/>
+  <text x="597" y="254" class="s m" text-anchor="middle">messages + tool schema (http)</text>
+
+  <path d="M694 296 H506" class="edge" marker-start="url(#a)"/>
+  <text x="597" y="288" class="s m" text-anchor="middle">tool call: resolve(query, db)</text>
+
+  <path d="M300 330 H1054" class="edge" marker-end="url(#a)"/>
+  <text x="680" y="322" class="s m" text-anchor="middle">Explain · grpc · source="agent" · session=db/conv</text>
+  <text x="315" y="346" class="s f">the console mirrors each resolve call as its event streams:</text>
+  <text x="315" y="358" class="s f">resolution is deterministic &#8594; re-explaining is exact, ~ms</text>
+
+  <path d="M1060 364 H1194" class="edge" marker-end="url(#a)"/>
+  <text x="1127" y="356" class="s m" text-anchor="middle">query_log &#8592;</text>
+
+  <path d="M1054 398 H306" class="edge" marker-start="url(#a)"/>
+  <text x="680" y="390" class="s m" text-anchor="middle">trace &#8594; trail entry for inline rendering</text>
+
+  <path d="M500 432 H874" class="edge" marker-end="url(#a)"/>
+  <text x="687" y="424" class="s m" text-anchor="middle">resolve · mcp over stdio</text>
+
+  <path d="M880 466 H1054" class="edge" marker-end="url(#a)"/>
+  <text x="967" y="458" class="s m" text-anchor="middle">Explain · grpc · source="mcp"</text>
+
+  <path d="M1060 500 H1194" class="edge" marker-end="url(#a)"/>
+  <text x="1127" y="492" class="s m" text-anchor="middle">query_log &#8592;</text>
+
+  <path d="M1054 534 H886" class="edge" marker-start="url(#a)"/>
+  <text x="970" y="526" class="s m" text-anchor="middle">full trajectory</text>
+
+  <path d="M874 568 H506" class="edge" marker-start="url(#a)"/>
+  <text x="690" y="560" class="s m" text-anchor="middle">compact digest + trajectory (structured content)</text>
+
+  <path d="M500 602 H694" class="edge" marker-end="url(#a)"/>
+  <text x="597" y="594" class="s m" text-anchor="middle">tool result (digest)</text>
+
+  <path d="M694 636 H506" class="edge" marker-start="url(#a)"/>
+  <text x="597" y="628" class="s m" text-anchor="middle">final message</text>
+
+  <path d="M494 670 H306" class="edge" marker-start="url(#a)"/>
+  <text x="400" y="662" class="s m" text-anchor="middle">{message, trail}</text>
+
+  <path d="M300 704 H1194" class="edge" marker-end="url(#a)"/>
+  <text x="740" y="696" class="s m" text-anchor="middle">chat_log &#8592; assistant turn + trail json (sqlite rw)</text>
+
+  <path d="M294 738 H106" class="edge" marker-start="url(#a)"/>
+  <text x="200" y="730" class="s m" text-anchor="middle">{message, trail}</text>
+  <text x="40" y="762" class="s f">the browser renders each resolve</text>
+  <text x="40" y="774" class="s f">in the trail as a full trajectory</text>
+
+  <!-- tool round bracket -->
+  <path d="M64 252 H56 V642 H64" class="fedge"/>
+  <text x="40" y="234" class="s f">tool rounds</text>
+  <text x="40" y="246" class="s f">repeat</text>
+
+  <!-- footnotes -->
+  <text x="40" y="820" class="s m">sql · schema · knowledge_graph tool calls go mcp &#8594; storebrowser (sqlite ro), never through the server</text>
+  <text x="40" y="838" class="s m">lm endpoint down &#8594; /api/chat answers 502 · browsing, resolve and sql are unaffected</text>
+  <text x="40" y="856" class="s m">stemma-server down &#8594; the resolve tool fails · console browsing still works: it reads the files directly</text>
+  <text x="40" y="874" class="s m">reload &#8594; GET /api/db/{db}/chat replays the transcript from chat_log</text>
+</svg>
