@@ -1535,6 +1535,121 @@ function setChatRail(open: boolean): void {
   if (open) renderChatRail();
 }
 
+/* ---- tool-result rendering for the chat rail: structured views per tool,
+ * never raw JSON. MCP results arrive enveloped ({content:[{type:"text",
+ * text:"<json>"}], structuredContent?}) and often double-encoded; unwrap
+ * before dispatching. ---- */
+function unwrapToolResult(result: unknown): unknown {
+  if (result == null || typeof result !== "object") {
+    if (typeof result === "string") {
+      try { return JSON.parse(result); } catch { return result; }
+    }
+    return result;
+  }
+  const r = result as Record<string, unknown>;
+  const sc = r.structuredContent as Record<string, unknown> | undefined;
+  if (sc) return sc.result ?? sc;
+  const content = r.content as { type?: string; text?: string }[] | undefined;
+  if (Array.isArray(content)) {
+    const text = content.find((c) => c.type === "text")?.text;
+    if (text != null) {
+      try { return JSON.parse(text); } catch { return text; }
+    }
+  }
+  return result;
+}
+
+function toolResult(tool: string, raw: unknown, args?: Record<string, unknown>): HTMLElement {
+  const r = unwrapToolResult(raw);
+  if (r == null) return el("div", { class: "tool-body" }, "—");
+  if (typeof r === "object") {
+    const o = r as Record<string, unknown>;
+    if (tool === "sql" && Array.isArray(o.columns)) return sqlResult(o);
+    if (tool === "knowledge_graph" && (o.tables || o.characteristic_terms)) return kgResult(o);
+    if (tool === "schema" && Array.isArray(o.tables)) return schemaResult(o);
+  }
+  return el("div", { class: "tool-body" },
+    typeof r === "string" ? r : JSON.stringify(r, null, 2));
+}
+
+/* sql → a real table: mono, right-aligned numbers, truncation stated */
+function sqlResult(o: Record<string, unknown>): HTMLElement {
+  const cols = o.columns as string[];
+  const rows = (o.rows as unknown[][]) ?? [];
+  const box = el("div", { class: "tr-box" });
+  if (!rows.length) {
+    box.append(el("div", { class: "tr-note" }, "no rows"));
+    return box;
+  }
+  const numeric = cols.map((_, i) => rows.every((r) => typeof r[i] === "number" || r[i] == null));
+  const table = el("table", { class: "tr-table" },
+    el("thead", null, el("tr", null,
+      cols.map((c, i) => el("th", { class: numeric[i] ? "num" : null }, c)))),
+    el("tbody", null, rows.map((r) => el("tr", null,
+      r.map((v, i) => {
+        const s = v == null ? "∅" : String(v);
+        return el("td", {
+          class: numeric[i] ? "num" : null,
+          title: s.length > 80 ? s : null,
+        }, s.length > 80 ? s.slice(0, 80) + "…" : s);
+      })))));
+  box.append(el("div", { class: "tr-scroll" }, table));
+  if (o.truncated) box.append(el("div", { class: "tr-note" }, "truncated — showing the first rows"));
+  return box;
+}
+
+/* knowledge_graph → the corpus at a glance: tables, the term field, joins */
+function kgResult(o: Record<string, unknown>): HTMLElement {
+  const box = el("div", { class: "tr-box" });
+  const tables = (o.tables as Record<string, unknown>[]) ?? [];
+  if (tables.length) {
+    box.append(el("div", { class: "tr-sub" }, "tables"),
+      el("div", { class: "tr-chips" }, tables.map((t) =>
+        el("span", { class: "chip tr-tbl" },
+          String(t.name),
+          t.rows != null || t.approx_rows != null
+            ? el("i", null, ` ~${Number(t.rows ?? t.approx_rows).toLocaleString()}`)
+            : null))));
+  }
+  const terms = (o.characteristic_terms as string[]) ?? [];
+  if (terms.length) {
+    // centrality order arrives most-central first: size the first ranks up
+    box.append(el("div", { class: "tr-sub" }, "characteristic terms"),
+      el("div", { class: "tr-terms" }, terms.slice(0, 24).map((t, i) =>
+        el("span", { class: "tr-term tr-t" + (i < 4 ? 0 : i < 10 ? 1 : 2) }, t))));
+  }
+  const joins = (o.joins as Record<string, unknown>[]) ?? [];
+  if (joins.length) {
+    box.append(el("div", { class: "tr-sub" }, "join paths"),
+      el("div", null, joins.map((j) => el("div", { class: "tr-join" },
+        el("b", null, String(j.from).replace(/^table:/, "")),
+        el("span", { class: "tr-arrow" }, ` —${j.label ?? ""}→ `),
+        el("b", null, String(j.to).replace(/^table:/, "")),
+        j.confidence != null
+          ? el("span", { class: "tr-conf" },
+            ` ${j.method === "inferred" || j.method === "inclusion" ? "inferred · " : ""}${Number(j.confidence).toFixed(2)}`)
+          : null))));
+  }
+  if (!tables.length && !terms.length && !joins.length) {
+    box.append(el("div", { class: "tr-note" }, "empty graph"));
+  }
+  return box;
+}
+
+/* schema → one line per table: name, rows, columns, fks */
+function schemaResult(o: Record<string, unknown>): HTMLElement {
+  const box = el("div", { class: "tr-box" });
+  for (const t of o.tables as Record<string, unknown>[]) {
+    box.append(el("div", { class: "tr-schema" },
+      el("b", null, String(t.name)),
+      el("span", { class: "tr-conf" }, ` ~${Number(t.approx_rows ?? 0).toLocaleString()} · `),
+      el("span", { class: "tr-cols" }, (t.columns as string[] ?? []).join(", ")),
+      ...((t.foreign_keys as string[] ?? []).map((fk) =>
+        el("div", { class: "tr-join tr-fk" }, `↳ ${fk}`)))));
+  }
+  return box;
+}
+
 function renderChatRail(): void {
   const rail = document.getElementById("chatrail") as HTMLElement;
   rail.replaceChildren();
@@ -1708,7 +1823,7 @@ function renderChatRail(): void {
       ? `sql · ${((t.args as { query?: string }).query ?? "").slice(0, 60)}`
       : t.tool;
     d.append(el("summary", null, el("span", { class: "chip" }, t.tool), label));
-    d.append(el("div", { class: "tool-body" }, JSON.stringify(t.result, null, 2)));
+    d.append(toolResult(t.tool, t.result, t.args as Record<string, unknown>));
     return d;
   }
 

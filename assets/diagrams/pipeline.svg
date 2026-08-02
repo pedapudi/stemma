@@ -29,16 +29,26 @@
   <text x="40" y="42" class="t">stemma — resolution pipeline</text>
   <text x="40" y="62" class="s m">crates/stemma-resolve · one call = one Trace · every stage keeps its rejects</text>
   <g>
-    <rect x="700" y="28" width="24" height="14" rx="4" class="box designed" stroke-width="1.2"/>
-    <text x="734" y="39" class="s m">designed, not built</text>
-    <path d="M900 35 H926" class="fedge"/>
-    <text x="936" y="39" class="s m">store table read</text>
+    <path d="M700 35 H726" class="fedge"/>
+    <text x="736" y="39" class="s m">store table read</text>
   </g>
 
   <!-- query_log side note -->
-  <text x="1250" y="106" class="s f">server appends query_log after</text>
-  <text x="1250" y="118" class="s f">each resolve (q · mentions · ms)</text>
-  <path d="M1516 152 V126 H1430" class="fedge"/>
+  <text x="1444" y="100" class="s f">server appends query_log</text>
+  <text x="1444" y="112" class="s f">(q · mentions · ms · source)</text>
+  <path d="M1516 152 V120" class="fedge"/>
+
+  <!-- 6b collective disambiguation -->
+  <rect x="1082" y="40" width="250" height="110" rx="7" class="box"/>
+  <text x="1094" y="62" class="bt">collective disambiguation</text>
+  <text x="1094" y="80" class="s m">provisional mentions &#8804;4 &#215; top 4:</text>
+  <text x="1094" y="92" class="s m">joint tuple scoring</text>
+  <text x="1094" y="106" class="s m">fk paths &#8804;2 hops (kg_edges) +</text>
+  <text x="1094" y="118" class="s m">LIMIT-1 instance probes (src)</text>
+  <text x="1094" y="132" class="s m">verified pair +0.15 · cap 0.9 ·</text>
+  <text x="1094" y="144" class="s m">evidence: Candidate.coherence</text>
+  <path d="M1162 164 V152" class="edge" marker-end="url(#a)"/>
+  <path d="M1332 96 H1358 V154" class="edge" marker-end="url(#a)"/>
 
   <!-- query in -->
   <text x="40" y="222" class="n m">query</text>
@@ -134,17 +144,17 @@
   <text x="1290" y="286" class="s m">below_threshold</text>
   <path d="M1438 232 H1454" class="edge" marker-end="url(#a)"/>
 
-  <!-- 8 adjudication band (designed) -->
-  <rect x="1178" y="420" width="260" height="118" rx="7" class="box designed"/>
+  <!-- 8 adjudication band -->
+  <rect x="1178" y="420" width="260" height="118" rx="7" class="box"/>
   <text x="1190" y="442" class="bt">lm adjudication band</text>
-  <text x="1364" y="442" class="s m">designed</text>
-  <text x="1190" y="462" class="s m">ambiguous band only · lm selects</text>
-  <text x="1190" y="474" class="s m">among k presented candidates</text>
-  <text x="1190" y="492" class="s m">choice or explicit NIL · decision</text>
-  <text x="1190" y="504" class="s m">recorded as Adjudication evidence</text>
-  <text x="1190" y="522" class="s m">gate: allow_lm (accepted, ignored)</text>
-  <path d="M1330 310 V414" class="edge designed" marker-end="url(#a)"/>
-  <path d="M1438 470 H1516 V330" class="edge designed" marker-end="url(#a)"/>
+  <text x="1364" y="442" class="s m">stemma-lm</text>
+  <text x="1190" y="462" class="s m">ambiguous only: top-2 gap &lt; 0.08,</text>
+  <text x="1190" y="474" class="s m">no exact winner &#183; select among k</text>
+  <text x="1190" y="492" class="s m">choice &#8594; reorder, adjudicated=true</text>
+  <text x="1190" y="504" class="s m">explicit NIL &#8594; span demoted weak</text>
+  <text x="1190" y="522" class="s m">gate: allow_lm &#183; lm down &#8594; no-op</text>
+  <path d="M1330 310 V414" class="edge" marker-end="url(#a)"/>
+  <path d="M1438 470 H1516 V330" class="edge" marker-end="url(#a)"/>
 
   <!-- 9 trace out -->
   <rect x="1460" y="158" width="112" height="166" rx="7" class="box"/>

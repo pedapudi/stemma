@@ -1,8 +1,7 @@
 # stemma — architecture, visually
 
 Four hand-drawn diagrams and the walk through them. Every box and arrow here
-is checked against the code as it stands; the one thing that is designed but
-not built — the LM adjudication band — is drawn dashed and tagged `designed`.
+is checked against the code as it stands.
 The prose companion is [architecture.md](architecture.md) and the deep
 reference is [docs/design/](design/README.md).
 
@@ -54,10 +53,13 @@ standalone via `adk run agents/stemma_agent`. The model is anything
 OpenAI-compatible, reached through LiteLLM.
 
 **model endpoints** are external and both optional. The embedding endpoint
-speaks `/v1/embeddings` and enables the dense channel — absent or down,
-resolution degrades to lexical + kg and keeps answering. The LM endpoint
-speaks `/v1/chat/completions` and powers only the chat view — without it the
-console serves everything except `/api/db/{name}/chat`, which answers 503.
+speaks `/v1/embeddings` and enables the dense channel — the server uses it
+both per query (≤1 batched call) and for the startup queue drain; absent or
+down, resolution degrades to lexical + kg and keeps answering. The LM
+endpoint speaks `/v1/chat/completions` and serves two callers: the console's
+chat view (via LiteLLM) and the server's adjudication band — without it the
+console answers 503 on `/api/db/{name}/chat` and resolution simply ships
+unadjudicated traces.
 
 **files.** `user.db` is the user's stock SQLite database; every process that
 opens it does so read-only, and stemma never writes it. `user.stemmadb` is
@@ -66,8 +68,9 @@ the one deployment file: the server reads `databases` + `server.*`, the
 console and MCP server read their own sections of the same file, flags
 override, and configuration never comes from environment variables.
 
-**degradation summary:** embedder down → lexical-only resolution;
-LM down → no chat, everything else intact; stemma-server down → the console
+**degradation summary:** embedder down → lexical+kg resolution, queue items
+stay pending; LM down → no chat and unadjudicated traces, everything else
+intact; stemma-server down → the console
 still browses, runs SQL and shows history (direct file reads) but
 `/api/db/{name}/resolve` answers 502.
 
@@ -123,18 +126,26 @@ up in `kg_edges`, each is probed against the candidate's `lex_fts` row, and
 matches add +0.04 each, capped at 0.9 — a tiebreaker that appears in the
 trace as the `kg` channel, never a retrieval signal.
 
+**collective disambiguation** runs before selection: the provisional
+mention set (strongest 4, top 4 candidates each) is scored jointly. A pair
+of candidates whose tables connect through fk/inferred-fk edges (≤2 hops,
+via `stemma_kg::table_paths`) is verified with a `LIMIT 1` probe against
+the read-only source database; the winning tuple's verified candidates get
++0.15 (capped at 0.9) and carry the path as `Candidate.coherence` — how
+"Chen" becomes *the* Chen who leads the team you also mentioned.
+
 **greedy selection** lets the strongest spans claim non-overlapping byte
 ranges; within a winning span the top 5 candidates at or above 0.35 are
 selected. Everything that lost stays in the trace with its reason:
 `overlapped`, `weak`, `below_threshold`, `outranked`, `span_not_selected`.
 
-**the LM adjudication band is designed, not built** — drawn dashed. The
-design (see [design/05-encoders-decoders.md](design/05-encoders-decoders.md))
-has the LM select among k presented candidates on the ambiguous band only,
-with an explicit NIL choice, recorded as `Adjudication` evidence.
-`ResolveOptions.allow_lm` already exists on the wire and is accepted and
-ignored; `crates/stemma-lm` is a stub. Today every resolution is the pure
-lexical/dense/kg pipeline.
+**the LM adjudication band** (`crates/stemma-lm`) runs after selection, on
+the ambiguous band only: top-two gap under `ADJUDICATION_MARGIN = 0.08` and
+no exact winner. The LM selects among the presented candidates or answers
+an explicit NIL — a choice reorders (marked `adjudicated`), a NIL demotes
+the span to `weak`. It is gated per request by `ResolveOptions.allow_lm`,
+and an absent or failing LM is a no-op: the trace is exactly what fusion
+produced.
 
 **out** comes a `Trace`: `Resolve` serializes only the selected mentions,
 `Explain` the entire trajectory. The server then appends `query_log`
@@ -146,7 +157,7 @@ lexical/dense/kg pipeline.
 
 ![the .stemmadb store](../assets/diagrams/store.svg)
 
-One SQLite file (WAL mode, `PRAGMA user_version = 3`) holds everything
+One SQLite file (WAL mode, `PRAGMA user_version = 4`) holds everything
 stemma derives; the user database is attached read-only as `src` and is
 never written. Groups, with their writers:
 
@@ -177,9 +188,13 @@ server — the extension-bearing process — creates the `vec0` table
 `vec_dense`, moves the vectors in, records the model identity in
 `model_registry` (one model per vector table; a model change is a blue-green
 swap, never a silent mix of vector spaces), and drops the staging table.
-Mixed model identities in staging are a hard error. `embed_queue` is
-declared in the schema for rows awaiting (re-)embedding, but nothing writes
-or drains it yet — the async drain worker is designed, not built.
+Mixed model identities in staging are a hard error. `embed_queue` holds
+documents awaiting embedding (status, attempts ≤3, error note): at startup
+the server enqueues every document lacking a vector and a background task
+per database drains the queue through the embedder in batches of 32 —
+serving is never blocked, and resolution gets denser as the drain runs. A
+registry row bound to a different model refuses the whole batch rather
+than mixing vector spaces.
 
 **operational history** — the store is also working memory. `query_log` is
 written by the resolution server after every resolve, tagged with `source`

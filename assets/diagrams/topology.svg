@@ -83,7 +83,7 @@
   <rect x="738" y="236" width="254" height="56" rx="5" class="sub"/>
   <text x="750" y="254" class="n">startup, per registered db:</text>
   <text x="750" y="272" class="s m">lexical ingest · kg compile ·</text>
-  <text x="750" y="284" class="s m">dense promote (vec_staging)</text>
+  <text x="750" y="284" class="s m">dense promote · embed-queue drain</text>
   <text x="750" y="318" class="s m">per resolve: query_log write</text>
   <text x="750" y="334" class="s m">(source · session · elapsed_ms)</text>
 
@@ -98,8 +98,8 @@
   <rect x="1150" y="250" width="230" height="90" rx="8" class="box"/>
   <text x="1166" y="276" class="bt">lm endpoint</text>
   <text x="1166" y="296" class="s m">openai-compat · external</text>
-  <text x="1166" y="310" class="s m">optional: absent &#8594; no chat view</text>
-  <text x="1166" y="328" class="s m">console.lm in config.json</text>
+  <text x="1166" y="310" class="s m">absent &#8594; no chat, no adjudication</text>
+  <text x="1166" y="328" class="s m">console.lm + server.lm in config</text>
 
   <!-- mcp server -->
   <rect x="250" y="450" width="330" height="130" rx="8" class="box"/>
@@ -136,6 +136,12 @@
   <path d="M1010 150 H1150" class="edge" marker-end="url(#a)"/>
   <text x="1080" y="142" class="s m" text-anchor="middle">http /v1/embeddings</text>
   <text x="1080" y="164" class="s f" text-anchor="middle">&#8804;1 batched call / query</text>
+  <text x="1080" y="176" class="s f" text-anchor="middle">+ queue drain, batch 32</text>
+
+  <!-- server -> lm endpoint (adjudication band) -->
+  <path d="M1010 230 H1080 V282 H1144" class="edge" marker-end="url(#a)"/>
+  <text x="1080" y="222" class="s m" text-anchor="middle">http /v1/chat/completions</text>
+  <text x="1080" y="298" class="s f" text-anchor="middle">adjudication · ambiguous band</text>
 
   <!-- agentchat -> lm endpoint -->
   <path d="M580 310 H650 V410 H1265 V346" class="edge" marker-end="url(#a)"/>

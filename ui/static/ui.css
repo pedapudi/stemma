@@ -638,6 +638,33 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .rail-inputgrip:hover i, .rail-inputgrip:active i { background: var(--accent); }
 .rail-inputgrip + .rail-inputrow { border-top: 0; padding-top: 4px; }
 .rail-chatinput { resize: none; min-height: 34px; max-height: 40vh; }
+
+/* ---- structured tool results in the chat rail ---- */
+.tr-box { padding: 6px 2px 2px; font-size: calc(11px * var(--fs)); }
+.tr-sub { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-soft); margin: 8px 0 4px; }
+.tr-sub:first-child { margin-top: 0; }
+.tr-note { font-family: var(--mono); font-size: calc(10px * var(--fs)); color: var(--ink-soft); margin-top: 6px; }
+.tr-scroll { overflow-x: auto; }
+.tr-table { border-collapse: collapse; font-family: var(--mono); font-size: calc(10.5px * var(--fs)); width: max-content; max-width: none; }
+.tr-table th { text-align: left; font-weight: 700; color: var(--ink-soft); border-bottom: 1px solid var(--rule); padding: 2px 10px 3px 0; white-space: nowrap; }
+.tr-table td { border-bottom: 1px solid color-mix(in srgb, var(--rule) 45%, transparent); padding: 2px 10px 2px 0; vertical-align: top; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tr-table .num { text-align: right; padding-right: 14px; font-variant-numeric: tabular-nums; }
+.tr-table tr:last-child td { border-bottom: none; }
+.tr-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.tr-tbl i { font-style: normal; color: var(--ink-soft); }
+.tr-terms { display: flex; flex-wrap: wrap; gap: 3px 8px; align-items: baseline; }
+.tr-term { font-family: var(--mono); color: var(--ink); }
+.tr-t0 { font-size: calc(13px * var(--fs)); font-weight: 700; color: var(--accent); }
+.tr-t1 { font-size: calc(11px * var(--fs)); }
+.tr-t2 { font-size: calc(9.5px * var(--fs)); color: var(--ink-soft); }
+.tr-join { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); margin: 2px 0; }
+.tr-join b { font-weight: 700; }
+.tr-arrow { color: var(--ink-soft); }
+.tr-conf { color: var(--ink-soft); font-size: calc(9.5px * var(--fs)); }
+.tr-schema { margin: 4px 0; font-size: calc(11px * var(--fs)); }
+.tr-schema b { font-family: var(--mono); }
+.tr-cols { color: var(--ink-soft); font-family: var(--mono); font-size: calc(10px * var(--fs)); }
+.tr-fk { margin-left: 10px; color: var(--ink-soft); }
 .chatrail .chat-msg { margin: 8px 0; }
 .chatrail .chat-tool { margin: 4px 0 4px 10px; }
 .chatrail .tool-body { max-height: 160px; }

@@ -30,16 +30,12 @@
 
   <text x="40" y="46" class="t">stemma — the .stemmadb store</text>
   <text x="40" y="66" class="s m">every derived artifact in one sidecar sqlite file · the user database is never written</text>
-  <g>
-    <rect x="950" y="34" width="24" height="14" rx="4" class="grp designed"/>
-    <text x="984" y="45" class="s m">designed, not built</text>
-  </g>
 
   <!-- the store container -->
   <rect x="320" y="110" width="820" height="660" rx="10" class="box"/>
   <text x="344" y="140" class="bt">user.stemmadb</text>
   <circle cx="452" cy="135" r="3.2" class="dot"/>
-  <text x="472" y="140" class="s m">sqlite · journal_mode=wal · PRAGMA user_version = 3</text>
+  <text x="472" y="140" class="s m">sqlite · journal_mode=wal · PRAGMA user_version = 4</text>
 
   <!-- lexical group -->
   <rect x="350" y="164" width="370" height="266" rx="8" class="grp"/>
@@ -91,9 +87,7 @@
   <text x="376" y="648" class="s m">backend · model · dim · blue-green, no mixing</text>
   <rect x="364" y="666" width="342" height="48" rx="5" class="sub"/>
   <text x="376" y="684" class="n">embed_queue</text>
-  <text x="376" y="700" class="s m">rows awaiting (re-)embedding</text>
-  <rect x="596" y="676" width="98" height="20" rx="4" class="sub designed"/>
-  <text x="606" y="690" class="s m">drain: designed</text>
+  <text x="376" y="700" class="s m">status · attempts&#8804;3 · drained by a server task, batch 32</text>
 
   <!-- operational group -->
   <rect x="750" y="460" width="360" height="186" rx="8" class="grp"/>
