@@ -1,7 +1,7 @@
 {
   "databases": {
     "legal": "eval/legal/data/legal.db",
-    "mini": "/tmp/mini.db"
+    "mini": "eval/mini/data/mini.db"
   },
   "server": {
     "listen": "127.0.0.1:50051",

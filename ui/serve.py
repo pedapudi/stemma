@@ -2,7 +2,7 @@
 """Launches the stemma console.
 
     python ui/serve.py --config config.json
-    python ui/serve.py --db mini=/tmp/mini.db --grpc 127.0.0.1:50051
+    python ui/serve.py --db mini=eval/mini/data/mini.db --grpc 127.0.0.1:50051
 
 Configuration comes from the config file and command-line flags only
 (flags override the file) — never from environment variables. With no

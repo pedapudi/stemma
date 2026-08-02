@@ -12,7 +12,7 @@ Entirely optional: a separate process; nothing in the core depends on it.
 
 ```sh
 pip install -r ui/requirements.txt -e clients/python
-python ui/serve.py --db mini=/tmp/mini.db --grpc 127.0.0.1:50051
+python ui/serve.py --db mini=eval/mini/data/mini.db --grpc 127.0.0.1:50051
 # → http://127.0.0.1:8600
 ```
 

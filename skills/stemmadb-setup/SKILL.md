@@ -50,9 +50,10 @@ derived state goes in the sidecar automatically. For a quick corpus, use the
 bundled test data:
 
 ```sh
+mkdir -p eval/mini/data
 python3 -c "
 import sqlite3
-c = sqlite3.connect('/tmp/mini.db')
+c = sqlite3.connect('eval/mini/data/mini.db')
 c.executescript(open('eval/testdata/mini.sql').read())
 c.close()"
 ```
@@ -65,7 +66,7 @@ For real data, follow the `stemmadb-corpus` skill.
 bazel build //crates/stemma-server
 ./bazel-bin/crates/stemma-server/stemma-server \
   --listen 127.0.0.1:50051 \
-  --db mini=/tmp/mini.db &
+  --db mini=eval/mini/data/mini.db &
 ```
 
 Verify from the logs (both lines must appear):

@@ -26,9 +26,10 @@ The bundled mini corpus covers every mention class from the README — the
 alias — in six small tables:
 
 ```sh
+mkdir -p eval/mini/data
 python3 - <<'EOF'
 import sqlite3
-conn = sqlite3.connect('/tmp/mini.db')
+conn = sqlite3.connect('eval/mini/data/mini.db')
 conn.executescript(open('eval/testdata/mini.sql').read())
 conn.close()
 print("mini.db built")
@@ -39,16 +40,16 @@ EOF
 
 ```sh
 bazel build //crates/stemma-server
-./bazel-bin/crates/stemma-server/stemma-server --db mini=/tmp/mini.db
+./bazel-bin/crates/stemma-server/stemma-server --db mini=eval/mini/data/mini.db
 ```
 
 ```
-INFO stemma_server: database registered name="mini" user_db=/tmp/mini.db
-     store=/tmp/mini.stemmadb vec="v0.1.6"
+INFO stemma_server: database registered name="mini" user_db=eval/mini/data/mini.db
+     store=eval/mini/data/mini.stemmadb vec="v0.1.6"
 INFO stemma_server: stemma-server starting listen=127.0.0.1:50051
 ```
 
-Two things happened before serving: `/tmp/mini.stemmadb` was created (the
+Two things happened before serving: `eval/mini/data/mini.stemmadb` was created (the
 sidecar store, with its versioned bookkeeping schema), and `vec="v0.1.6"`
 confirmed the vector extension is live in-process.
 
@@ -93,7 +94,7 @@ with `LexicalMatch` evidence — that exact case is the acceptance test.
 The sidecar is a normal SQLite database — inspect it like one:
 
 ```sh
-sqlite3 /tmp/mini.stemmadb "PRAGMA user_version; .tables"
+sqlite3 eval/mini/data/mini.stemmadb "PRAGMA user_version; .tables"
 ```
 
 ```
@@ -115,7 +116,7 @@ With the [CA Code of Regulations corpus built](user-guide/04-corpora.md)
 
 ```sh
 ./bazel-bin/crates/stemma-server/stemma-server \
-  --db mini=/tmp/mini.db \
+  --db mini=eval/mini/data/mini.db \
   --db careg=eval/careg/data/careg.db
 ```
 

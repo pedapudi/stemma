@@ -10,3 +10,4 @@ __pycache__/
 *.egg-info/
 /eval/ecfr/data/
 /eval/legal/data/
+/eval/mini/data/
