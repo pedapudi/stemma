@@ -1177,6 +1177,8 @@ function setChatRail(open: boolean): void {
   const rail = document.getElementById("chatrail") as HTMLElement;
   const grid = document.getElementById("bodygrid") as HTMLElement;
   const btn = document.getElementById("chattoggle") as HTMLButtonElement;
+  const savedW = localStorage.getItem("stemma.railw");
+  if (savedW) grid.style.setProperty("--railw", savedW);
   rail.hidden = !open;
   grid.classList.toggle("chat-open", open);
   btn.classList.toggle("accent", open);
@@ -1187,6 +1189,27 @@ function setChatRail(open: boolean): void {
 function renderChatRail(): void {
   const rail = document.getElementById("chatrail") as HTMLElement;
   rail.replaceChildren();
+
+  // the rail's left edge is draggable — the pill is the affordance
+  const widthGrip = el("div", { class: "rail-resize", title: "drag to resize" }, el("i"));
+  widthGrip.addEventListener("pointerdown", (down: PointerEvent) => {
+    down.preventDefault();
+    widthGrip.setPointerCapture(down.pointerId);
+    const grid = document.getElementById("bodygrid") as HTMLElement;
+    const move = (e: PointerEvent) => {
+      const w = Math.round(Math.min(
+        720, Math.max(300, document.documentElement.clientWidth - e.clientX)));
+      grid.style.setProperty("--railw", `${w}px`);
+    };
+    widthGrip.addEventListener("pointermove", move);
+    widthGrip.addEventListener("pointerup", () => {
+      widthGrip.removeEventListener("pointermove", move);
+      localStorage.setItem("stemma.railw",
+        grid.style.getPropertyValue("--railw") || "380px");
+    }, { once: true });
+  });
+  rail.append(widthGrip);
+
   const db = state.db as string;
   const conv = activeConv(db);
   const key = `${db}:${conv}`;
@@ -1255,15 +1278,42 @@ function renderChatRail(): void {
   const log = chatLog.get(key) as ChatMsg[];
 
   const transcript = el("div", { class: "rail-transcript" });
-  const input = el("input", {
-    class: "input",
+  const input = el("textarea", {
+    class: "input rail-chatinput",
+    rows: "1",
     placeholder: `ask ${db} anything…`,
     onkeydown: (e: Event) => {
-      if ((e as KeyboardEvent).key === "Enter") send();
+      const k = e as KeyboardEvent;
+      if (k.key === "Enter" && !k.shiftKey) {
+        k.preventDefault();
+        send();
+      }
     },
   });
+  const savedH = localStorage.getItem("stemma.chatinputh");
+  if (savedH) input.style.height = savedH;
   const sendBtn = el("button", { class: "btn accent", onclick: () => send() }, "send");
-  rail.append(transcript, el("div", { class: "rail-inputrow" }, input, sendBtn));
+
+  // the input row's top edge is draggable — taller box for longer questions
+  const heightGrip = el("div", { class: "rail-inputgrip", title: "drag to resize" }, el("i"));
+  heightGrip.addEventListener("pointerdown", (down: PointerEvent) => {
+    down.preventDefault();
+    heightGrip.setPointerCapture(down.pointerId);
+    const bottom = input.getBoundingClientRect().bottom;
+    const move = (e: PointerEvent) => {
+      const h = Math.round(Math.min(
+        window.innerHeight * 0.4, Math.max(34, bottom - e.clientY)));
+      input.style.height = `${h}px`;
+    };
+    heightGrip.addEventListener("pointermove", move);
+    heightGrip.addEventListener("pointerup", () => {
+      heightGrip.removeEventListener("pointermove", move);
+      localStorage.setItem("stemma.chatinputh", input.style.height);
+    }, { once: true });
+  });
+
+  rail.append(transcript, heightGrip,
+    el("div", { class: "rail-inputrow" }, input, sendBtn));
   redraw();
 
   function redraw(): void {

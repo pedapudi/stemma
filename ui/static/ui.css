@@ -422,7 +422,7 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 
 /* ============ chrome: body split ============ */
 .body { display: grid; grid-template-columns: 264px minmax(0, 1fr); min-height: calc(100vh - 50px); }
-.body.chat-open { grid-template-columns: 264px minmax(0, 1fr) 380px; }
+.body.chat-open { grid-template-columns: 264px minmax(0, 1fr) var(--railw, 380px); }
 .sidebar {
   position: sticky; top: 50px; align-self: start;
   height: calc(100vh - 50px); overflow-y: auto;
@@ -614,6 +614,30 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .chatrail .rail-transcript { flex: 1; overflow-y: auto; padding: 10px 14px; }
 .chatrail .rail-inputrow { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--rule); }
 .chatrail .rail-inputrow .input { flex: 1; font-family: var(--sans); }
+
+/* drag affordances: hairline handles, a pill as the grip, accent when engaged */
+.rail-resize {
+  position: absolute; left: -6px; top: 0; bottom: 0; width: 12px;
+  cursor: col-resize; display: flex; align-items: center; justify-content: center;
+  touch-action: none; z-index: 5;
+}
+.rail-resize i {
+  width: 4px; height: 44px; border-radius: 999px;
+  background: var(--rule); transition: background .15s;
+}
+.rail-resize:hover i, .rail-resize:active i { background: var(--accent); }
+.rail-inputgrip {
+  display: flex; align-items: center; justify-content: center;
+  height: 12px; cursor: row-resize; touch-action: none;
+  border-top: 1px solid var(--rule);
+}
+.rail-inputgrip i {
+  width: 44px; height: 4px; border-radius: 999px;
+  background: var(--rule); transition: background .15s;
+}
+.rail-inputgrip:hover i, .rail-inputgrip:active i { background: var(--accent); }
+.rail-inputgrip + .rail-inputrow { border-top: 0; padding-top: 4px; }
+.rail-chatinput { resize: none; min-height: 34px; max-height: 40vh; }
 .chatrail .chat-msg { margin: 8px 0; }
 .chatrail .chat-tool { margin: 4px 0 4px 10px; }
 .chatrail .tool-body { max-height: 160px; }
