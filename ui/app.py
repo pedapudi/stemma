@@ -127,7 +127,7 @@ def create_app(
     def resolve(name: str, q: str):
         browser(name)  # 404 on unknown db before touching gRPC
         try:
-            return client.explain_dict(q, database=name, source="console")
+            return client.explain_dict(q, database=name, source="console", allow_lm=True)
         except grpc.RpcError as e:
             raise HTTPException(502, f"stemma-server: {e.code().name}: {e.details()}") from e
 

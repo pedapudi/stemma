@@ -33,38 +33,46 @@ class StemmaClient:
         self._channel.close()
 
     def _request(
-        self, query: str, database: str, source: str = "", session: str = ""
+        self, query: str, database: str, source: str = "", session: str = "",
+        allow_lm: bool = False,
     ) -> resolve_pb2.ResolveRequest:
         options = None
-        if source or session:
-            options = resolve_pb2.ResolveOptions(source=source, session=session)
+        if source or session or allow_lm:
+            options = resolve_pb2.ResolveOptions(
+                source=source, session=session, allow_lm=allow_lm)
         return resolve_pb2.ResolveRequest(query=query, database=database, options=options)
 
     def resolve(
-        self, query: str, database: str, source: str = "", session: str = ""
+        self, query: str, database: str, source: str = "", session: str = "",
+        allow_lm: bool = False,
     ) -> resolve_pb2.ResolveResponse:
         """Selected mentions with their candidates and evidence. `source` and
-        `session` tag the store's query history."""
+        `session` tag the store's query history; `allow_lm` permits the
+        adjudication band for this request."""
         return self._stub.Resolve(
-            self._request(query, database, source, session), timeout=self._timeout
+            self._request(query, database, source, session, allow_lm),
+            timeout=self._timeout,
         )
 
     def explain(
-        self, query: str, database: str, source: str = "", session: str = ""
+        self, query: str, database: str, source: str = "", session: str = "",
+        allow_lm: bool = False,
     ) -> resolve_pb2.ExplainResponse:
         """The full resolution trajectory, near-misses included."""
         return self._stub.Explain(
-            self._request(query, database, source, session), timeout=self._timeout
+            self._request(query, database, source, session, allow_lm),
+            timeout=self._timeout,
         )
 
     def explain_dict(
-        self, query: str, database: str, source: str = "", session: str = ""
+        self, query: str, database: str, source: str = "", session: str = "",
+        allow_lm: bool = False,
     ) -> dict[str, Any]:
         """explain() as a plain dict (JSON-ready), preserving zero fields."""
         from google.protobuf.json_format import MessageToDict
 
         return MessageToDict(
-            self.explain(query, database, source, session),
+            self.explain(query, database, source, session, allow_lm),
             preserving_proto_field_name=True,
             always_print_fields_with_no_presence=True,
         )
