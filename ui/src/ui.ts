@@ -807,6 +807,17 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
   hideHover();
   const mentionSpans = trace.mentions.map((i) => trace.spans[i]);
 
+  /* one stable hue per source table, shared by every view in this
+   * trajectory (dots, lanes, lattice fills, mention chips). --accent is
+   * reserved for "selected", so tables draw from the rest of the palette. */
+  const TABLE_HUES = [
+    "var(--caution)", "var(--brand-accent)", "var(--bad)", "var(--good)", "var(--flat)",
+  ];
+  const tablesSeen = [...new Set(
+    trace.spans.flatMap((s) => s.candidates.map((c) => c.table)))].sort();
+  const hueOf = (t: string) =>
+    TABLE_HUES[tablesSeen.indexOf(t) % TABLE_HUES.length];
+
   /* the lineage: the query line above, the substituted form below — every
    * mention replaced by the entity it resolves to — with wires tying each
    * (sub)string to its replacement. */
@@ -843,6 +854,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       chip = el("button", {
         class: "sub-chip",
         title: `${top.table}.${top.column} #${top.rowid}`,
+        style: `--th:${hueOf(top.table)}`,
         onclick: (e: Event) => {
           e.stopPropagation();
           showCard(sp, top);
@@ -1003,7 +1015,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       const jitter = ((i % 5) - 2) * 5;
       const dot = el("span", {
         class: cls,
-        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`,
+        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px; --th:${hueOf(c.table)}`,
         onclick: (e: Event) => {
           e.stopPropagation();
           showCard(sp, c);
@@ -1136,7 +1148,14 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       }, m);
       modeBtns.set(m, b);
       return b;
-    }));
+    }),
+    // when more than one table answered, its hue is the shared legend
+    ...(tablesSeen.length > 1
+      ? [el("span", { class: "spacer", style: "max-width:18px" }),
+        ...tablesSeen.map((t) =>
+          el("span", { class: "tbl-key mono" },
+            el("i", { style: `background:${hueOf(t)}` }), t))]
+      : []));
 
   function setMode(m: string): void {
     mode = m;
@@ -1205,7 +1224,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
           class: cls,
           style: `left:${b2c(sp.start)}ch; width:${Math.max(1, b2c(sp.end) - b2c(sp.start))}ch; top:${lanes[k] * 13}px;` +
             (top && sp.status !== "skipped"
-              ? `--w:${Math.round(Math.min(1, top.score) * 100)}%` : ""),
+              ? `--w:${Math.round(Math.min(1, top.score) * 100)}%; --th:${hueOf(top.table)}` : ""),
           onclick: top ? () => showCard(sp, top) : null,
         });
         if (top) bar.append(el("i", { class: "lat-fill" }));
@@ -1271,13 +1290,22 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       return box;
     }
     const s = stages(sp, w);
+    // the deciding mechanism colors the card's spine: exact = good,
+    // semantic floor = the dense hue, plain lexical = flat
+    const mechHue = s.hasExact
+      ? "var(--good)"
+      : s.calibrated > s.branch + 0.005
+        ? "color-mix(in srgb, var(--brand-accent) 60%, var(--ink))"
+        : "var(--flat)";
+    box.style.borderLeft = `3px solid ${mechHue}`;
     const meter = el("span", { class: "why-meter" },
       el("i", { style: `width:${Math.round(Math.min(1, w.score) * 100)}%` }));
     const head = el("div", { class: "why-head" },
       el("span", { class: "sf-mention" }, sp.text),
       el("span", { class: "why-arrow" }, "→"),
       el("button", {
-        class: "why-ref mono", onclick: () => showCard(sp, w),
+        class: "why-ref mono", style: `color:${hueOf(w.table)}`,
+        onclick: () => showCard(sp, w),
       }, `${w.table}.${w.column} #${w.rowid}`),
       meter,
       el("span", { class: "why-score mono" }, w.score.toFixed(2)));
@@ -1325,7 +1353,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
         el("span", { class: "why-soft" }, "— verified in the data, +0.15")));
     }
     if (w.adjudicated) {
-      mech.push(el("div", { class: "why-line" },
+      mech.push(el("div", { class: "why-line why-adj" },
         el("span", { class: "why-k" }, "adjudicated"),
         el("span", null, "⚖ the lm chose this among near-ties (gap < 0.08)")));
     }
@@ -1422,7 +1450,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
         placed.push(x);
         const dot = el("button", {
           class: "spec-dot" + (h.c.selected ? " sel" : ""),
-          style: `left:${x}%; top:${8 + Math.min(row, 3) * 9}px`,
+          style: `left:${x}%; top:${8 + Math.min(row, 3) * 9}px; --th:${hueOf(h.c.table)}`,
         });
         hov(dot,
           `<div class="hc-head"><span class="hc-ref">for “${esc(h.sp.text)}”</span>` +
@@ -1436,7 +1464,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
       const bestMine = mine[0];
       spec.append(el("div", { class: "spec-row" },
         el("span", { class: "spec-lab" },
-          el("b", null, t),
+          el("b", { style: `color:${hueOf(t)}` }, t),
           el("i", null, `${mine.length} · best ${bestMine.cos.toFixed(2)}`)),
         lane));
     }

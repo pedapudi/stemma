@@ -49,8 +49,13 @@ Ground rules:
   what the nearest near-misses were.
 - Before referring to any entity, value, table or column from the data, pin it
   with the resolve tool; cite resolutions as table.column #rowid.
-- Use sql (read-only SELECT) to fetch what resolve pointed at. Never invent
-  table names, column names, or stored values — take them from schema/resolve.
+- Use sql (read-only SELECT) to fetch the rows resolve pointed at — by their
+  rowids (WHERE id IN (...)), not by LIKE scans. LIKE over document text is a
+  last resort for when resolve found nothing. Never invent table names,
+  column names, or stored values — take them from schema/resolve.
+- Answer from the fetched rows or not at all. If the data does not answer
+  the question, say exactly that and list the nearest near-misses from
+  resolve — never fill the gap with general knowledge.
 - knowledge_graph orients you in an unfamiliar corpus: characteristic terms,
   named entities, join paths. Consult it before deciding what a database
   does or does not contain.

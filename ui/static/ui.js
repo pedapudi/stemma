@@ -932,6 +932,17 @@ function renderTrace(out, trace) {
   out.replaceChildren();
   hideHover();
   const mentionSpans = trace.mentions.map((i) => trace.spans[i]);
+  const TABLE_HUES = [
+    "var(--caution)",
+    "var(--brand-accent)",
+    "var(--bad)",
+    "var(--good)",
+    "var(--flat)"
+  ];
+  const tablesSeen = [
+    ...new Set(trace.spans.flatMap((s) => s.candidates.map((c) => c.table)))
+  ].sort();
+  const hueOf = (t) => TABLE_HUES[tablesSeen.indexOf(t) % TABLE_HUES.length];
   const qline = el("div", {
     class: "qline"
   });
@@ -968,6 +979,7 @@ function renderTrace(out, trace) {
       chip = el("button", {
         class: "sub-chip",
         title: `${top.table}.${top.column} #${top.rowid}`,
+        style: `--th:${hueOf(top.table)}`,
         onclick: (e) => {
           e.stopPropagation();
           showCard(sp, top);
@@ -1163,7 +1175,7 @@ function renderTrace(out, trace) {
       const jitter = (i % 5 - 2) * 5;
       const dot = el("span", {
         class: cls,
-        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px`,
+        style: `left:${(c.score * 100).toFixed(1)}%; margin-top:${jitter}px; --th:${hueOf(c.table)}`,
         onclick: (e) => {
           e.stopPropagation();
           showCard(sp, c);
@@ -1324,19 +1336,35 @@ function renderTrace(out, trace) {
   let mode = localStorage.getItem(MODE_KEY) || "field";
   if (!(mode in panels)) mode = "field";
   const modeBtns = /* @__PURE__ */ new Map();
-  const modeBar = el("div", {
-    class: "traj-modes"
-  }, el("span", {
-    class: "sql-caption",
-    style: "margin-right:6px"
-  }, "view:"), ...Object.keys(panels).map((m) => {
-    const b = el("button", {
-      class: "chip" + (m === mode ? " on-chan" : ""),
-      onclick: () => setMode(m)
-    }, m);
-    modeBtns.set(m, b);
-    return b;
-  }));
+  const modeBar = el(
+    "div",
+    {
+      class: "traj-modes"
+    },
+    el("span", {
+      class: "sql-caption",
+      style: "margin-right:6px"
+    }, "view:"),
+    ...Object.keys(panels).map((m) => {
+      const b = el("button", {
+        class: "chip" + (m === mode ? " on-chan" : ""),
+        onclick: () => setMode(m)
+      }, m);
+      modeBtns.set(m, b);
+      return b;
+    }),
+    ...tablesSeen.length > 1 ? [
+      el("span", {
+        class: "spacer",
+        style: "max-width:18px"
+      }),
+      ...tablesSeen.map((t) => el("span", {
+        class: "tbl-key mono"
+      }, el("i", {
+        style: `background:${hueOf(t)}`
+      }), t))
+    ] : []
+  );
   function setMode(m) {
     mode = m;
     localStorage.setItem(MODE_KEY, m);
@@ -1409,7 +1437,7 @@ function renderTrace(out, trace) {
         const cls = "lat-bar lat-" + (isMention ? "won" : sp.status);
         const bar = el("button", {
           class: cls,
-          style: `left:${b2c(sp.start)}ch; width:${Math.max(1, b2c(sp.end) - b2c(sp.start))}ch; top:${lanes[k] * 13}px;` + (top && sp.status !== "skipped" ? `--w:${Math.round(Math.min(1, top.score) * 100)}%` : ""),
+          style: `left:${b2c(sp.start)}ch; width:${Math.max(1, b2c(sp.end) - b2c(sp.start))}ch; top:${lanes[k] * 13}px;` + (top && sp.status !== "skipped" ? `--w:${Math.round(Math.min(1, top.score) * 100)}%; --th:${hueOf(top.table)}` : ""),
           onclick: top ? () => showCard(sp, top) : null
         });
         if (top) bar.append(el("i", {
@@ -1489,6 +1517,8 @@ function renderTrace(out, trace) {
       return box;
     }
     const s = stages(sp, w);
+    const mechHue = s.hasExact ? "var(--good)" : s.calibrated > s.branch + 5e-3 ? "color-mix(in srgb, var(--brand-accent) 60%, var(--ink))" : "var(--flat)";
+    box.style.borderLeft = `3px solid ${mechHue}`;
     const meter = el("span", {
       class: "why-meter"
     }, el("i", {
@@ -1502,6 +1532,7 @@ function renderTrace(out, trace) {
       class: "why-arrow"
     }, "\u2192"), el("button", {
       class: "why-ref mono",
+      style: `color:${hueOf(w.table)}`,
       onclick: () => showCard(sp, w)
     }, `${w.table}.${w.column} #${w.rowid}`), meter, el("span", {
       class: "why-score mono"
@@ -1561,7 +1592,7 @@ function renderTrace(out, trace) {
     }
     if (w.adjudicated) {
       mech.push(el("div", {
-        class: "why-line"
+        class: "why-line why-adj"
       }, el("span", {
         class: "why-k"
       }, "adjudicated"), el("span", null, "\u2696 the lm chose this among near-ties (gap < 0.08)")));
@@ -1691,7 +1722,7 @@ function renderTrace(out, trace) {
         placed.push(x);
         const dot = el("button", {
           class: "spec-dot" + (h.c.selected ? " sel" : ""),
-          style: `left:${x}%; top:${8 + Math.min(row, 3) * 9}px`
+          style: `left:${x}%; top:${8 + Math.min(row, 3) * 9}px; --th:${hueOf(h.c.table)}`
         });
         hov(dot, `<div class="hc-head"><span class="hc-ref">for \u201C${esc(h.sp.text)}\u201D</span><span class="hc-score">cos ${h.cos.toFixed(3)}</span></div>` + hovCandidate(h.c));
         dot.addEventListener("click", (e) => {
@@ -1705,7 +1736,9 @@ function renderTrace(out, trace) {
         class: "spec-row"
       }, el("span", {
         class: "spec-lab"
-      }, el("b", null, t), el("i", null, `${mine.length} \xB7 best ${bestMine.cos.toFixed(2)}`)), lane));
+      }, el("b", {
+        style: `color:${hueOf(t)}`
+      }, t), el("i", null, `${mine.length} \xB7 best ${bestMine.cos.toFixed(2)}`)), lane));
     }
     spec.append(el("div", {
       class: "spec-axis"

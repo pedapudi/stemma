@@ -103,11 +103,20 @@ def build_server(grpc: str, dbs: dict[str, str], session: str = "") -> FastMCP:
     @mcp.tool()
     def sql(query: str, database: str) -> dict[str, Any]:
         """Run a read-only SELECT. Schema `src` is the user database (e.g.
-        src.regulations); `main` is the stemma store. Never write."""
+        src.regulations); `main` is the stemma store. Never write.
+
+        Prefer fetching the rows resolve pointed at (WHERE id IN (...));
+        cells are clipped to 1500 chars, so SELECT the columns you need."""
         result = browser(database).query(query)
+
+        def clip(v: Any) -> Any:
+            if isinstance(v, str) and len(v) > 1500:
+                return v[:1500] + f"… [+{len(v) - 1500} chars]"
+            return v
+
         return {
             "columns": result["columns"],
-            "rows": result["rows"][:12],
+            "rows": [[clip(v) for v in row] for row in result["rows"][:12]],
             "truncated": result.get("truncated", False) or len(result["rows"]) > 12,
         }
 
