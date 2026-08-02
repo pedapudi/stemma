@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 860" width="1180" height="860"
+     class="dg" role="img" aria-label="anatomy of the .stemmadb store">
+  <title>stemma — the .stemmadb store</title>
+  <style>
+    .dg { color:#15181C; }
+    @media (prefers-color-scheme: dark) { .dg { color:#EDEFEA; } }
+    .dg .dot { fill:#2FA46A; }
+    @media (prefers-color-scheme: dark) { .dg .dot { fill:#3FB87A; } }
+    text { font-family:"JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; fill:currentColor; }
+    .t  { font-size:14px; font-weight:700; }
+    .bt { font-size:12px; font-weight:700; }
+    .gt { font-size:11px; font-weight:700; }
+    .n  { font-size:9.5px; }
+    .s  { font-size:8.5px; }
+    .m  { opacity:0.62; }
+    .f  { opacity:0.38; }
+    .box  { fill:none; stroke:currentColor; stroke-width:1.4; stroke-linejoin:round; }
+    .grp  { fill:none; stroke:currentColor; stroke-width:1.2; opacity:0.8; }
+    .sub  { fill:none; stroke:currentColor; stroke-width:1.1; opacity:0.65; }
+    .file { fill:none; stroke:currentColor; stroke-width:1.2; stroke-linejoin:round; }
+    .edge { fill:none; stroke:currentColor; stroke-width:1.2; }
+    .fedge{ fill:none; stroke:currentColor; stroke-width:1.1; opacity:0.4; }
+    .designed { stroke-dasharray:5 4; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+      <path d="M1.5 1 L6.5 4 L1.5 7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="46" class="t">stemma — the .stemmadb store</text>
+  <text x="40" y="66" class="s m">every derived artifact in one sidecar sqlite file · the user database is never written</text>
+  <g>
+    <rect x="950" y="34" width="24" height="14" rx="4" class="grp designed"/>
+    <text x="984" y="45" class="s m">designed, not built</text>
+  </g>
+
+  <!-- the store container -->
+  <rect x="320" y="110" width="820" height="660" rx="10" class="box"/>
+  <text x="344" y="140" class="bt">user.stemmadb</text>
+  <circle cx="452" cy="135" r="3.2" class="dot"/>
+  <text x="472" y="140" class="s m">sqlite · journal_mode=wal · PRAGMA user_version = 3</text>
+
+  <!-- lexical group -->
+  <rect x="350" y="164" width="370" height="266" rx="8" class="grp"/>
+  <text x="364" y="186" class="gt">lexical index</text>
+  <text x="364" y="202" class="s m">writer: stemma-ingest · server startup</text>
+  <rect x="364" y="214" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="232" class="n">lex_values</text>
+  <text x="376" y="248" class="s m">value · value_norm · is_doc = len&#8805;200</text>
+  <rect x="364" y="266" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="284" class="n">lex_fts</text>
+  <text x="376" y="300" class="s m">fts5 content-linked · unicode61 · bm25()</text>
+  <rect x="364" y="318" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="336" class="n">lex_trigram</text>
+  <text x="376" y="352" class="s m">fts5 trigram · substring / fuzzy</text>
+  <rect x="364" y="370" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="388" class="n">lex_vocab</text>
+  <text x="376" y="404" class="s m">fts5vocab · term stats for kg compile</text>
+
+  <!-- knowledge group -->
+  <rect x="750" y="164" width="360" height="266" rx="8" class="grp"/>
+  <text x="764" y="186" class="gt">knowledge graph</text>
+  <text x="764" y="202" class="s m">writer: stemma-kg compile · server startup,</text>
+  <text x="764" y="214" class="s m">incremental — only dirty tables recompile</text>
+  <rect x="764" y="226" width="332" height="52" rx="5" class="sub"/>
+  <text x="776" y="244" class="n">kg_nodes</text>
+  <text x="776" y="258" class="s m">table · column · value · term/phrase</text>
+  <text x="776" y="270" class="s m">props: counts · textrank (d=0.85) · centrality</text>
+  <rect x="764" y="284" width="332" height="64" rx="5" class="sub"/>
+  <text x="776" y="302" class="n">kg_edges</text>
+  <text x="776" y="316" class="s m">has_column · fk · inferred_fk (containment</text>
+  <text x="776" y="328" class="s m">&#8805;0.95) · frequent_value · term · cooccurs</text>
+  <text x="776" y="340" class="s m">props: method (declared/inferred/profiled) · confidence</text>
+  <rect x="764" y="354" width="332" height="46" rx="5" class="sub"/>
+  <text x="776" y="372" class="n">kg_meta</text>
+  <text x="776" y="388" class="s m">content fingerprint per src table</text>
+
+  <!-- dense group -->
+  <rect x="350" y="460" width="370" height="262" rx="8" class="grp"/>
+  <text x="364" y="482" class="gt">dense vectors</text>
+  <text x="364" y="498" class="s m">writers: loaders stage · server promotes</text>
+  <rect x="364" y="510" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="528" class="n">vec_staging</text>
+  <text x="376" y="544" class="s m">plain table · transient, dropped on promote</text>
+  <rect x="364" y="562" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="580" class="n">vec_dense</text>
+  <text x="376" y="596" class="s m">vec0 virtual table · embedding float[dim]</text>
+  <rect x="364" y="614" width="342" height="46" rx="5" class="sub"/>
+  <text x="376" y="632" class="n">model_registry</text>
+  <text x="376" y="648" class="s m">backend · model · dim · blue-green, no mixing</text>
+  <rect x="364" y="666" width="342" height="48" rx="5" class="sub"/>
+  <text x="376" y="684" class="n">embed_queue</text>
+  <text x="376" y="700" class="s m">rows awaiting (re-)embedding</text>
+  <rect x="596" y="676" width="98" height="20" rx="4" class="sub designed"/>
+  <text x="606" y="690" class="s m">drain: designed</text>
+
+  <!-- operational group -->
+  <rect x="750" y="460" width="360" height="186" rx="8" class="grp"/>
+  <text x="764" y="482" class="gt">operational history</text>
+  <text x="764" y="498" class="s m">working memory · queryable like everything else</text>
+  <rect x="764" y="510" width="332" height="52" rx="5" class="sub"/>
+  <text x="776" y="528" class="n">query_log</text>
+  <text x="890" y="528" class="s m">writer: stemma-server, per resolve</text>
+  <text x="776" y="544" class="s m">query · mentions · elapsed_ms · source · session</text>
+  <rect x="764" y="568" width="332" height="52" rx="5" class="sub"/>
+  <text x="776" y="586" class="n">chat_log</text>
+  <text x="890" y="586" class="s m">writer: console (agentchat)</text>
+  <text x="776" y="602" class="s m">conversation · role · content · trail json</text>
+
+  <!-- migrations footer -->
+  <text x="350" y="744" class="s m">migrations: additive, idempotent ddl re-applied on open · non-idempotent ALTERs guarded per version</text>
+  <text x="350" y="758" class="s m">(v2&#8594;v3 added query_log.source/session) · a store from the future is a hard error — re-ingest</text>
+
+  <!-- user.db attach -->
+  <path d="M40 230 L212 230 L230 248 L230 340 L40 340 Z M212 230 L212 248 L230 248" class="file"/>
+  <text x="56" y="258" class="bt">user.db</text>
+  <text x="56" y="278" class="s m">stock sqlite</text>
+  <text x="56" y="292" class="s m">the corpus itself</text>
+  <path d="M230 285 H314" class="edge" marker-end="url(#a)"/>
+  <text x="272" y="265" class="s m" text-anchor="middle">ATTACH AS src</text>
+  <text x="272" y="277" class="s m" text-anchor="middle">mode=ro</text>
+
+  <!-- external loaders -->
+  <rect x="40" y="560" width="200" height="110" rx="8" class="box"/>
+  <text x="56" y="588" class="bt">external loaders</text>
+  <text x="56" y="608" class="s m">eval/legal/load_vectors.py</text>
+  <text x="56" y="622" class="s m">embed documents offline,</text>
+  <text x="56" y="634" class="s m">no sqlite-vec needed</text>
+  <path d="M240 615 H340 V533 H358" class="edge" marker-end="url(#a)"/>
+  <text x="40" y="692" class="s f">writes vec_staging (sqlite rw), then the</text>
+  <text x="40" y="704" class="s f">server promotes into vec_dense on startup</text>
+</svg>

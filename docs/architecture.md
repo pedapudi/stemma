@@ -68,6 +68,9 @@ lifecycle must not be coupled to database lifecycle.
 
 ## Topology
 
+Diagrammed, with the pipeline, store anatomy and chat flow, in
+[architecture-visuals.md](architecture-visuals.md).
+
 ```
                        ┌──────────────────────────────┐
  NL query ──gRPC──►    │  stemma core (Rust, 1 proc)  │
