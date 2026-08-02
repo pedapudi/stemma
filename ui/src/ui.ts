@@ -28,6 +28,11 @@ interface TraceCandidate {
   channels: TraceChannelScore[];
   snippet: string;
   is_doc: boolean;
+  /* the LM adjudication band chose this candidate (reordered to front) */
+  adjudicated?: boolean;
+  /* verified join path to a co-mention's candidate, e.g.
+     "people #2 ←lead_id— teams #43" */
+  coherence?: string;
 }
 
 interface TraceSpan {
@@ -272,6 +277,10 @@ function hovCandidate(c: TraceCandidate): string {
     <div class="hc-meter"><i style="width:${Math.round(c.score * 100)}%"></i></div>
     <div class="hc-snip">${snip}</div>
     <div class="hc-chips">${chips}</div>` +
+    (c.coherence
+      ? `<div class="hc-coh">⬡ ${esc(c.coherence)}</div>` : "") +
+    (c.adjudicated
+      ? '<div class="hc-adj">⚖ adjudicated — the lm chose this among near-ties</div>' : "") +
     (c.selected
       ? '<div class="hc-verdict hc-ok">selected</div>'
       : `<div class="hc-verdict hc-no">${esc((c.reject_reason || "rejected").replace(/_/g, " "))}</div>`) +
@@ -1067,14 +1076,354 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
     alsoBox.append(el("div", { class: "empty" }, "— every considered span became a mention"));
   }
 
+  /* coherence ribbons: mentions whose candidates verified a join path get an
+   * arc below the substituted line, the path as its label — the collective
+   * layer made visible. */
+  const cohPairs: { a: number; b: number; label: string }[] = [];
+  for (let i = 0; i < mentionSpans.length; i++) {
+    for (let j = i + 1; j < mentionSpans.length; j++) {
+      const ca = mentionSpans[i].candidates.find((c) => c.selected && c.coherence);
+      const cb = mentionSpans[j].candidates.find((c) => c.selected && c.coherence);
+      if (ca && cb && ca.coherence === cb.coherence) {
+        cohPairs.push({ a: mentionSpans[i].id, b: mentionSpans[j].id, label: ca.coherence as string });
+      }
+    }
+  }
+  if (cohPairs.length) lineage.classList.add("has-coh");
+
+  function drawCoherence(): void {
+    const box = lineage.getBoundingClientRect();
+    for (const p of cohPairs) {
+      const a = spanChip.get(p.a), b = spanChip.get(p.b);
+      if (!a || !b) continue;
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      const x1 = ra.left - box.left + ra.width / 2, x2 = rb.left - box.left + rb.width / 2;
+      const y = Math.max(ra.bottom, rb.bottom) - box.top + 2;
+      const dip = y + 16;
+      wires.append(svgEl("path", {
+        class: "coh-arc",
+        d: `M ${x1} ${y} C ${x1} ${dip}, ${x2} ${dip}, ${x2} ${y}`,
+      }));
+      const t = svgEl("text", {
+        class: "coh-label",
+        x: (x1 + x2) / 2,
+        y: dip + 12,
+        "text-anchor": "middle",
+      });
+      t.textContent = `⬡ ${p.label}`;
+      wires.append(t);
+    }
+  }
+  requestAnimationFrame(drawCoherence);
+
+  /* ---- the analytical panels: field (score axis), anatomy (span lattice +
+   * score assembly), space (the dense channel's vector neighborhood) ---- */
+  const panels: Record<string, { node: HTMLElement; built: boolean; build: () => void }> = {
+    field: { node: field, built: true, build: () => {} },
+    anatomy: { node: el("div", { class: "anatomy" }), built: false, build: buildAnatomy },
+    space: { node: el("div", { class: "space" }), built: false, build: buildSpace },
+  };
+  const MODE_KEY = "stemma.trajmode";
+  let mode = localStorage.getItem(MODE_KEY) || "field";
+  if (!(mode in panels)) mode = "field";
+  const modeBtns = new Map<string, HTMLElement>();
+  const modeBar = el("div", { class: "traj-modes" },
+    el("span", { class: "sql-caption", style: "margin-right:6px" }, "view:"),
+    ...Object.keys(panels).map((m) => {
+      const b = el("button", {
+        class: "chip" + (m === mode ? " on-chan" : ""),
+        onclick: () => setMode(m),
+      }, m);
+      modeBtns.set(m, b);
+      return b;
+    }));
+
+  function setMode(m: string): void {
+    mode = m;
+    localStorage.setItem(MODE_KEY, m);
+    hideHover();
+    for (const [k, p] of Object.entries(panels)) {
+      if (k === m && !p.built) { p.build(); p.built = true; }
+      p.node.hidden = k !== m;
+      modeBtns.get(k)?.classList.toggle("on-chan", k === m);
+    }
+  }
+
+  /* byte offsets (proto) → char offsets (layout): built once per trace */
+  const b2c = (() => {
+    const m = new Map<number, number>([[0, 0]]);
+    let b = 0;
+    const enc = new TextEncoder();
+    [...trace.query].forEach((ch, i) => {
+      b += enc.encode(ch).length;
+      m.set(b, i + 1);
+    });
+    return (byte: number) => m.get(byte) ?? byte;
+  })();
+
+  /* -- anatomy · the span lattice: every enumerated span as a bar over the
+   * query's character grid, stacked by n-gram width, status made visible —
+   * the segmentation decision at a glance. -- */
+  function buildAnatomy(): void {
+    const host = panels.anatomy.node;
+    const tokensIn = (sp: TraceSpan) =>
+      trace.tokens.filter((t) => t.start >= sp.start && t.end <= sp.end).length;
+
+    host.append(el("div", { class: "subhead" }, "span lattice"),
+      el("div", { class: "sql-caption" },
+        "every span the pipeline enumerated · winners tile the query, the rest lost their range"));
+
+    const lat = el("div", { class: "lattice mono" });
+    lat.append(el("div", { class: "lat-q" }, trace.query));
+
+    const byLen = new Map<number, TraceSpan[]>();
+    for (const sp of trace.spans) {
+      const n = tokensIn(sp);
+      if (!byLen.has(n)) byLen.set(n, []);
+      (byLen.get(n) as TraceSpan[]).push(sp);
+    }
+    const lens = [...byLen.keys()].sort((a, b) => b - a);
+    for (const n of lens) {
+      const spans = (byLen.get(n) as TraceSpan[]).sort((a, b) => a.start - b.start);
+      // greedy lane assignment: same-width n-grams overlap their neighbors
+      const laneEnds: number[] = [];
+      const lanes = spans.map((sp) => {
+        const i = laneEnds.findIndex((e) => e <= sp.start);
+        const lane = i === -1 ? laneEnds.length : i;
+        laneEnds[lane] = sp.end;
+        return lane;
+      });
+      const track = el("div", {
+        class: "lat-track",
+        style: `height:${(Math.max(...lanes) + 1) * 13}px`,
+      });
+      spans.forEach((sp, k) => {
+        const top = sp.candidates[0];
+        const isMention = trace.mentions.includes(sp.id);
+        const cls = "lat-bar lat-" + (isMention ? "won" : sp.status);
+        const bar = el("button", {
+          class: cls,
+          style: `left:${b2c(sp.start)}ch; width:${Math.max(1, b2c(sp.end) - b2c(sp.start))}ch; top:${lanes[k] * 13}px;` +
+            (top && sp.status !== "skipped"
+              ? `--w:${Math.round(Math.min(1, top.score) * 100)}%` : ""),
+          onclick: top ? () => showCard(sp, top) : null,
+        });
+        if (top) bar.append(el("i", { class: "lat-fill" }));
+        hov(bar, top
+          ? `<div class="hc-head"><span class="hc-ref">“${esc(sp.text)}”</span>` +
+            `<span class="hc-score">${top.score.toFixed(2)}</span></div>` + hovCandidate(top)
+          : `<div class="hc-head"><span class="hc-ref">“${esc(sp.text)}”</span></div>` +
+            `<div class="hc-verdict hc-no">${esc(sp.status.replace(/_/g, " "))}</div>`);
+        track.append(bar);
+      });
+      lat.append(el("div", { class: "lat-row" },
+        el("span", { class: "lat-lab" }, n > MAX_LAT_N ? "whole" : String(n)),
+        track));
+    }
+    lat.append(el("div", { class: "lat-legend sql-caption" },
+      el("i", { class: "lat-key lat-won" }), " mention · ",
+      el("i", { class: "lat-key lat-overlapped" }), " overlapped · ",
+      el("i", { class: "lat-key lat-weak" }), " weak · ",
+      el("i", { class: "lat-key lat-no_candidates" }), " no match · ",
+      el("i", { class: "lat-key lat-skipped" }), " skipped"));
+    host.append(lat);
+
+    /* -- score assembly: how each winner's number was actually made — the
+     * fused base, the branch envelope, the dense floor, coherence and
+     * adjudication — as a slope chart, rivals alongside. -- */
+    host.append(el("div", { class: "subhead", style: "margin-top:18px" }, "score assembly"),
+      el("div", { class: "sql-caption" },
+        "per mention: each candidate's score at every stage of the pipeline · the winner in accent"));
+    for (const sp of mentionSpans) host.append(assembly(sp));
+    if (!mentionSpans.length) {
+      host.append(el("div", { class: "empty" }, "— no mentions to assemble"));
+    }
+  }
+
+  function assembly(sp: TraceSpan): HTMLElement {
+    const W = 660, H = 150, L = 40, R = 90, T = 14, B = 26;
+    const sx = (i: number) => L + (i * (W - L - R)) / 3;
+    const sy = (v: number) => T + (1 - Math.min(1, v)) * (H - T - B);
+    const spanChars = [...sp.text].length;
+    const svg = svgEl("svg", {
+      class: "asm", viewBox: `0 0 ${W} ${H}`, width: "100%",
+      preserveAspectRatio: "xMinYMin meet",
+    });
+    // y grid + threshold
+    for (const v of [0, 0.5, 1]) {
+      svg.append(svgEl("line", { class: "asm-grid", x1: L, x2: W - R, y1: sy(v), y2: sy(v) }));
+      const t = svgEl("text", { class: "asm-tick", x: L - 5, y: sy(v) + 3, "text-anchor": "end" });
+      t.textContent = v.toFixed(1);
+      svg.append(t);
+    }
+    svg.append(svgEl("line", {
+      class: "asm-thresh", x1: L, x2: W - R, y1: sy(0.35), y2: sy(0.35),
+    }));
+    const th = svgEl("text", { class: "asm-tick asm-thresh-t", x: W - R + 4, y: sy(0.35) + 3 });
+    th.textContent = "threshold";
+    svg.append(th);
+    const stations = ["fused", "branch", "dense", "final"];
+    stations.forEach((s, i) => {
+      const t = svgEl("text", { class: "asm-station", x: sx(i), y: H - 8, "text-anchor": "middle" });
+      t.textContent = s;
+      svg.append(t);
+    });
+
+    const cands = sp.candidates.slice(0, 4);
+    const topIdx = cands.findIndex((c) => c.selected);
+    cands.forEach((c, ci) => {
+      const nonKg = c.channels.filter((ch) => ch.channel !== "kg");
+      const rrf = nonKg.reduce((s, ch) => s + 1 / (4 + ch.rank), 0);
+      const base = Math.min((rrf * 4) / 3, 1);
+      const hasExact = c.channels.some((ch) => ch.channel === "exact");
+      const valChars = Math.max(1, [...c.value].length + (c.value_truncated ? 40 : 0));
+      const branch = hasExact
+        ? Math.min(0.9 + 0.1 * base, 1)
+        : c.is_doc
+          ? Math.min(base * 0.85, 0.85)
+          : base * (0.4 + 0.6 * Math.sqrt(spanChars / Math.max(valChars, spanChars)));
+      const bestCos = c.channels.filter((ch) => ch.channel === "dense")
+        .reduce((m, ch) => Math.max(m, ch.raw), -1);
+      const calibrated = bestCos >= 0
+        ? Math.min(Math.max((bestCos - 0.3) / 0.3, 0), 1) * 0.78 : 0;
+      const dense = Math.max(branch, calibrated);
+      const pts = [base, branch, dense, c.score];
+      const isTop = ci === topIdx;
+      const line = svgEl("polyline", {
+        class: "asm-line" + (isTop ? " top" : ""),
+        points: pts.map((v, i) => `${sx(i)},${sy(v)}`).join(" "),
+      });
+      hov(line as unknown as HTMLElement, hovCandidate(c));
+      (line as unknown as HTMLElement).addEventListener("click", () => showCard(sp, c));
+      svg.append(line);
+      pts.forEach((v, i) => {
+        svg.append(svgEl("circle", {
+          class: "asm-dot" + (isTop ? " top" : ""),
+          cx: sx(i), cy: sy(v), r: isTop ? 3.4 : 2.4,
+        }));
+      });
+      if (isTop) {
+        const label = svgEl("text", {
+          class: "asm-final", x: sx(3) + 8, y: sy(c.score) + 3,
+        });
+        label.textContent = c.score.toFixed(2)
+          + (c.coherence ? " ⬡" : "") + (c.adjudicated ? " ⚖" : "");
+        svg.append(label);
+      }
+    });
+    return el("div", { class: "asm-box" },
+      el("div", { class: "asm-head" },
+        el("span", { class: "sf-mention" }, sp.text),
+        el("span", { class: "sql-caption" },
+          cands[topIdx]
+            ? ` → ${cands[topIdx].table}.${cands[topIdx].column} #${cands[topIdx].rowid}`
+            : " → unresolved")),
+      svg);
+  }
+
+  /* -- space · the dense channel's neighborhood: the query at the center,
+   * every dense-retrieved record at its true cosine distance, grouped by
+   * table. The vector space, honestly drawn. -- */
+  function buildSpace(): void {
+    const host = panels.space.node;
+    type Hit = { c: TraceCandidate; cos: number; sp: TraceSpan };
+    const best = new Map<string, Hit>();
+    for (const sp of trace.spans) {
+      for (const c of sp.candidates) {
+        const cos = c.channels.filter((ch) => ch.channel === "dense")
+          .reduce((m, ch) => Math.max(m, ch.raw), -1);
+        if (cos < 0) continue;
+        const k = `${c.table}#${c.rowid}`;
+        const prev = best.get(k);
+        if (!prev || cos > prev.cos || (c.selected && !prev.c.selected)) {
+          best.set(k, { c, cos, sp });
+        }
+      }
+    }
+    const hits = [...best.values()].sort((a, b) => b.cos - a.cos);
+    host.append(el("div", { class: "subhead" }, "semantic neighborhood"),
+      el("div", { class: "sql-caption" },
+        "dense-channel evidence at true cosine distance from the query · nearer is more similar"));
+    if (!hits.length) {
+      host.append(el("div", { class: "empty" },
+        "— no dense evidence in this trajectory: the embedder was absent, or every span had exact lexical anchors"));
+      return;
+    }
+    const S = 640, cx = S / 2, cy = 240, R = 200;
+    const rOf = (cos: number) => Math.max(16, Math.min(R, ((0.68 - cos) / 0.38) * R));
+    const svg = svgEl("svg", {
+      class: "spc", viewBox: `0 0 ${S} ${cy + R * 0.55}`, width: "100%",
+      preserveAspectRatio: "xMidYMin meet",
+    });
+    for (const cos of [0.6, 0.5, 0.4, 0.3]) {
+      svg.append(svgEl("circle", { class: "spc-ring", cx, cy, r: rOf(cos) }));
+      const t = svgEl("text", { class: "spc-ringlab", x: cx + rOf(cos) + 4, y: cy + 3 });
+      t.textContent = `cos ${cos.toFixed(1)}`;
+      svg.append(t);
+    }
+    // tables get angular sectors sized by hit count, on the upper arc
+    const tables = [...new Set(hits.map((h) => h.c.table))];
+    const perTable = new Map(tables.map((t) => [t, hits.filter((h) => h.c.table === t)]));
+    let a0 = -210;
+    const span = 240;
+    const total = hits.length;
+    for (const t of tables) {
+      const mine = perTable.get(t) as Hit[];
+      const width = (mine.length / total) * span;
+      mine.forEach((h, i) => {
+        const ang = ((a0 + ((i + 0.5) / mine.length) * width) * Math.PI) / 180;
+        const r = rOf(h.cos);
+        const x = cx + r * Math.cos(ang), y = cy + r * Math.sin(ang);
+        if (h.c.selected) {
+          svg.append(svgEl("line", { class: "spc-spoke", x1: cx, y1: cy, x2: x, y2: y }));
+        }
+        const dot = svgEl("circle", {
+          class: "spc-dot" + (h.c.selected ? " sel" : ""),
+          cx: x, cy: y, r: h.c.selected ? 5 : 3.5,
+        });
+        hov(dot as unknown as HTMLElement,
+          `<div class="hc-head"><span class="hc-ref">for “${esc(h.sp.text)}”</span>` +
+          `<span class="hc-score">cos ${h.cos.toFixed(3)}</span></div>` + hovCandidate(h.c));
+        (dot as unknown as HTMLElement).addEventListener("click", () => showCard(h.sp, h.c));
+        svg.append(dot);
+      });
+      const mid = ((a0 + width / 2) * Math.PI) / 180;
+      const lt = svgEl("text", {
+        class: "spc-table",
+        x: cx + (R + 16) * Math.cos(mid), y: cy + (R + 16) * Math.sin(mid),
+        "text-anchor": "middle",
+      });
+      lt.textContent = t;
+      svg.append(lt);
+      a0 += width;
+    }
+    svg.append(svgEl("circle", { class: "spc-query", cx, cy, r: 5 }));
+    const q = svgEl("text", { class: "spc-qlab", x: cx, y: cy + 18, "text-anchor": "middle" });
+    q.textContent = "query";
+    svg.append(q);
+    host.append(svg);
+  }
+
+  for (const [k, p] of Object.entries(panels)) p.node.hidden = k !== mode;
+  if (mode !== "field" && !panels[mode].built) {
+    panels[mode].build();
+    panels[mode].built = true;
+  }
+
   out.append(
     el("div", { class: "sql-caption" },
       `resolved in ${trace.elapsed_ms.toFixed(1)} ms · ${trace.spans.length} spans enumerated · channels: exact, bm25, trigram, dense, kg · click a mention row for detail`),
     lineage,
-    field,
+    modeBar,
+    panels.field.node,
+    panels.anatomy.node,
+    panels.space.node,
     alsoBox,
   );
 }
+
+/* n-grams wider than the enumeration cap are the whole-query span */
+const MAX_LAT_N = 4;
 
 /* The compact in-conversation trajectory: query line with mentions marked,
  * then each mention's selected candidates with meters — the same story as

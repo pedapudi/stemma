@@ -842,6 +842,70 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .traj-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .lineage-wire { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: .8; }
 .lineage-wire.lost { stroke: var(--flat); stroke-dasharray: 3 3; opacity: .5; }
+/* coherence ribbons: the collective layer's verified join paths */
+.lineage.has-coh { padding-bottom: 44px; }
+.coh-arc { fill: none; stroke: var(--brand-accent); stroke-width: 1.2; stroke-dasharray: 5 3; opacity: .85; }
+.coh-label { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); fill: var(--brand-accent); }
+
+/* ============ trajectory modes ============ */
+.traj-modes { display: flex; align-items: center; gap: 6px; margin: 2px 0 12px; }
+
+/* ---- anatomy: the span lattice ---- */
+.lattice { position: relative; border: 1px solid var(--rule); border-radius: 6px; padding: 12px 14px; overflow-x: auto; }
+.lat-q { font-size: calc(13px * var(--fs)); margin-bottom: 10px; margin-left: 52px; white-space: pre; color: var(--ink); }
+.lat-row { display: flex; align-items: flex-start; margin-bottom: 5px; }
+.lat-lab { width: 40px; flex: none; font-size: calc(9.5px * var(--fs)); color: var(--ink-soft); text-align: right; padding-right: 12px; padding-top: 1px; }
+.lat-track { position: relative; flex: 1; font-size: calc(13px * var(--fs)); white-space: pre; }
+.lat-bar {
+  position: absolute; height: 10px; border-radius: 2px; box-sizing: border-box;
+  border: 1px solid var(--rule); background: transparent; padding: 0; cursor: pointer;
+  overflow: hidden;
+}
+.lat-fill { position: absolute; left: 0; top: 0; bottom: 0; width: var(--w, 0%); background: var(--flat); opacity: .35; }
+.lat-won { border-color: var(--accent); }
+.lat-won .lat-fill { background: var(--accent); opacity: .55; }
+.lat-overlapped { border-color: var(--flat); opacity: .75; }
+.lat-weak { border-style: dashed; border-color: var(--flat); }
+.lat-no_candidates { border-color: var(--rule); opacity: .6; }
+.lat-skipped { border: none; border-bottom: 1px dotted var(--rule); border-radius: 0; height: 5px; cursor: default; }
+.lat-bar:hover { border-color: var(--ink-soft); }
+.lat-won:hover { border-color: var(--accent); }
+.lat-legend { margin-top: 10px; margin-left: 52px; display: flex; align-items: center; gap: 4px; }
+.lat-key { display: inline-block; width: 16px; height: 8px; border-radius: 2px; border: 1px solid var(--rule); }
+.lat-key.lat-won { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.lat-key.lat-overlapped { border-color: var(--flat); background: color-mix(in srgb, var(--flat) 30%, transparent); }
+.lat-key.lat-weak { border-style: dashed; border-color: var(--flat); }
+.lat-key.lat-no_candidates { border-color: var(--rule); }
+.lat-key.lat-skipped { border: none; border-bottom: 1px dotted var(--rule); border-radius: 0; height: 4px; }
+
+/* ---- anatomy: score assembly ---- */
+.asm-box { border: 1px solid var(--rule); border-radius: 6px; padding: 10px 14px 4px; margin-bottom: 10px; }
+.asm-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+.asm { display: block; max-width: 680px; }
+.asm-grid { stroke: var(--rule); stroke-width: .7; }
+.asm-thresh { stroke: var(--flat); stroke-width: .9; stroke-dasharray: 4 3; }
+.asm-tick, .asm-station, .asm-final { font-family: var(--mono); font-size: 9.5px; fill: var(--ink-soft); }
+.asm-final { fill: var(--ink); font-weight: 700; }
+.asm-line { fill: none; stroke: var(--flat); stroke-width: 1.2; opacity: .7; cursor: pointer; }
+.asm-line.top { stroke: var(--accent); stroke-width: 2; opacity: 1; }
+.asm-line:hover { stroke: var(--ink-soft); opacity: 1; }
+.asm-line.top:hover { stroke: var(--accent); }
+.asm-dot { fill: var(--paper); stroke: var(--flat); stroke-width: 1.2; pointer-events: none; }
+.asm-dot.top { stroke: var(--accent); fill: var(--accent); }
+
+/* ---- space: the semantic neighborhood ---- */
+.space svg { display: block; max-width: 680px; }
+.spc-ring { fill: none; stroke: var(--rule); stroke-width: .8; }
+.spc-ringlab, .spc-table, .spc-qlab { font-family: var(--mono); font-size: 9.5px; fill: var(--ink-soft); }
+.spc-table { fill: var(--ink); }
+.spc-spoke { stroke: var(--accent); stroke-width: .8; opacity: .5; }
+.spc-dot { fill: var(--flat); opacity: .8; cursor: pointer; }
+.spc-dot:hover { fill: var(--ink-soft); opacity: 1; }
+.spc-dot.sel { fill: var(--accent); opacity: 1; }
+.spc-query { fill: var(--brand-accent); }
+/* hovercard extras for the new evidence kinds */
+.hc-coh { font-family: var(--mono); font-size: calc(10px * var(--fs)); color: var(--brand-accent); margin-top: 4px; }
+.hc-adj { font-family: var(--mono); font-size: calc(10px * var(--fs)); color: var(--ink-soft); margin-top: 2px; }
 .subline {
   font-family: var(--mono); font-size: calc(12.5px * var(--fs)); line-height: 2.3;
   margin-top: 26px; overflow-x: auto; white-space: nowrap; padding-bottom: 2px;
