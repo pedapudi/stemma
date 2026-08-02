@@ -8,6 +8,10 @@
     "embedder": {
       "endpoint": "http://kossel.lan:8081/v1",
       "model": "Qwen3-Embedding-0.6B"
+    },
+    "lm": {
+      "endpoint": "http://kossel.lan:8080/v1",
+      "model": "gemma-4-26B-A4B-it-FP8"
     }
   },
   "console": {

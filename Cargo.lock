@@ -1392,6 +1392,12 @@ dependencies = [
 [[package]]
 name = "stemma-lm"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
 
 [[package]]
 name = "stemma-proto"
@@ -1410,6 +1416,7 @@ dependencies = [
  "serde_json",
  "stemma-embed",
  "stemma-ingest",
+ "stemma-lm",
  "stemma-proto",
  "stemmadb",
  "thiserror",
@@ -1427,6 +1434,7 @@ dependencies = [
  "stemma-embed",
  "stemma-ingest",
  "stemma-kg",
+ "stemma-lm",
  "stemma-proto",
  "stemma-resolve",
  "stemmadb",

@@ -16,17 +16,22 @@ bazel run //crates/stemma-server -- \
 ```
 
 - `--config` — a stemma `config.json`; the server reads `databases` and
-  `server.*` (listen address, embedder endpoint/model for the dense channel).
-  Flags override the file, field by field. Relative database paths resolve
-  against the file's directory. One file describes one deployment — the
-  console and the MCP server read their own sections of the same file.
-  Configuration never comes from environment variables.
+  `server.*` (listen address, embedder endpoint/model for the dense channel,
+  lm endpoint/model for the adjudication band). Flags override the file,
+  field by field. Relative database paths resolve against the file's
+  directory. One file describes one deployment — the console and the MCP
+  server read their own sections of the same file. Configuration never comes
+  from environment variables.
 - `--listen` — address to bind (default `127.0.0.1:50051`).
 - `--db name=path` — repeatable. `name` is the logical handle clients put in
   `ResolveRequest.database`; the sidecar store is created as
   `<path minus extension>.stemmadb` next to the user DB.
 - `--embed-endpoint`, `--embed-model` — OpenAI-compatible `/v1/embeddings`
   endpoint enabling the dense channel; absent = lexical + kg only.
+- `--lm-endpoint`, `--lm-model` — OpenAI-compatible `/v1/chat/completions`
+  endpoint enabling LM adjudication of ambiguous mentions; absent = no LM.
+  Even when configured, the band runs only for requests that set
+  `options.allow_lm`.
 
 Startup logs confirm each registration, including the linked sqlite-vec
 version:

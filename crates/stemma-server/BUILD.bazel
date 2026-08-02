@@ -9,6 +9,7 @@ rust_binary(
         "//crates/stemma-embed",
         "//crates/stemma-ingest",
         "//crates/stemma-kg",
+        "//crates/stemma-lm",
         "//crates/stemma-proto",
         "//crates/stemma-resolve",
         "//crates/stemmadb",

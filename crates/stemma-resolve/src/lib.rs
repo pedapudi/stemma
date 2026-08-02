@@ -38,6 +38,15 @@ const TOP_K: usize = 5;
 /// Dense KNN is a full scan of the vector table per probe; spend it only on
 /// spans the lexical channels left uncertain, at most this many per query.
 const DENSE_MAX_SPANS: usize = 4;
+/// A mention is ambiguous — and routed to LM adjudication — when its top two
+/// candidates are within this fused-score margin and neither has an exact
+/// hit. Rationale: a single rank-step of disagreement in one RRF channel
+/// moves the normalized base by (1/K − 1/(K+1))/(3/K) ≈ 0.067 at K = 4, and
+/// the doc/affinity factors only shrink that. So a gap under 0.08 is what
+/// fusion produces when the channels ordered two candidates by roughly one
+/// rank inversion — noise-level evidence — while a larger gap reflects
+/// genuine multi-channel agreement that needs no model's opinion.
+const ADJUDICATION_MARGIN: f64 = 0.08;
 
 /// Stopwords: never a mention on their own (still allowed inside longer spans).
 const STOPWORDS: &[&str] = &[
@@ -86,6 +95,9 @@ pub struct Candidate {
     pub is_doc: bool,
     /// FTS snippet with ⟨⟩ marking hit terms — document candidates only.
     pub snippet: Option<String>,
+    /// True when the LM adjudication band chose this candidate; the choice
+    /// is applied as a reorder, so an adjudicated candidate sits at rank 0.
+    pub adjudicated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +137,18 @@ pub fn resolve(
     db: &StemmaDb,
     query: &str,
     embedder: Option<&dyn stemma_embed::Embedder>,
+) -> Result<Trace> {
+    resolve_full(db, query, embedder, None)
+}
+
+/// Resolve `query` with every available channel plus the LM adjudication
+/// band. Like the embedder, the LM is optional and fallible: absent or down,
+/// the trace is exactly what [`resolve`] would have produced.
+pub fn resolve_full(
+    db: &StemmaDb,
+    query: &str,
+    embedder: Option<&dyn stemma_embed::Embedder>,
+    lm: Option<&dyn stemma_lm::LmBackend>,
 ) -> Result<Trace> {
     let started = std::time::Instant::now();
     let conn = db.conn();
@@ -254,13 +278,152 @@ pub fn resolve(
 
     let mentions = select_mentions(&mut spans);
 
-    Ok(Trace {
+    let mut trace = Trace {
         query: query.to_string(),
         tokens,
         spans,
         mentions,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-    })
+    };
+    if let Some(lm) = lm {
+        adjudicate(&mut trace, lm);
+        trace.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok(trace)
+}
+
+/// The constrained-adjudication band: for each mention whose top candidates
+/// fusion could not order (see [`ADJUDICATION_MARGIN`]), show the LM the
+/// selected candidates and ask for a constrained choice — a candidate index
+/// or an explicit nil. The LM decides among presented options only; it never
+/// retrieves. Its verdict is applied as a reorder (marked `adjudicated`) or,
+/// on nil, a demotion of the span to "weak". LM failure is a no-op: the
+/// trace stays exactly as fusion left it.
+fn adjudicate(trace: &mut Trace, lm: &dyn stemma_lm::LmBackend) {
+    let mut routed = 0usize;
+    for &sid in &trace.mentions {
+        let span = &trace.spans[sid];
+        if !is_ambiguous(span) {
+            continue;
+        }
+        routed += 1;
+        let presented: Vec<usize> = span
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.selected)
+            .map(|(i, _)| i)
+            .take(TOP_K)
+            .collect();
+        let (messages, schema) = adjudication_prompt(&trace.query, span, &presented);
+        let verdict = match lm.chat(&messages, Some(&schema)) {
+            Ok(reply) => parse_verdict(&reply, presented.len()),
+            Err(e) => {
+                tracing::warn!(error = %e, span = %span.text, "adjudication degraded");
+                continue;
+            }
+        };
+        let span = &mut trace.spans[sid];
+        match verdict {
+            Some(Verdict::Choice(i)) => {
+                let mut chosen = span.candidates.remove(presented[i]);
+                chosen.adjudicated = true;
+                chosen.selected = true;
+                chosen.reject_reason = None;
+                span.candidates.insert(0, chosen);
+            }
+            Some(Verdict::Nil) => span.status = "weak".into(),
+            None => {
+                tracing::warn!(span = %span.text, "adjudication reply unusable; ignored");
+            }
+        }
+    }
+    tracing::debug!(
+        adjudicated = routed,
+        mentions = trace.mentions.len(),
+        "adjudication routing"
+    );
+}
+
+/// The ambiguous band: two or more selected candidates, the top two within
+/// [`ADJUDICATION_MARGIN`], and no exact-channel winner — an exact match is
+/// definitionally right about the value and does not need a model's opinion.
+fn is_ambiguous(span: &Span) -> bool {
+    if span.status != "selected" {
+        return false;
+    }
+    let mut selected = span.candidates.iter().filter(|c| c.selected);
+    let (Some(top), Some(second)) = (selected.next(), selected.next()) else {
+        return false;
+    };
+    top.score - second.score < ADJUDICATION_MARGIN
+        && !top.channels.iter().any(|ch| ch.channel == "exact")
+}
+
+enum Verdict {
+    Choice(usize),
+    Nil,
+}
+
+/// Terse, deterministic prompt: the mention in its query, each presented
+/// candidate as `index. table.column #rowid — value (channels)`, and a JSON
+/// schema whose enum is exactly the presented indices plus "nil" — the NIL
+/// option is a schema member, not prose.
+fn adjudication_prompt(
+    query: &str,
+    span: &Span,
+    presented: &[usize],
+) -> (Vec<stemma_lm::ChatMessage>, serde_json::Value) {
+    let mut listing = String::new();
+    for (i, &ci) in presented.iter().enumerate() {
+        let c = &span.candidates[ci];
+        let shown = c.snippet.as_deref().unwrap_or(&c.value);
+        let channels: Vec<&str> =
+            c.channels.iter().map(|ch| ch.channel.as_str()).collect();
+        listing.push_str(&format!(
+            "{i}. {}.{} #{} — {:?} (channels: {})\n",
+            c.table,
+            c.column,
+            c.rowid,
+            shown,
+            channels.join(", ")
+        ));
+    }
+    let mut options: Vec<String> = (0..presented.len()).map(|i| i.to_string()).collect();
+    options.push("nil".into());
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "choice": { "enum": options } },
+        "required": ["choice"],
+        "additionalProperties": false,
+    });
+    let messages = vec![
+        stemma_lm::ChatMessage::system(
+            "You disambiguate references to database records. Pick the candidate \
+             record the mention refers to in this query, or nil if none fits.",
+        ),
+        stemma_lm::ChatMessage::user(format!(
+            "Query: {query}\nMention: {:?}\nCandidates:\n{listing}",
+            span.text
+        )),
+    ];
+    (messages, schema)
+}
+
+/// Parse `{"choice": "<index>" | "nil"}`, tolerating a bare integer for
+/// index, and rejecting out-of-range indices.
+fn parse_verdict(reply: &str, presented: usize) -> Option<Verdict> {
+    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
+    let choice = v.get("choice")?;
+    if choice.as_str() == Some("nil") {
+        return Some(Verdict::Nil);
+    }
+    let i = match choice {
+        serde_json::Value::String(s) => s.parse::<usize>().ok()?,
+        serde_json::Value::Number(n) => usize::try_from(n.as_u64()?).ok()?,
+        _ => return None,
+    };
+    (i < presented).then_some(Verdict::Choice(i))
 }
 
 fn tokenize(query: &str) -> Vec<Token> {
@@ -648,6 +811,7 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 reject_reason: None,
                 is_doc: g.is_doc,
                 snippet: g.snippet,
+                adjudicated: false,
             }
         })
         .collect();
@@ -726,7 +890,10 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                 text: s.text.clone(),
                 start: s.start as u32,
                 end: s.end as u32,
-                nil: false,
+                // Selection only picks "selected" spans, so a weak span here
+                // can only mean the adjudication band answered NIL — the
+                // affirmative no-record-matches conclusion.
+                nil: s.status == "weak",
                 candidates: s
                     .candidates
                     .iter()
@@ -804,6 +971,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                         reject_reason: c.reject_reason.clone().unwrap_or_default(),
                         snippet: c.snippet.clone().unwrap_or_default(),
                         is_doc: c.is_doc,
+                        adjudicated: c.adjudicated,
                         channels: c
                             .channels
                             .iter()
@@ -995,5 +1163,152 @@ mod tests {
             Err(Error::IndexMissing) => {}
             other => panic!("expected IndexMissing, got {other:?}"),
         }
+    }
+
+    /// In-crate fake LM: a canned reply (or a canned failure) plus a call
+    /// counter, which is all the trait demands.
+    struct FakeLm {
+        reply: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeLm {
+        fn replying(reply: &str) -> Self {
+            Self { reply: Some(reply.to_string()), calls: 0.into() }
+        }
+        fn failing() -> Self {
+            Self { reply: None, calls: 0.into() }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl stemma_lm::LmBackend for FakeLm {
+        fn chat(
+            &self,
+            _messages: &[stemma_lm::ChatMessage],
+            _schema: Option<&serde_json::Value>,
+        ) -> stemma_lm::Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match &self.reply {
+                Some(r) => Ok(r.clone()),
+                None => Err(stemma_lm::Error::Http("fake endpoint down".into())),
+            }
+        }
+        fn native_structured_output(&self) -> bool {
+            true
+        }
+        fn identity(&self) -> stemma_lm::LmIdentity {
+            stemma_lm::LmIdentity { backend: "fake".into(), model: "fake".into() }
+        }
+    }
+
+    fn cand(rowid: i64, value: &str, score: f64, channels: &[&str]) -> Candidate {
+        Candidate {
+            table: "t".into(),
+            column: "c".into(),
+            rowid,
+            value: value.into(),
+            value_truncated: false,
+            score,
+            channels: channels
+                .iter()
+                .map(|ch| ChannelScore { channel: ch.to_string(), rank: 0, raw: 1.0 })
+                .collect(),
+            selected: true,
+            reject_reason: None,
+            is_doc: false,
+            snippet: None,
+            adjudicated: false,
+        }
+    }
+
+    /// One mention whose top two candidates sit inside the margin with no
+    /// exact hit — the ambiguous band by construction.
+    fn ambiguous_trace() -> Trace {
+        Trace {
+            query: "q".into(),
+            tokens: Vec::new(),
+            spans: vec![Span {
+                id: 0,
+                text: "q".into(),
+                start: 0,
+                end: 1,
+                status: "selected".into(),
+                candidates: vec![
+                    cand(1, "alpha", 0.60, &["bm25"]),
+                    cand(2, "beta", 0.55, &["trigram"]),
+                ],
+                kg_alias: false,
+            }],
+            mentions: vec![0],
+            elapsed_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn adjudication_reorders_on_choice() {
+        let mut trace = ambiguous_trace();
+        let lm = FakeLm::replying(r#"{"choice": "1"}"#);
+        adjudicate(&mut trace, &lm);
+        assert_eq!(lm.calls(), 1);
+        let span = &trace.spans[0];
+        assert_eq!(span.status, "selected");
+        assert_eq!(span.candidates[0].rowid, 2, "chosen candidate moves to front");
+        assert!(span.candidates[0].adjudicated);
+        assert!(span.candidates[0].selected);
+        assert_eq!(span.candidates[1].rowid, 1, "displaced candidate stays visible");
+        assert!(!span.candidates[1].adjudicated);
+    }
+
+    #[test]
+    fn adjudication_nil_demotes_to_weak() {
+        let mut trace = ambiguous_trace();
+        let lm = FakeLm::replying(r#"{"choice": "nil"}"#);
+        adjudicate(&mut trace, &lm);
+        assert_eq!(lm.calls(), 1);
+        assert_eq!(trace.spans[0].status, "weak");
+        assert!(trace.spans[0].candidates.iter().all(|c| !c.adjudicated));
+    }
+
+    #[test]
+    fn unambiguous_mentions_never_invoke_the_lm() {
+        // An exact-channel winner is outside the band even when close...
+        let mut exact = ambiguous_trace();
+        exact.spans[0].candidates[0].channels[0].channel = "exact".into();
+        // ...and so is a clear fused-score gap.
+        let mut gapped = ambiguous_trace();
+        gapped.spans[0].candidates[1].score = 0.40;
+        // ...and a single-candidate mention has nothing to adjudicate.
+        let mut single = ambiguous_trace();
+        single.spans[0].candidates.truncate(1);
+        let lm = FakeLm::replying(r#"{"choice": "0"}"#);
+        adjudicate(&mut exact, &lm);
+        adjudicate(&mut gapped, &lm);
+        adjudicate(&mut single, &lm);
+        assert_eq!(lm.calls(), 0);
+        assert_eq!(exact.spans[0].candidates[0].rowid, 1);
+        assert_eq!(exact.spans[0].status, "selected");
+    }
+
+    #[test]
+    fn lm_failure_degrades_to_unadjudicated_trace() {
+        let db = readme_db("lmdown");
+        let plain = resolve(&db, "what did Wei Chen ship", None).unwrap();
+        let lm = FakeLm::failing();
+        let full = resolve_full(&db, "what did Wei Chen ship", None, Some(&lm)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&plain.spans).unwrap(),
+            serde_json::to_value(&full.spans).unwrap(),
+            "a down LM must be a no-op"
+        );
+        assert_eq!(plain.mentions, full.mentions);
+        // A malformed verdict is equally a no-op.
+        let mut trace = ambiguous_trace();
+        let lm = FakeLm::replying(r#"{"choice": "9"}"#);
+        adjudicate(&mut trace, &lm);
+        assert_eq!(trace.spans[0].candidates[0].rowid, 1);
+        assert_eq!(trace.spans[0].status, "selected");
     }
 }

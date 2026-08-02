@@ -3,15 +3,20 @@
 **What is built, as of this writing:** the `Embedder` trait and its
 OpenAI-compatible backend ([`stemma-embed`](../../crates/stemma-embed/src/lib.rs)),
 the `vec_staging` → `vec_dense` promotion path with its `model_registry`
-write, the targeted dense retrieval channel inside the pipeline, and the
-consumption pattern (MCP surface and reference agent). The mechanics of the
-built parts are specified in
+write, the targeted dense retrieval channel inside the pipeline, the
+consumption pattern (MCP surface and reference agent), and — from the decoder
+half — **constrained adjudication**: the `LmBackend` trait and its
+OpenAI-compatible chat backend
+([`stemma-lm`](../../crates/stemma-lm/src/lib.rs)), and the ambiguous-band
+select-among-k with explicit NIL inside the pipeline
+(`stemma_resolve::resolve_full`), gated by `ResolveOptions.allow_lm`. The
+mechanics of the built parts are specified in
 [02-data-model.md](02-data-model.md#vec_staging-and-vec_dense) and
 [03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted);
 this document gives the *why*, and everything it describes beyond those
 mechanics — index-time embedding through the queue, online blue-green swaps,
-cross-encoder reranking, and the entire decoder half — is **designed, not
-built**. `stemma-lm` is still a one-line placeholder.
+cross-encoder reranking, mention expansion, and the `Adjudication` evidence
+record — is **designed, not built**.
 
 The design rests on one division of labour, and this document argues it,
 specifies both halves, and then addresses the failure mode that decides
@@ -888,9 +893,16 @@ expansion is for mentions the corpus's own vocabulary cannot expand.
 
 ### 2. Constrained adjudication, after retrieval
 
-The LM is shown *k* candidates with their evidence and asked to select one,
-with a JSON-schema-constrained response over an enum of candidate ids plus an
-explicit **NIL** option.
+**Built** (`stemma_resolve::resolve_full`, backed by
+[`stemma-lm`](../../crates/stemma-lm/src/lib.rs)). The LM is shown *k*
+candidates with their evidence and asked to select one, with a
+JSON-schema-constrained response over an enum of candidate ids plus an
+explicit **NIL** option. The band is entered only when fusion could not order
+the top two candidates (`ADJUDICATION_MARGIN`) and no exact-channel winner
+exists; the verdict is applied as a reorder, marked `adjudicated` in the
+trace, or — on NIL — as a demotion of the span to "weak". Like the embedder,
+the LM is fallible and optional: a failure or timeout leaves the trace
+exactly as fusion produced it.
 
 Three properties are non-negotiable:
 
@@ -908,12 +920,14 @@ Three properties are non-negotiable:
   linkers; the design uses the first property and refuses the second.
 - **The decision is evidence.** Every adjudication produces an
   `Adjudication { model, rationale }`, so an LM decision is inspectable on
-  the same terms as a BM25 hit.
+  the same terms as a BM25 hit. (Still designed: today the trace records the
+  choice as the `adjudicated` marker on the reordered candidate, and the
+  demoted status on a NIL; the rationale-carrying evidence record does not
+  exist yet.)
 
 `ResolveOptions.allow_lm` gates the whole band. With it off, resolution is
 purely lexical + dense + KG and fully local — no network, no model, no
 non-determinism. That is the default posture, and the LM is an escalation.
-(The field is currently accepted and ignored, since the band does not exist.)
 
 ### The `rewritten_query` artifact
 

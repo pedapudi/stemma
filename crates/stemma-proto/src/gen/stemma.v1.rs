@@ -67,6 +67,10 @@ pub struct TraceCandidate {
     pub snippet: ::prost::alloc::string::String,
     #[prost(bool, tag = "11")]
     pub is_doc: bool,
+    /// True when the LM adjudication band chose this candidate; the choice is
+    /// applied as a reorder, so an adjudicated candidate sits at the front.
+    #[prost(bool, tag = "12")]
+    pub adjudicated: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraceSpan {
