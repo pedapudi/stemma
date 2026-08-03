@@ -339,9 +339,22 @@ function swatchStrip(colors) {
   }
   return strip;
 }
+function store(key) {
+  try {
+    return store(key);
+  } catch {
+    return null;
+  }
+}
+function storeSet(key, v) {
+  try {
+    storeSet(key, v);
+  } catch {
+  }
+}
 function buildThemePicker() {
   const mount = document.getElementById("themepicker");
-  const saved = localStorage.getItem("stemma.theme") ?? "paper";
+  const saved = store("stemma.theme") ?? "paper";
   document.documentElement.dataset.theme = saved;
   const current = COLOR_THEMES.find((t) => t[0] === saved) ?? COLOR_THEMES[9];
   const trigName = el("span", {
@@ -371,7 +384,7 @@ function buildThemePicker() {
       "aria-selected": id === saved ? "true" : "false",
       onclick: () => {
         document.documentElement.dataset.theme = id;
-        localStorage.setItem("stemma.theme", id);
+        storeSet("stemma.theme", id);
         list.querySelectorAll(".cd-option").forEach((o) => o.setAttribute("aria-selected", "false"));
         opt.setAttribute("aria-selected", "true");
         trigName.textContent = label;
@@ -388,9 +401,9 @@ function buildThemePicker() {
 }
 function buildTypePicker() {
   const mount = document.getElementById("typepicker");
-  const saved = localStorage.getItem("stemma.type") ?? "T9";
+  const saved = store("stemma.type") ?? "T9";
   if (saved !== "T9") document.documentElement.dataset.type = saved;
-  const savedSize = localStorage.getItem("stemma.fontsize") ?? "s";
+  const savedSize = store("stemma.fontsize") ?? "s";
   const sizeVal = FONT_SIZES.find(([k]) => k === savedSize)?.[1] ?? 1;
   if (sizeVal !== 1) document.documentElement.style.setProperty("--fs", String(sizeVal));
   const current = TYPE_OPTIONS.find((o) => o.id === saved) ?? TYPE_OPTIONS[1];
@@ -446,7 +459,7 @@ function buildTypePicker() {
         onclick: () => {
           if (o.id === "T9") delete document.documentElement.dataset.type;
           else document.documentElement.dataset.type = o.id;
-          localStorage.setItem("stemma.type", o.id);
+          storeSet("stemma.type", o.id);
           pop.querySelectorAll(".tf-option").forEach((x) => x.setAttribute("aria-selected", "false"));
           opt.setAttribute("aria-selected", "true");
           trigName.textContent = o.label;
@@ -464,7 +477,7 @@ function buildTypePicker() {
       class: k === savedSize ? "on" : "",
       onclick: () => {
         document.documentElement.style.setProperty("--fs", String(v));
-        localStorage.setItem("stemma.fontsize", k);
+        storeSet("stemma.fontsize", k);
         seg.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
         b.classList.add("on");
       }
