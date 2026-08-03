@@ -11,4 +11,5 @@ __pycache__/
 /eval/ecfr/data/
 /eval/legal/data/
 /eval/mini/data/
+/eval/runs/
 /.claude/

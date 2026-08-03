@@ -54,13 +54,21 @@ evaluated in the **no-evidence** setting (see
 ```sh
 eval/bird/fetch_bird.sh                       # downloads + unpacks
 bazel run //crates/stemma-eval -- derive \
-  --questions eval/bird/data/dev/dev.json \
+  --questions eval/bird/data/dev_20240627/dev.json \
   --out /tmp/targets.json
 ```
 
 `derive` parses every gold SQL, extracting the tables it references and the
 `column op literal` predicates — the ground truth a resolver must reconstruct.
 Use `--db-id <name>` (repeatable) to restrict to a slice.
+
+The full evaluation harness builds on this: `stemma-eval dataset` produces
+denotation-verified, tier-assigned question sets (checked in under
+`eval/datasets/`), `stemma-eval run` sweeps the mechanism ablations and
+emits a self-contained HTML report, and `stemma-eval grade` compares a run
+to the accepted baseline in `eval/baseline/`. See
+[07-eval-harness.md](../design/07-eval-harness.md) and the
+`skills/stemmadb-eval` skill for the commands.
 
 ## Building your own corpus
 

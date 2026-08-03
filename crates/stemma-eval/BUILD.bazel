@@ -2,20 +2,32 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 rust_binary(
     name = "stemma-eval",
-    srcs = ["src/main.rs"],
+    srcs = glob(["src/**/*.rs"]),
+    # The report template is embedded at compile time (include_str!) so a
+    # run needs no working-directory assumptions.
+    compile_data = ["//eval/report:template"],
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/stemma-embed",
+        "//crates/stemma-ingest",
+        "//crates/stemma-kg",
+        "//crates/stemma-lm",
+        "//crates/stemma-resolve",
+        "//crates/stemmadb",
         "@crates//:anyhow",
         "@crates//:clap",
+        "@crates//:rand",
         "@crates//:rusqlite",
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:sqlparser",
+        "@crates//:tracing",
     ],
 )
 
 rust_test(
     name = "stemma-eval_test",
     crate = ":stemma-eval",
+    compile_data = ["//eval/report:template"],
 )

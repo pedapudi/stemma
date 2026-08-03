@@ -1,0 +1,1379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stemma eval report</title>
+<style>
+/* stemma eval report — zicato design language, standalone.
+ * Theme and typeface tokens are COPIED from ui/static/ui.css (not imported)
+ * so a report file stays self-contained forever. Sixteen terminal-derived
+ * themes over fixed semantic roles; sans for prose and controls, mono
+ * reserved for data; hairlines, not shadows; one accent, earned; good/bad
+ * by direction, never identity; categorical color rides as small interior
+ * dots, colored text, or chips — never a colored left rail.
+ * No hex outside the theme blocks. */
+
+/* ============ the sixteen themes (default: paper — light first) ============ */
+:root, :root[data-theme="paper"], [data-swatch="paper"] {
+  --paper:#F2EEDE; --panel:#E6E2D3; --ink:#1A1A1A; --ink-soft:#33312B;
+  --ink-faint:#85837A; --rule:#C6C3B6; --rule-soft:#DCD9CA;
+  --good:#216609; --good-soft:#CCD6B8; --bad:#CC3E28; --bad-soft:#EBCEBD;
+  --caution:#B58900; --accent:#1E6FCC; --flat:#6E6A5E; --cell-empty:#E8E4D5;
+  --brand-accent:#2FA46A;
+}
+:root[data-theme="monokai"], [data-swatch="monokai"] {
+  --paper:#1e1f1c; --panel:#272822; --ink:#f8f8f2; --ink-soft:#c9cabf;
+  --ink-faint:#8f908a; --rule:#3a3b34; --rule-soft:#2f302a;
+  --good:#a6e22e; --good-soft:#2c361a; --bad:#f92672; --bad-soft:#3a1622;
+  --caution:#e6db74; --accent:#66d9ef; --flat:#75715e; --cell-empty:#23241f;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="solarized-dark"], [data-swatch="solarized-dark"] {
+  --paper:#04222B; --panel:#0A2D38; --ink:#93A1A1; --ink-soft:#839496;
+  --ink-faint:#5E7079; --rule:#0E3540; --rule-soft:#0B2E39;
+  --good:#8BB80E; --good-soft:#1C3320; --bad:#E0483C; --bad-soft:#3A1F1D;
+  --caution:#C4920A; --accent:#2AA198; --flat:#46606B; --cell-empty:#0A2730;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="solarized-light"], [data-swatch="solarized-light"] {
+  --paper:#FDF6E3; --panel:#FBF1D6; --ink:#586E75; --ink-soft:#657B83;
+  --ink-faint:#93A1A1; --rule:#E7DCBE; --rule-soft:#F0E7CC;
+  --good:#6B9B0B; --good-soft:#E3ECCB; --bad:#DC322F; --bad-soft:#F6DDD3;
+  --caution:#B58900; --accent:#268BD2; --flat:#93A1A1; --cell-empty:#F2E9CE;
+  --brand-accent:#2FA46A;
+}
+:root[data-theme="google-light"], [data-swatch="google-light"] {
+  --paper:#FFFFFF; --panel:#F4F4F4; --ink:#474A4E; --ink-soft:#5F6368;
+  --ink-faint:#9FA1A4; --rule:#E2E3E4; --rule-soft:#F1F1F1;
+  --good:#34A853; --good-soft:#D2ECD9; --bad:#EA4335; --bad-soft:#FAD6D3;
+  --caution:#C99700; --accent:#1B9CB8; --flat:#9AA0A6; --cell-empty:#F8F8F8;
+  --brand-accent:#2FA46A;
+}
+:root[data-theme="google-dark"], [data-swatch="google-dark"] {
+  --paper:#202124; --panel:#2C2D30; --ink:#FFFFFF; --ink-soft:#E8EAED;
+  --ink-faint:#989A9D; --rule:#444548; --rule-soft:#323336;
+  --good:#34A853; --good-soft:#243F2E; --bad:#EA4335; --bad-soft:#4C2828;
+  --caution:#FBBC05; --accent:#24C1E0; --flat:#5F6368; --cell-empty:#28292C;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="lunaria-light"], [data-swatch="lunaria-light"] {
+  --paper:#EBE4E1; --panel:#E2DCD9; --ink:#363434; --ink-soft:#484646;
+  --ink-faint:#898584; --rule:#CEC8C5; --rule-soft:#DCD6D3;
+  --good:#497D46; --good-soft:#C7CDBF; --bad:#783C1F; --bad-soft:#D2BFB6;
+  --caution:#8F750B; --accent:#3778A9; --flat:#898584; --cell-empty:#E6DFDC;
+  --brand-accent:#2FA46A;
+}
+:root[data-theme="lunaria-eclipse"], [data-swatch="lunaria-eclipse"] {
+  --paper:#323F46; --panel:#3B484F; --ink:#DFE2ED; --ink-soft:#C9CDD7;
+  --ink-faint:#8D949D; --rule:#4D5960; --rule-soft:#404C53;
+  --good:#BEDBC1; --good-soft:#516161; --bad:#BA9088; --bad-soft:#505155;
+  --caution:#F1DFB4; --accent:#C8429F; --flat:#6B767D; --cell-empty:#38454C;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="belafonte-day"], [data-swatch="belafonte-day"] {
+  --paper:#D5CCBA; --panel:#CCC3B2; --ink:#34292D; --ink-soft:#45373C;
+  --ink-faint:#7F736E; --rule:#BBB1A3; --rule-soft:#C8BFAF;
+  --good:#6E6A4E; --good-soft:#C3BCA7; --bad:#BE100E; --bad-soft:#D0A394;
+  --caution:#B57A1E; --accent:#426A79; --flat:#5E5252; --cell-empty:#D0C6B5;
+  --brand-accent:#2FA46A;
+}
+:root[data-theme="belafonte-night"], [data-swatch="belafonte-night"] {
+  --paper:#20111B; --panel:#271821; --ink:#D5CCBA; --ink-soft:#968C83;
+  --ink-faint:#675B59; --rule:#35272E; --rule-soft:#2B1C24;
+  --good:#A6A07A; --good-soft:#362A2B; --bad:#D6403E; --bad-soft:#431118;
+  --caution:#EAA549; --accent:#6F8E97; --flat:#5E5252; --cell-empty:#25161F;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="zenburn"], [data-swatch="zenburn"] {
+  --paper:#3A3A3A; --panel:#424241; --ink:#DCDCCC; --ink-soft:#C5C5B8;
+  --ink-faint:#83837C; --rule:#575754; --rule-soft:#494947;
+  --good:#8FB28F; --good-soft:#2E3A2E; --bad:#CC9393; --bad-soft:#402F2F;
+  --caution:#FFD7A7; --accent:#8CD0D3; --flat:#757575; --cell-empty:#404040;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="selenized-black"], [data-swatch="selenized-black"] {
+  --paper:#181818; --panel:#202020; --ink:#DEDEDE; --ink-soft:#B9B9B9;
+  --ink-faint:#606060; --rule:#353535; --rule-soft:#262626;
+  --good:#83C746; --good-soft:#243218; --bad:#FF5E56; --bad-soft:#3A1B19;
+  --caution:#EFC541; --accent:#56D8C9; --flat:#3B3B3B; --cell-empty:#1E1E1E;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="relaxed"], [data-swatch="relaxed"] {
+  --paper:#353A44; --panel:#3D424B; --ink:#F7F7F7; --ink-soft:#D9D9D9;
+  --ink-faint:#7F8287; --rule:#53575F; --rule-soft:#444851;
+  --good:#A0AC77; --good-soft:#353D2E; --bad:#BC5653; --bad-soft:#3F2A2C;
+  --caution:#EBC17A; --accent:#7EAAC7; --flat:#636363; --cell-empty:#3C404A;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="espresso"], [data-swatch="espresso"] {
+  --paper:#323232; --panel:#3A3A3A; --ink:#FFFFFF; --ink-soft:#D9D9D9;
+  --ink-faint:#8A8A8A; --rule:#4C4C4C; --rule-soft:#3E3E3E;
+  --good:#A5C261; --good-soft:#353D24; --bad:#D25252; --bad-soft:#3D2424;
+  --caution:#FFC66D; --accent:#6C99BB; --flat:#6E6E6E; --cell-empty:#383838;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="dracula"], [data-swatch="dracula"] {
+  --paper:#282A36; --panel:#343746; --ink:#F8F8F2; --ink-soft:#D4D4CF;
+  --ink-faint:#6272A4; --rule:#44475A; --rule-soft:#353848;
+  --good:#50FA7B; --good-soft:#213A2A; --bad:#FF5555; --bad-soft:#3C2329;
+  --caution:#F1FA8C; --accent:#BD93F9; --flat:#6272A4; --cell-empty:#2E303D;
+  --brand-accent:#3FB87A;
+}
+:root[data-theme="ubuntu"], [data-swatch="ubuntu"] {
+  --paper:#300A24; --panel:#3D1530; --ink:#EEEEEC; --ink-soft:#CBC3C9;
+  --ink-faint:#8A7383; --rule:#4B2640; --rule-soft:#3E1A32;
+  --good:#8AE234; --good-soft:#2E3320; --bad:#CC0000; --bad-soft:#45161F;
+  --caution:#FCE94F; --accent:#34E2E2; --flat:#847683; --cell-empty:#371129;
+  --brand-accent:#3FB87A;
+}
+
+/* ============ typefaces ============
+ * The 12-face picker carried over from the sibling systems: three groups of
+ * four. Default is T9 (sans for prose/controls, mono reserved for data);
+ * the brand wordmark pins to a FIXED mono regardless of the picker. */
+:root {
+  --brand-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --sans: "Source Sans 3", system-ui, sans-serif;
+  --mono: "Source Code Pro", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --font-head: "Source Sans 3", system-ui, sans-serif;
+  --fs: 1;
+}
+/* Technical */
+:root[data-type="T7"] {
+  --sans: "Google Sans Mono", "Noto Sans Mono", ui-monospace, monospace;
+  --mono: "Google Sans Mono", "Noto Sans Mono", ui-monospace, monospace;
+  --font-head: "Google Sans Mono", "Noto Sans Mono", ui-monospace, monospace;
+}
+:root[data-type="T9"] {
+  --sans: "Source Sans 3", system-ui, sans-serif;
+  --mono: "Source Code Pro", ui-monospace, monospace;
+  --font-head: "Source Sans 3", system-ui, sans-serif;
+}
+:root[data-type="T12"] {
+  --sans: "Inconsolata", ui-monospace, monospace;
+  --mono: "Inconsolata", ui-monospace, monospace;
+  --font-head: "Inconsolata", ui-monospace, monospace;
+}
+:root[data-type="T14"] {
+  --sans: "Ubuntu", system-ui, sans-serif;
+  --mono: "Ubuntu Mono", ui-monospace, monospace;
+  --font-head: "Ubuntu", system-ui, sans-serif;
+}
+/* Editorial */
+:root[data-type="E5"] {
+  --sans: "Fraunces", Georgia, serif; --mono: "Fraunces", Georgia, serif;
+  --font-head: "Fraunces", Georgia, serif;
+}
+:root[data-type="E7"] {
+  --sans: "Bitter", Georgia, serif; --mono: "Bitter", Georgia, serif;
+  --font-head: "Bitter", Georgia, serif;
+}
+:root[data-type="E8"] {
+  --sans: "Literata", Georgia, serif; --mono: "Literata", Georgia, serif;
+  --font-head: "Literata", Georgia, serif;
+}
+:root[data-type="E15"] {
+  --sans: "Domine", Georgia, serif; --mono: "Domine", Georgia, serif;
+  --font-head: "Domine", Georgia, serif;
+}
+/* Display */
+:root[data-type="D2"] {
+  --sans: "Space Grotesk", system-ui, sans-serif; --mono: "Space Grotesk", system-ui, sans-serif;
+  --font-head: "Archivo Narrow", "Space Grotesk", system-ui, sans-serif;
+}
+:root[data-type="D12"] {
+  --sans: "Hanken Grotesk", system-ui, sans-serif; --mono: "Hanken Grotesk", system-ui, sans-serif;
+  --font-head: "Hanken Grotesk", system-ui, sans-serif;
+}
+:root[data-type="D14"] {
+  --sans: "Space Grotesk", system-ui, sans-serif; --mono: "Space Grotesk", system-ui, sans-serif;
+  --font-head: "Barlow Condensed", "Archivo Narrow", system-ui, sans-serif;
+}
+:root[data-type="D5"] {
+  --sans: "Bricolage Grotesque", system-ui, sans-serif; --mono: "Bricolage Grotesque", system-ui, sans-serif;
+  --font-head: "Bricolage Grotesque", system-ui, sans-serif;
+}
+
+/* ============ base ============ */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--paper); color: var(--ink);
+  font-family: var(--sans); font-size: calc(13px * var(--fs)); line-height: 1.5;
+  transition: background .18s ease, color .18s ease;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+* { scrollbar-width: thin; scrollbar-color: var(--flat) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--flat); border-radius: 5px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--ink-faint); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+.mono { font-family: var(--mono); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.faint { color: var(--ink-faint); }
+a { color: var(--accent); text-decoration: none; }
+
+/* ============ component vocabulary (from the console) ============ */
+.panel {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 17px 19px; max-width: 100%; overflow-x: hidden;
+}
+.subhead {
+  font-family: var(--mono); font-size: calc(10px * var(--fs));
+  text-transform: uppercase; letter-spacing: .08em; font-weight: 600;
+  color: var(--ink-faint); margin: 0 0 8px;
+}
+.h1 { font-family: var(--font-head); font-size: calc(19px * var(--fs)); font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; }
+.h2 {
+  font-family: var(--font-head); font-size: calc(13px * var(--fs)); font-weight: 600;
+  letter-spacing: .01em; margin: 0 0 10px;
+  border-bottom: 1px solid var(--rule); padding-bottom: 6px;
+}
+.lede { font-size: calc(12.5px * var(--fs)); line-height: 1.45; max-width: 78ch; color: var(--ink-soft); }
+.section { margin: 30px 0; }
+.empty { color: var(--ink-faint); font-size: calc(12px * var(--fs)); font-style: italic; padding: 10px 0; }
+
+.kv { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); gap: 4px 14px; }
+.kv .k {
+  font-family: var(--mono); font-size: calc(10px * var(--fs)); text-transform: uppercase;
+  letter-spacing: .05em; color: var(--ink-faint); padding-top: 2px;
+}
+.kv .v { font-family: var(--mono); font-size: calc(12px * var(--fs)); overflow-wrap: anywhere; }
+
+.table-scroll { max-width: 100%; overflow-x: auto; }
+table.grid { border-collapse: collapse; width: 100%; font-size: calc(12px * var(--fs)); margin: 4px 0 12px; }
+table.grid th, table.grid td { border: 1px solid var(--rule); padding: 5px 9px; text-align: left; color: var(--ink); }
+table.grid th { background: var(--rule-soft); font-weight: 600; color: var(--ink-soft); }
+table.grid td { font-family: var(--mono); font-size: calc(11.5px * var(--fs)); }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono);
+  font-size: calc(10.5px * var(--fs)); padding: 2px 8px; border-radius: 10px; border: 1px solid;
+}
+.pill.good { color: var(--good); border-color: var(--good); background: var(--good-soft); }
+.pill.bad { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
+.pill.caution { color: var(--caution); border-color: var(--caution); }
+.pill.neutral { color: var(--ink-soft); border-color: var(--rule); }
+.chip {
+  font-family: var(--mono); font-size: calc(9.5px * var(--fs)); padding: 1px 6px;
+  border-radius: 8px; border: 1px solid var(--rule); color: var(--ink-soft);
+  text-transform: lowercase; white-space: nowrap;
+  background: transparent; appearance: none;
+}
+button.chip { cursor: pointer; }
+button.chip:hover { background: var(--rule-soft); color: var(--ink); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--flat); }
+.dot.good { background: var(--good); }
+.dot.bad { background: var(--bad); }
+.dot.caution { background: var(--caution); }
+
+/* ============ chrome: topbar + pickers (console idiom) ============ */
+.topbar {
+  position: sticky; top: 0; z-index: 6;
+  display: flex; align-items: center; gap: 18px;
+  padding: 11px 26px;
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--rule);
+}
+.brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); }
+.brand-word {
+  font-family: var(--brand-mono); font-weight: 700; font-size: calc(15px * var(--fs));
+  letter-spacing: .01em; color: var(--ink);
+}
+.brand-variant {
+  font-family: var(--brand-mono); font-size: calc(9.5px * var(--fs));
+  text-transform: uppercase; letter-spacing: .16em; color: var(--accent);
+}
+.crumbs { font-family: var(--mono); font-size: calc(11px * var(--fs)); color: var(--ink-faint); }
+.spacer { flex: 1; }
+
+.cd { position: relative; display: inline-flex; }
+.cd-trigger {
+  display: inline-flex; align-items: center; gap: 7px;
+  border: 1px solid var(--rule); border-radius: 5px;
+  padding: 3px 8px;
+  background: transparent; color: var(--ink-soft); cursor: pointer;
+  font-family: var(--sans);
+  font-size: calc(11px * var(--fs));
+  transition: border-color .15s, color .15s;
+}
+.cd-trigger:hover { color: var(--ink); border-color: var(--accent); }
+.cd-name { color: var(--ink); white-space: nowrap; }
+.cd-caret { color: var(--ink-faint); font-size: calc(8px * var(--fs)); transition: transform .15s; }
+.cd.open .cd-caret { transform: rotate(180deg); }
+.swatch-strip {
+  display: inline-flex; flex: none;
+  border: 1px solid var(--rule); border-radius: 3px; overflow: hidden;
+}
+.swatch-strip i { display: inline-block; width: 10px; height: 10px; }
+.swatch-strip i + i { border-left: 1px solid var(--rule); }
+.cd-list {
+  display: none; position: absolute; top: calc(100% + 5px); right: 0; z-index: 30;
+  min-width: 192px; max-height: 60vh; overflow-y: auto;
+  padding: 4px; border-radius: 5px;
+  background: var(--panel); border: 1px solid var(--rule);
+}
+.cd.open > .cd-list { display: block; }
+.cd-option {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 7px; border-radius: 4px; cursor: pointer;
+  color: var(--ink-soft); transition: background .12s, color .12s;
+}
+.cd-option:hover { background: var(--rule-soft); color: var(--ink); }
+.cd-option[aria-selected="true"] .cd-name { color: var(--accent); }
+
+.tf-pop {
+  display: none; flex-direction: column;
+  position: absolute; top: calc(100% + 5px); right: 0; z-index: 30;
+  min-width: 252px; padding: 4px; border-radius: 5px;
+  background: var(--panel); border: 1px solid var(--rule);
+}
+.cd.open > .tf-pop { display: flex; }
+.tf-list { overflow-y: auto; max-height: 56vh; }
+.tf-group { padding: 7px 7px 3px; border-top: 1px solid var(--rule-soft); margin-top: 3px; }
+.tf-group:first-child { border-top: none; margin-top: 0; }
+.tf-group .subhead { margin: 0; }
+.tf-option {
+  display: flex; flex-direction: column; align-items: stretch; gap: 2px;
+  padding: 5px 7px; border-radius: 4px; cursor: pointer; transition: background .12s;
+}
+.tf-option:hover { background: var(--rule-soft); }
+.tf-name { font-size: calc(13px * var(--fs)); line-height: 1.3; color: var(--ink); white-space: nowrap; }
+.tf-option[aria-selected="true"] .tf-name { color: var(--accent); }
+.tf-sample { font-size: calc(10.5px * var(--fs)); line-height: 1.3; color: var(--ink-faint); white-space: nowrap; }
+.tf-spec { font-size: calc(12px * var(--fs)); line-height: 1; color: var(--ink-soft); }
+.tf-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-top: 4px; padding: 6px 4px 3px; border-top: 1px solid var(--rule-soft);
+}
+.tf-foot .k {
+  font-family: var(--mono); font-size: calc(10px * var(--fs)); text-transform: uppercase;
+  letter-spacing: .05em; color: var(--ink-faint);
+}
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 5px; overflow: hidden; }
+.seg button {
+  border: none; background: transparent; color: var(--ink-soft); cursor: pointer;
+  font-family: var(--mono); font-size: calc(10.5px * var(--fs)); padding: 2px 9px;
+}
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button.on { color: var(--accent); font-weight: 700; }
+
+/* ============ report layout ============ */
+.page { max-width: 1200px; margin: 0 auto; padding: 34px 30px 110px; }
+.runhead { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 4px; }
+
+/* the mechanism × tier matrix */
+table.matrix td { padding: 0; }
+.cellbox {
+  display: flex; flex-direction: column; gap: 1px; align-items: flex-start;
+  width: 100%; padding: 7px 10px; border: none; background: transparent;
+  font-family: var(--mono); color: var(--ink); cursor: pointer; text-align: left;
+}
+.cellbox:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.cellbox.on { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.cell-r5 { font-size: calc(14px * var(--fs)); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cell-delta { font-size: calc(10px * var(--fs)); font-variant-numeric: tabular-nums; color: var(--ink-faint); }
+.cell-delta.up { color: var(--good); }
+.cell-delta.down { color: var(--bad); }
+.cell-ci { font-size: calc(9.5px * var(--fs)); color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+
+/* per-cell drawer */
+.drawer { margin: 10px 0 16px; }
+.drawer table.grid td.q { font-family: var(--sans); max-width: 46ch; overflow-wrap: anywhere; }
+
+/* calibration */
+.calgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.calcard svg { display: block; width: 100%; height: auto; }
+.callabel { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); color: var(--ink-soft); margin-top: 4px; }
+
+/* failures */
+.fail-item { padding: 9px 0; border-bottom: 1px solid var(--rule-soft); }
+.fail-item:last-child { border-bottom: none; }
+.fail-title { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: calc(12px * var(--fs)); }
+.fail-detail { color: var(--ink-soft); font-size: calc(12px * var(--fs)); margin: 3px 0 0; }
+.fail-queries { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); color: var(--ink-faint); margin-top: 3px; overflow-wrap: anywhere; }
+
+</style>
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="3" r="2" fill="var(--brand-accent)"/>
+      <circle cx="3.5" cy="12" r="2" fill="currentColor"/>
+      <circle cx="12.5" cy="12" r="2" fill="currentColor"/>
+      <path d="M8 5v3M8 8L4.3 10.6M8 8l3.7 2.6" stroke="currentColor" stroke-width="1.2" fill="none"/>
+    </svg>
+    <span class="brand-word">stemma</span>
+    <span class="brand-variant">eval</span>
+  </span>
+  <span class="crumbs" id="crumbs"></span>
+  <span class="spacer"></span>
+  <span id="themepicker"></span>
+  <span id="typepicker"></span>
+</div>
+<div class="page" id="page"></div>
+<script id="run-data" type="application/json">__STEMMA_RUN_DATA__</script>
+<script>
+// report.ts
+function el(tag, attrs, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs ?? {})) {
+    if (v === null || v === void 0) continue;
+    if (k === "class") n.className = String(v);
+    else if (k.startsWith("on") && typeof v === "function") {
+      n.addEventListener(k.slice(2), v);
+    } else n.setAttribute(k, String(v));
+  }
+  appendChildren(n, children);
+  return n;
+}
+function svgEl(tag, attrs, ...children) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs ?? {})) n.setAttribute(k, String(v));
+  appendChildren(n, children);
+  return n;
+}
+function appendChildren(n, children) {
+  for (const c of children) {
+    if (c === null || c === void 0) continue;
+    if (Array.isArray(c)) appendChildren(n, c);
+    else n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+}
+var COLOR_THEMES = [
+  [
+    "monokai",
+    "monokai",
+    [
+      "#1e1f1c",
+      "#272822",
+      "#f8f8f2",
+      "#a6e22e",
+      "#f92672",
+      "#66d9ef"
+    ]
+  ],
+  [
+    "solarized-dark",
+    "solarized dark",
+    [
+      "#04222B",
+      "#0A2D38",
+      "#93A1A1",
+      "#8BB80E",
+      "#E0483C",
+      "#2AA198"
+    ]
+  ],
+  [
+    "solarized-light",
+    "solarized light",
+    [
+      "#FDF6E3",
+      "#FBF1D6",
+      "#586E75",
+      "#6B9B0B",
+      "#DC322F",
+      "#268BD2"
+    ]
+  ],
+  [
+    "google-light",
+    "google light",
+    [
+      "#FFFFFF",
+      "#F4F4F4",
+      "#474A4E",
+      "#34A853",
+      "#EA4335",
+      "#1B9CB8"
+    ]
+  ],
+  [
+    "google-dark",
+    "google dark",
+    [
+      "#202124",
+      "#2C2D30",
+      "#FFFFFF",
+      "#34A853",
+      "#EA4335",
+      "#24C1E0"
+    ]
+  ],
+  [
+    "lunaria-light",
+    "lunaria light",
+    [
+      "#EBE4E1",
+      "#E2DCD9",
+      "#363434",
+      "#497D46",
+      "#783C1F",
+      "#3778A9"
+    ]
+  ],
+  [
+    "lunaria-eclipse",
+    "lunaria eclipse",
+    [
+      "#323F46",
+      "#3B484F",
+      "#DFE2ED",
+      "#BEDBC1",
+      "#BA9088",
+      "#C8429F"
+    ]
+  ],
+  [
+    "belafonte-day",
+    "belafonte day",
+    [
+      "#D5CCBA",
+      "#CCC3B2",
+      "#34292D",
+      "#6E6A4E",
+      "#BE100E",
+      "#426A79"
+    ]
+  ],
+  [
+    "belafonte-night",
+    "belafonte night",
+    [
+      "#20111B",
+      "#271821",
+      "#D5CCBA",
+      "#A6A07A",
+      "#D6403E",
+      "#6F8E97"
+    ]
+  ],
+  [
+    "paper",
+    "paper",
+    [
+      "#F2EEDE",
+      "#E6E2D3",
+      "#1A1A1A",
+      "#216609",
+      "#CC3E28",
+      "#1E6FCC"
+    ]
+  ],
+  [
+    "zenburn",
+    "zenburn",
+    [
+      "#3A3A3A",
+      "#424241",
+      "#DCDCCC",
+      "#8FB28F",
+      "#CC9393",
+      "#8CD0D3"
+    ]
+  ],
+  [
+    "selenized-black",
+    "selenized black",
+    [
+      "#181818",
+      "#202020",
+      "#DEDEDE",
+      "#83C746",
+      "#FF5E56",
+      "#56D8C9"
+    ]
+  ],
+  [
+    "relaxed",
+    "relaxed",
+    [
+      "#353A44",
+      "#3D424B",
+      "#F7F7F7",
+      "#A0AC77",
+      "#BC5653",
+      "#7EAAC7"
+    ]
+  ],
+  [
+    "espresso",
+    "espresso",
+    [
+      "#323232",
+      "#3A3A3A",
+      "#FFFFFF",
+      "#A5C261",
+      "#D25252",
+      "#6C99BB"
+    ]
+  ],
+  [
+    "dracula",
+    "dracula",
+    [
+      "#282A36",
+      "#343746",
+      "#F8F8F2",
+      "#50FA7B",
+      "#FF5555",
+      "#BD93F9"
+    ]
+  ],
+  [
+    "ubuntu",
+    "ubuntu",
+    [
+      "#300A24",
+      "#3D1530",
+      "#EEEEEC",
+      "#8AE234",
+      "#CC0000",
+      "#34E2E2"
+    ]
+  ]
+];
+var MONO_GSM = '"Google Sans Mono","Noto Sans Mono",ui-monospace,monospace';
+var SANS_GROTESK = '"Space Grotesk",system-ui,sans-serif';
+var TYPE_OPTIONS = [
+  {
+    id: "T7",
+    label: "Google Sans Mono",
+    group: "technical",
+    head: MONO_GSM,
+    body: MONO_GSM
+  },
+  {
+    id: "T9",
+    label: "Source Sans 3 + Source Code Pro",
+    group: "technical",
+    head: '"Source Sans 3",system-ui,sans-serif',
+    body: '"Source Sans 3",system-ui,sans-serif'
+  },
+  {
+    id: "T12",
+    label: "Inconsolata",
+    group: "technical",
+    head: '"Inconsolata",ui-monospace,monospace',
+    body: '"Inconsolata",ui-monospace,monospace'
+  },
+  {
+    id: "T14",
+    label: "Ubuntu + Ubuntu Mono",
+    group: "technical",
+    head: '"Ubuntu",system-ui,sans-serif',
+    body: '"Ubuntu",system-ui,sans-serif'
+  },
+  {
+    id: "E5",
+    label: "Fraunces",
+    group: "editorial",
+    head: '"Fraunces",Georgia,serif',
+    body: '"Fraunces",Georgia,serif'
+  },
+  {
+    id: "E7",
+    label: "Bitter",
+    group: "editorial",
+    head: '"Bitter",Georgia,serif',
+    body: '"Bitter",Georgia,serif'
+  },
+  {
+    id: "E8",
+    label: "Literata",
+    group: "editorial",
+    head: '"Literata",Georgia,serif',
+    body: '"Literata",Georgia,serif'
+  },
+  {
+    id: "E15",
+    label: "Domine",
+    group: "editorial",
+    head: '"Domine",Georgia,serif',
+    body: '"Domine",Georgia,serif'
+  },
+  {
+    id: "D2",
+    label: "Archivo Narrow + Space Grotesk",
+    group: "display",
+    head: `"Archivo Narrow",${SANS_GROTESK}`,
+    body: SANS_GROTESK
+  },
+  {
+    id: "D12",
+    label: "Hanken Grotesk",
+    group: "display",
+    head: '"Hanken Grotesk",system-ui,sans-serif',
+    body: '"Hanken Grotesk",system-ui,sans-serif'
+  },
+  {
+    id: "D14",
+    label: "Barlow Condensed + Space Grotesk",
+    group: "display",
+    head: '"Barlow Condensed","Archivo Narrow",system-ui,sans-serif',
+    body: SANS_GROTESK
+  },
+  {
+    id: "D5",
+    label: "Bricolage Grotesque",
+    group: "display",
+    head: '"Bricolage Grotesque",system-ui,sans-serif',
+    body: '"Bricolage Grotesque",system-ui,sans-serif'
+  }
+];
+var SAMPLE_LINE = "the quick brown fox 0123";
+var FONT_SIZES = [
+  [
+    "s",
+    1
+  ],
+  [
+    "m",
+    1.15
+  ],
+  [
+    "l",
+    1.3
+  ]
+];
+var openMenus = [];
+function closeAllMenus(except) {
+  for (const m of openMenus) {
+    if (m !== except) m.classList.remove("open");
+  }
+}
+function swatchStrip(colors) {
+  const strip = el("span", {
+    class: "swatch-strip",
+    "aria-hidden": "true"
+  });
+  for (const c of colors) {
+    const chip = el("i");
+    chip.style.background = c;
+    strip.append(chip);
+  }
+  return strip;
+}
+function buildThemePicker() {
+  const mount = document.getElementById("themepicker");
+  const saved = localStorage.getItem("stemma.theme") ?? "paper";
+  document.documentElement.dataset.theme = saved;
+  const current = COLOR_THEMES.find((t) => t[0] === saved) ?? COLOR_THEMES[9];
+  const trigName = el("span", {
+    class: "cd-name"
+  }, current[1]);
+  const trigStrip = el("span", null, swatchStrip(current[2]));
+  const list = el("div", {
+    class: "cd-list",
+    role: "listbox"
+  });
+  const cd = el("span", {
+    class: "cd"
+  }, el("button", {
+    class: "cd-trigger",
+    onclick: (e) => {
+      e.stopPropagation();
+      closeAllMenus(cd);
+      cd.classList.toggle("open");
+    }
+  }, trigStrip, trigName, el("span", {
+    class: "cd-caret"
+  }, "\u25BE")), list);
+  for (const [id, label, colors] of COLOR_THEMES) {
+    const opt = el("div", {
+      class: "cd-option",
+      role: "option",
+      "aria-selected": id === saved ? "true" : "false",
+      onclick: () => {
+        document.documentElement.dataset.theme = id;
+        localStorage.setItem("stemma.theme", id);
+        list.querySelectorAll(".cd-option").forEach((o) => o.setAttribute("aria-selected", "false"));
+        opt.setAttribute("aria-selected", "true");
+        trigName.textContent = label;
+        trigStrip.replaceChildren(swatchStrip(colors));
+        cd.classList.remove("open");
+      }
+    }, swatchStrip(colors), el("span", {
+      class: "cd-name"
+    }, label));
+    list.append(opt);
+  }
+  openMenus.push(cd);
+  mount.append(cd);
+}
+function buildTypePicker() {
+  const mount = document.getElementById("typepicker");
+  const saved = localStorage.getItem("stemma.type") ?? "T9";
+  if (saved !== "T9") document.documentElement.dataset.type = saved;
+  const savedSize = localStorage.getItem("stemma.fontsize") ?? "s";
+  const sizeVal = FONT_SIZES.find(([k]) => k === savedSize)?.[1] ?? 1;
+  if (sizeVal !== 1) document.documentElement.style.setProperty("--fs", String(sizeVal));
+  const current = TYPE_OPTIONS.find((o) => o.id === saved) ?? TYPE_OPTIONS[1];
+  const trigName = el("span", {
+    class: "cd-name"
+  }, current.label);
+  const trigSpec = el("span", {
+    class: "tf-spec"
+  }, "Ag");
+  trigSpec.style.fontFamily = current.head;
+  const listBox = el("div", {
+    class: "tf-list"
+  });
+  const pop = el("div", {
+    class: "tf-pop"
+  }, listBox);
+  const cd = el("span", {
+    class: "cd"
+  }, el("button", {
+    class: "cd-trigger",
+    onclick: (e) => {
+      e.stopPropagation();
+      closeAllMenus(cd);
+      cd.classList.toggle("open");
+    }
+  }, trigSpec, trigName, el("span", {
+    class: "cd-caret"
+  }, "\u25BE")), pop);
+  for (const group of [
+    "technical",
+    "editorial",
+    "display"
+  ]) {
+    listBox.append(el("div", {
+      class: "tf-group"
+    }, el("div", {
+      class: "subhead"
+    }, group)));
+    for (const o of TYPE_OPTIONS.filter((x) => x.group === group)) {
+      const name = el("span", {
+        class: "tf-name"
+      }, o.label);
+      name.style.fontFamily = o.head;
+      const sample = el("span", {
+        class: "tf-sample",
+        "aria-hidden": "true"
+      }, SAMPLE_LINE);
+      sample.style.fontFamily = o.body;
+      const opt = el("div", {
+        class: "tf-option",
+        role: "option",
+        "aria-selected": o.id === saved ? "true" : "false",
+        onclick: () => {
+          if (o.id === "T9") delete document.documentElement.dataset.type;
+          else document.documentElement.dataset.type = o.id;
+          localStorage.setItem("stemma.type", o.id);
+          pop.querySelectorAll(".tf-option").forEach((x) => x.setAttribute("aria-selected", "false"));
+          opt.setAttribute("aria-selected", "true");
+          trigName.textContent = o.label;
+          trigSpec.style.fontFamily = o.head;
+        }
+      }, name, sample);
+      listBox.append(opt);
+    }
+  }
+  const seg = el("span", {
+    class: "seg"
+  });
+  for (const [k, v] of FONT_SIZES) {
+    const b = el("button", {
+      class: k === savedSize ? "on" : "",
+      onclick: () => {
+        document.documentElement.style.setProperty("--fs", String(v));
+        localStorage.setItem("stemma.fontsize", k);
+        seg.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+        b.classList.add("on");
+      }
+    }, k);
+    seg.append(b);
+  }
+  pop.append(el("div", {
+    class: "tf-foot"
+  }, el("span", {
+    class: "k"
+  }, "text size"), seg));
+  openMenus.push(cd);
+  mount.append(cd);
+}
+var f3 = (x) => x.toFixed(3);
+var pct = (x) => (100 * x).toFixed(1);
+var signed = (x) => (x >= 0 ? "+" : "") + (100 * x).toFixed(1);
+function header(run) {
+  const pass = run.pass === null ? el("span", {
+    class: "pill neutral"
+  }, "ungraded \u2014 no baseline") : run.pass ? el("span", {
+    class: "pill good"
+  }, el("span", {
+    class: "dot good"
+  }), "pass") : el("span", {
+    class: "pill bad"
+  }, el("span", {
+    class: "dot bad"
+  }), "fail");
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "runhead"
+  }, el("span", {
+    class: "h1"
+  }, "evaluation run \u2014 ", run.corpus), pass), el("div", {
+    class: "kv"
+  }, el("span", {
+    class: "k"
+  }, "run id"), el("span", {
+    class: "v"
+  }, run.run_id), el("span", {
+    class: "k"
+  }, "git rev"), el("span", {
+    class: "v"
+  }, run.git_rev), el("span", {
+    class: "k"
+  }, "date (utc)"), el("span", {
+    class: "v"
+  }, run.date), el("span", {
+    class: "k"
+  }, "dataset"), el("span", {
+    class: "v"
+  }, run.dataset), el("span", {
+    class: "k"
+  }, "ablations"), el("span", {
+    class: "v"
+  }, run.ablations.join(" \u2192 "))));
+}
+function cellDelta(c) {
+  return c.delta_baseline ?? c.delta_prev;
+}
+function matrixSection(run) {
+  const drawer = el("div", {
+    class: "drawer"
+  });
+  let openKey = "";
+  const table = el("table", {
+    class: "grid matrix"
+  });
+  const head = el("tr", null, el("th", null, "mechanism"));
+  for (const tier of run.tiers) head.append(el("th", null, tier));
+  table.append(head);
+  for (const ab of run.ablations) {
+    const row = el("tr", null, el("td", {
+      class: "mono"
+    }, ab));
+    for (const tier of run.tiers) {
+      const c = run.cells[ab]?.[tier];
+      if (!c) {
+        row.append(el("td", null, el("div", {
+          class: "cellbox",
+          disabled: "true"
+        }, el("span", {
+          class: "cell-r5 faint"
+        }, "\u2014"))));
+        continue;
+      }
+      const d = cellDelta(c);
+      const key = `${ab}\xD7${tier}`;
+      const box = el("button", {
+        class: "cellbox",
+        onclick: () => {
+          if (openKey === key) {
+            openKey = "";
+            drawer.replaceChildren();
+            box.classList.remove("on");
+            return;
+          }
+          openKey = key;
+          table.querySelectorAll(".cellbox.on").forEach((b) => b.classList.remove("on"));
+          box.classList.add("on");
+          drawer.replaceChildren(cellDrawer(ab, tier, c));
+        }
+      }, el("span", {
+        class: "cell-r5"
+      }, f3(c.r5_strict)), d ? el("span", {
+        class: "cell-delta " + (d.mean > 5e-4 ? "up" : d.mean < -5e-4 ? "down" : "")
+      }, `${signed(d.mean)} (${d.vs.replace("prev:", "vs ")})`) : el("span", {
+        class: "cell-delta"
+      }, "n=" + c.n), d ? el("span", {
+        class: "cell-ci"
+      }, `ci [${signed(d.ci[0])}, ${signed(d.ci[1])}] p=${d.p.toFixed(3)}`) : null);
+      row.append(el("td", null, box));
+    }
+    table.append(row);
+  }
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "mechanism \xD7 tier matrix"), el("div", {
+    class: "lede"
+  }, "column-strict recall@5 per cell; deltas vs the accepted baseline where one exists, ", "else vs the previous ablation. click a cell for its per-query list."), el("div", {
+    class: "table-scroll"
+  }, table), drawer);
+}
+function cellDrawer(ab, tier, c) {
+  const t = el("table", {
+    class: "grid"
+  }, el("tr", null, el("th", null, "query"), el("th", null, "question"), el("th", null, "r@5"), el("th", null, "r@\u221E"), el("th", null, "mrr"), el("th", null, "grounded"), el("th", null, "diagnosis")));
+  for (const q of c.queries) {
+    t.append(el("tr", null, el("td", null, q.id), el("td", {
+      class: "q"
+    }, q.question), el("td", {
+      class: "num"
+    }, f3(q.r5)), el("td", {
+      class: "num"
+    }, f3(q.rinf)), el("td", {
+      class: "num"
+    }, f3(q.mrr)), el("td", null, el("span", {
+      class: "dot " + (q.grounded ? "good" : "bad")
+    }), " ", q.grounded ? "yes" : "no"), el("td", {
+      class: "q"
+    }, q.note)));
+  }
+  return el("div", null, el("div", {
+    class: "subhead"
+  }, `${ab} \xD7 ${tier} \u2014 ${c.n} queries, ${c.n_targets} targets`), metricStrip(c), el("div", {
+    class: "table-scroll"
+  }, t));
+}
+function metricStrip(c) {
+  const pairs = [
+    [
+      "r@1 strict/loose",
+      `${f3(c.r1_strict)} / ${f3(c.r1_loose)}`
+    ],
+    [
+      "r@5 strict/loose",
+      `${f3(c.r5_strict)} / ${f3(c.r5_loose)}`
+    ],
+    [
+      "r@\u221E strict/loose",
+      `${f3(c.rinf_strict)} / ${f3(c.rinf_loose)}`
+    ],
+    [
+      "mrr",
+      f3(c.mrr)
+    ],
+    [
+      "grounded",
+      pct(c.grounded) + "%"
+    ],
+    [
+      "mention F2 strict \u03BC/M",
+      `${f3(c.mention_f_strict_micro)} / ${f3(c.mention_f_strict_macro)}`
+    ],
+    [
+      "mention F2 weak \u03BC/M",
+      `${f3(c.mention_f_weak_micro)} / ${f3(c.mention_f_weak_macro)}`
+    ]
+  ];
+  const strip = el("div", null);
+  for (const [k, v] of pairs) {
+    strip.append(el("span", {
+      class: "chip",
+      style: "margin: 0 6px 6px 0;"
+    }, `${k}: ${v}`));
+  }
+  return strip;
+}
+function nilSection(run) {
+  const t = el("table", {
+    class: "grid"
+  }, el("tr", null, el("th", null, "ablation"), el("th", null, "NIL precision"), el("th", null, "NIL recall"), el("th", null, "confident-wrong")));
+  const wrongs = [];
+  for (const ab of run.ablations) {
+    const n = run.nil[ab];
+    if (!n) continue;
+    t.append(el("tr", null, el("td", null, ab), el("td", {
+      class: "num"
+    }, n.precision === null ? "\u2014" : f3(n.precision)), el("td", {
+      class: "num"
+    }, n.recall === null ? "\u2014" : f3(n.recall)), el("td", {
+      class: "num"
+    }, String(n.confident_wrong.length))));
+    for (const w of n.confident_wrong) {
+      wrongs.push(el("div", {
+        class: "fail-item"
+      }, el("div", {
+        class: "fail-title"
+      }, el("span", {
+        class: "dot bad"
+      }), `${ab} \u2014 ${w.id}`), el("div", {
+        class: "fail-detail"
+      }, w.question), el("div", {
+        class: "fail-queries"
+      }, `resolved to ${w.candidate} (score ${f3(w.score)})`)));
+    }
+  }
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "honest absence (NIL)"), el("div", {
+    class: "lede"
+  }, "precision: correct absences over all absence outcomes. recall: NIL queries that did not ", "produce a confident wrong mention. every confident-wrong is a named case, not just a rate."), el("div", {
+    class: "table-scroll"
+  }, t), wrongs.length ? el("div", {
+    class: "panel"
+  }, ...wrongs) : el("div", {
+    class: "empty"
+  }, "no confident-wrong cases in this run"));
+}
+function calibrationSection(run) {
+  const grid = el("div", {
+    class: "calgrid"
+  });
+  for (const ab of run.ablations) {
+    const buckets = run.calibration[ab];
+    if (!buckets) continue;
+    grid.append(el("div", {
+      class: "calcard panel"
+    }, el("div", {
+      class: "subhead"
+    }, ab), calibrationSvg(buckets), el("div", {
+      class: "callabel"
+    }, "P(gold | score bucket) \u2014 dashed identity is perfect calibration")));
+  }
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "calibration"), el("div", {
+    class: "lede"
+  }, "the fused scores claim absolute meaning (bands at 0.35 / 0.85 / 0.9); this curve is the ", "direct test. bucket area scales with sample count."), grid);
+}
+function calibrationSvg(buckets) {
+  const W = 260, H = 180, L = 34, B = 24, T = 8, R = 8;
+  const pw = W - L - R, ph = H - T - B;
+  const x = (v) => L + v * pw;
+  const y = (v) => T + (1 - v) * ph;
+  const svg = svgEl("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    role: "img"
+  });
+  for (const v of [
+    0,
+    0.5,
+    1
+  ]) {
+    svg.append(svgEl("line", {
+      x1: x(0),
+      y1: y(v),
+      x2: x(1),
+      y2: y(v),
+      stroke: "var(--rule)",
+      "stroke-width": 1
+    }));
+    svg.append(svgEl("text", {
+      x: L - 5,
+      y: y(v) + 3,
+      "text-anchor": "end",
+      "font-size": 8,
+      fill: "var(--ink-faint)",
+      "font-family": "var(--mono)"
+    }, f3(v)));
+  }
+  for (const v of [
+    0,
+    0.5,
+    1
+  ]) {
+    svg.append(svgEl("text", {
+      x: x(v),
+      y: H - 8,
+      "text-anchor": "middle",
+      "font-size": 8,
+      fill: "var(--ink-faint)",
+      "font-family": "var(--mono)"
+    }, String(v)));
+  }
+  svg.append(svgEl("line", {
+    x1: x(0),
+    y1: y(0),
+    x2: x(1),
+    y2: y(1),
+    stroke: "var(--flat)",
+    "stroke-width": 1,
+    "stroke-dasharray": "3 3"
+  }));
+  const pts = buckets.filter((b) => b.n > 0);
+  if (pts.length > 0) {
+    const path = pts.map((b, i) => `${i === 0 ? "M" : "L"}${x((b.lo + b.hi) / 2).toFixed(1)},${y(b.p_gold).toFixed(1)}`).join(" ");
+    svg.append(svgEl("path", {
+      d: path,
+      fill: "none",
+      stroke: "var(--accent)",
+      "stroke-width": 1.5
+    }));
+    const maxN = Math.max(...pts.map((b) => b.n));
+    for (const b of pts) {
+      svg.append(svgEl("circle", {
+        cx: x((b.lo + b.hi) / 2),
+        cy: y(b.p_gold),
+        r: 1.5 + 3.5 * Math.sqrt(b.n / maxN),
+        fill: "var(--accent)",
+        "fill-opacity": 0.75
+      }));
+    }
+  } else {
+    svg.append(svgEl("text", {
+      x: x(0.5),
+      y: y(0.5),
+      "text-anchor": "middle",
+      "font-size": 9,
+      fill: "var(--ink-faint)",
+      "font-family": "var(--mono)"
+    }, "no selected candidates"));
+  }
+  return svg;
+}
+function costSection(run) {
+  const t = el("table", {
+    class: "grid"
+  }, el("tr", null, el("th", null, "ablation"), el("th", null, "tier"), el("th", null, "median ms"), el("th", null, "p95 ms"), el("th", null, "dense probes/q"), el("th", null, "adjudication rate"), el("th", null, "selected/mention")));
+  for (const ab of run.ablations) {
+    for (const tier of run.tiers) {
+      const c = run.cells[ab]?.[tier];
+      if (!c) continue;
+      t.append(el("tr", null, el("td", null, ab), el("td", null, tier), el("td", {
+        class: "num"
+      }, c.latency_median_ms.toFixed(1)), el("td", {
+        class: "num"
+      }, c.latency_p95_ms.toFixed(1)), el("td", {
+        class: "num"
+      }, c.dense_probes_mean.toFixed(2)), el("td", {
+        class: "num"
+      }, f3(c.adjudication_rate)), el("td", {
+        class: "num"
+      }, c.selected_per_mention.toFixed(2))));
+    }
+  }
+  const bt = el("table", {
+    class: "grid"
+  }, el("tr", null, el("th", null, "ablation"), el("th", null, "embed calls"), el("th", null, "texts embedded"), el("th", null, "embed ms total"), el("th", null, "lm calls"), el("th", null, "lm ms mean")));
+  for (const ab of run.ablations) {
+    const b = run.backend_cost[ab];
+    if (!b) continue;
+    bt.append(el("tr", null, el("td", null, ab), el("td", {
+      class: "num"
+    }, String(b.embed_calls)), el("td", {
+      class: "num"
+    }, String(b.embed_texts)), el("td", {
+      class: "num"
+    }, b.embed_ms_total.toFixed(0)), el("td", {
+      class: "num"
+    }, String(b.lm_calls)), el("td", {
+      class: "num"
+    }, b.lm_ms_mean.toFixed(0))));
+  }
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "cost"), el("div", {
+    class: "lede"
+  }, "every mechanism's lift is quoted with its cost or not at all: latency next to recall, ", "probe counts and LM routing measured at the backend seams."), el("div", {
+    class: "table-scroll"
+  }, t), el("div", {
+    class: "subhead"
+  }, "backend round-trips"), el("div", {
+    class: "table-scroll"
+  }, bt));
+}
+function tukeySection(run) {
+  const tiers = Object.keys(run.tukey);
+  if (tiers.length === 0) return null;
+  const t = el("table", {
+    class: "grid"
+  }, el("tr", null, el("th", null, "tier"), el("th", null, "pair"), el("th", null, "adjusted p"), el("th", null, "verdict")));
+  for (const tier of tiers) {
+    for (const p of run.tukey[tier]) {
+      t.append(el("tr", null, el("td", null, tier), el("td", null, `${p.a} vs ${p.b}`), el("td", {
+        class: "num"
+      }, p.p.toFixed(4)), el("td", null, p.p < 0.05 ? el("span", {
+        class: "pill caution"
+      }, "significant") : el("span", {
+        class: "faint"
+      }, "n.s."))));
+    }
+  }
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "multiple comparisons \u2014 randomised Tukey HSD"), el("div", {
+    class: "lede"
+  }, "familywise-adjusted pairwise differences across the ablation sweep (per-query recall@5)."), el("div", {
+    class: "table-scroll"
+  }, t));
+}
+function failuresSection(run) {
+  const body = run.failures.length === 0 ? el("div", {
+    class: "empty"
+  }, run.pass === null ? "ungraded: no accepted baseline for this corpus yet" : "all grading checks passed") : el("div", {
+    class: "panel"
+  }, run.failures.map((f) => el("div", {
+    class: "fail-item"
+  }, el("div", {
+    class: "fail-title"
+  }, el("span", {
+    class: "dot bad"
+  }), el("span", {
+    class: "chip"
+  }, f.check), " ", f.cell), el("div", {
+    class: "fail-detail"
+  }, f.detail), f.queries.length ? el("div", {
+    class: "fail-queries"
+  }, f.queries.join("  ")) : null)));
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "named failures"), body);
+}
+function notesSection(run) {
+  if (run.notes.length === 0) return null;
+  return el("div", {
+    class: "section"
+  }, el("div", {
+    class: "h2"
+  }, "run notes"), el("div", {
+    class: "panel mono",
+    style: "font-size: 11.5px; line-height: 1.7;"
+  }, run.notes.map((n) => el("div", null, n))));
+}
+function main() {
+  const blob = document.getElementById("run-data");
+  if (!blob) return;
+  const run = JSON.parse(blob.textContent ?? "{}");
+  buildThemePicker();
+  buildTypePicker();
+  document.addEventListener("click", () => closeAllMenus());
+  document.title = `stemma eval \u2014 ${run.run_id}`;
+  const crumbs = document.getElementById("crumbs");
+  if (crumbs) crumbs.textContent = `eval / ${run.corpus} / ${run.run_id}`;
+  const page = document.getElementById("page");
+  const sections = [
+    header(run),
+    matrixSection(run),
+    nilSection(run),
+    calibrationSection(run),
+    costSection(run),
+    tukeySection(run),
+    failuresSection(run),
+    notesSection(run)
+  ];
+  for (const s of sections) if (s) page.append(s);
+}
+main();
+
+</script>
+</body>
+</html>
