@@ -44,9 +44,9 @@ Three consequences follow from this ordering and are relied on throughout:
    `mode=ro` URI makes writes to `src` fail at the VFS layer; a bug in
    stemma cannot corrupt user data. `stemmadb::tests::attaches_user_db_read_only`
    asserts the failure.
-3. **WAL on the store** lets the resolution server hold the store read-write
-   while the console, the Python `StoreBrowser`, and `sqlite3` open it
-   `mode=ro` concurrently.
+3. **WAL on the store** [SQLite-WAL] lets the resolution server hold the
+   store read-write while the console, the Python `StoreBrowser`, and
+   `sqlite3` open it `mode=ro` concurrently.
 
 `StemmaDb::open_in_memory()` gives a throwaway pair (`:memory:` store with a
 `:memory:` `src`) for tests; it is the only way to get a *writable* `src`,
@@ -57,7 +57,7 @@ and exists so tests can construct fixtures.
 `register_extensions()` calls `sqlite3_auto_extension(sqlite3_vec_init)`
 once per process behind a `std::sync::Once`, so every connection opened
 afterwards — including ones stemma did not open — has `vec0` and the
-`vec_*()` scalar functions. sqlite-vec is compiled from
+`vec_*()` scalar functions. sqlite-vec [sqlite-vec] is compiled from
 [`third_party/sqlite_vec/sqlite-vec.c`](../../third_party/sqlite_vec) and
 statically linked; there is no runtime `.so` loading and no patched SQLite.
 `StemmaDb::vec_version()` (`SELECT vec_version()`) is the liveness check,
@@ -203,7 +203,9 @@ CREATE TABLE IF NOT EXISTS embed_queue (
 CREATE INDEX IF NOT EXISTS embed_queue_status ON embed_queue(status);
 ```
 
-The write path never waits on a model. `stemma_ingest::enqueue_missing_embeddings`
+The write path never waits on a model — the queue-driven external-worker
+pattern proven by the PostgreSQL vectorizer lineage [pgai-vectorizer],
+transplanted to SQLite. `stemma_ingest::enqueue_missing_embeddings`
 inserts one pending item per document cell (`lex_values.is_doc = 1`) that has
 no vector in `vec_dense` — documents only, because dense retrieval pays off
 where mentions resolve *into* long text, and short values are already served
@@ -531,7 +533,11 @@ document-frequency denominator.
 ## Knowledge store schema
 
 Owned by [`stemma-kg`](../../crates/stemma-kg/src/lib.rs); the algorithms
-that fill it are in [04-knowledge-graph.md](04-knowledge-graph.md).
+that fill it are in [04-knowledge-graph.md](04-knowledge-graph.md). The
+shape is the nodes/edges-tables-plus-recursive-CTE pattern
+[simple-graph], adequate to ~10⁶ edges — research scale needs no graph
+engine, and the `KnowledgeStore` trait is the seam through which one could
+substitute later.
 
 ```sql
 CREATE TABLE IF NOT EXISTS kg_nodes (
@@ -755,5 +761,12 @@ stage that fills them lands.
 - [Robertson 2009] Stephen Robertson, Hugo Zaragoza. "The
   Probabilistic Relevance Framework: BM25 and Beyond." *Foundations and
   Trends in Information Retrieval* 3(4), 2009.
+- [sqlite-vec] Alex Garcia. *sqlite-vec* v0.1.6 (software).
+- [pgai-vectorizer] Timescale. *pgai / pgvectorizer* (software) — the
+  queue-driven external-worker embedding pattern.
+- [simple-graph] Denis Papathanasiou. *simple-graph* (software) — graph
+  tables + recursive CTEs in SQLite.
+- [SQLite-WAL] SQLite Consortium. "Write-Ahead Logging."
+  sqlite.org/wal.html.
 
 See [00-bibliography.md](00-bibliography.md) for the full reference list.

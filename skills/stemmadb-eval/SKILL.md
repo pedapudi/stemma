@@ -28,6 +28,12 @@ unrecoverable downstream, an extra candidate is noise. Report value-linking
 recall directly — never end-to-end SQL execution accuracy, which measures a
 different system.
 
+The full protocol with citations is docs/design/06-evaluation.md; the
+harness design (query tiers, mechanism ablations, the mechanism × tier
+matrix, statistical grading) is docs/design/07-eval-harness.md — read both
+before extending metrics, and keep new metrics consistent with their
+definitions and with the shared bibliography (docs/design/00-bibliography.md).
+
 ## Running
 
 ```sh

@@ -3,7 +3,11 @@
 Four hand-drawn diagrams and the walk through them. Every box and arrow here
 is checked against the code as it stands.
 The prose companion is [architecture.md](architecture.md) and the deep
-reference is [docs/design/](design/README.md).
+reference is [docs/design/](design/README.md); every constant drawn in a
+diagram (RRF_K, thresholds, caps, margins) is specified — with its
+justification and citations — in the design doc for its stage, and the
+research claims behind the architecture are cited in the
+[shared bibliography](design/00-bibliography.md).
 
 Each diagram is a single SVG in [`assets/diagrams/`](../assets/diagrams):
 strokes and text follow `currentColor` with a light/dark media-query

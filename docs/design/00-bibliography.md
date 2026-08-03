@@ -263,6 +263,34 @@ and `[C. Li 2025]`.
   DOI 10.18653/v1/2025.findings-emnlp.568. *(Secondary sources dating this to
   EMNLP 2024 are wrong.)*
 
+## E2. Systems patterns (software)
+
+The storage layer descends from working systems as much as from papers;
+these are software citations, held to the same rule — cite what shaped the
+design.
+
+- **[sqlite-vec]** Alex Garcia. *sqlite-vec: a vector search SQLite
+  extension.* v0.1.6, statically linked from
+  [`third_party/sqlite_vec`](../../third_party/sqlite_vec).
+  https://github.com/asg017/sqlite-vec. *(The `vec0` virtual table:
+  typed vector columns, brute-force KNN — no ANN index as of this
+  version, which is why the dense channel budgets probes.)*
+- **[pgai-vectorizer]** Timescale. *pgvectorizer / pgai: automatic
+  embedding pipelines for PostgreSQL.* 2024.
+  https://github.com/timescale/pgai. *(The queue-driven external-worker
+  embedding pattern — never embed on the write path; reconcile
+  asynchronously; record model identity — that `embed_queue` +
+  `model_registry` + the server drain task adopt for SQLite.)*
+- **[simple-graph]** Denis Papathanasiou. *simple-graph: a graph database
+  in SQLite.* https://github.com/dpapathanasiou/simple-graph. *(The
+  nodes/edges-tables-plus-recursive-CTE pattern behind
+  `kg_nodes`/`kg_edges`; proven to ~10⁶ edges, which covers research
+  scale without a graph engine.)*
+- **[SQLite-WAL]** SQLite Consortium. "Write-Ahead Logging."
+  https://www.sqlite.org/wal.html. *(One writer, many concurrent
+  readers — the property the store relies on for server-writes +
+  console/browser reads, and for the drain task's separate connection.)*
+
 ## F2. Evaluation methodology
 
 - **[Xiang 2025]** Yilin Xiang et al. "When to use Graphs in RAG: A
