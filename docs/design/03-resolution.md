@@ -490,14 +490,22 @@ score = score.max(calibrated);
 ```
 
 The window `[0.30, 0.60]` is the observed working range of
-Qwen3-Embedding-0.6B under the asymmetric instruct format on this corpus —
-cosines below ≈ 0.4 are topical noise, above ≈ 0.55 are strong semantic
-matches — and the 0.78 ceiling keeps a perfect cosine below the 0.85
-document ceiling and the 0.9 exact floor, preserving the band ordering:
-*exact > lexically-corroborated document > dense-only semantic match*. The
-constants are per-encoder by nature; when the embedder becomes swappable in
-anger, the calibration window belongs beside the model identity in
-`model_registry`, not in the code.
+Qwen3-Embedding-0.6B [Zhang 2025] under the asymmetric instruct format on
+this corpus — cosines below ≈ 0.4 are topical noise, above ≈ 0.55 are
+strong semantic matches — and the 0.78 ceiling keeps a perfect cosine below
+the 0.85 document ceiling and the 0.9 exact floor, preserving the band
+ordering: *exact > lexically-corroborated document > dense-only semantic
+match*. Treating a raw cosine as meaningful only after per-model
+calibration is not caution for its own sake: cosine similarity is an
+artifact of how an embedding was trained, not a universal semantic scale
+[Steck 2024], and the same corpus measured under this encoder shows a
+compressed working range consistent with its crowding profile
+([05-encoders-decoders.md](05-encoders-decoders.md#the-legal-corpus-measured)).
+The constants are per-encoder by nature; when the embedder becomes
+swappable in anger, the calibration window belongs beside the model
+identity in `model_registry`, not in the code — and its empirical
+validation is the calibration-curve track of
+[07-eval-harness.md](07-eval-harness.md#what-is-measured-and-why).
 
 ### Worked examples, from real traces
 
@@ -963,5 +971,10 @@ written while the server is stopped. There is no online re-embed.
   PVLDB 16(6), 2023.
 - [Robertson 2009] Stephen Robertson, Hugo Zaragoza. "The
   Probabilistic Relevance Framework: BM25 and Beyond." *FnTIR* 3(4), 2009.
+- [Steck 2024] Harald Steck, Chaitanya Ekanadham, Nathan Kallus. "Is
+  Cosine-Similarity of Embeddings Really About Similarity?" WWW 2024
+  Companion.
+- [Zhang 2025] Yanzhao Zhang et al. "Qwen3 Embedding: Advancing Text
+  Embedding and Reranking Through Foundation Models." arXiv:2506.05176.
 
 Full bibliography: [00-bibliography.md](00-bibliography.md).

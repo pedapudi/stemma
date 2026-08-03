@@ -263,6 +263,76 @@ and `[C. Li 2025]`.
   DOI 10.18653/v1/2025.findings-emnlp.568. *(Secondary sources dating this to
   EMNLP 2024 are wrong.)*
 
+## F2. Evaluation methodology
+
+- **[Xiang 2025]** Yilin Xiang et al. "When to use Graphs in RAG: A
+  Comprehensive Analysis for Graph Retrieval-Augmented Generation"
+  (GraphRAG-Bench). arXiv:2506.05690, 2025. *(Tiered tasks by evidence
+  topology; pipeline-layer metrics; the finding that graph structure helps
+  multi-hop and synthesis tiers while vanilla RAG matches or beats it on
+  simple fact retrieval — the discipline behind
+  [07-eval-harness.md](07-eval-harness.md)'s per-tier matrix and
+  containment grading.)*
+- **[Röder 2018]** Michael Röder, Ricardo Usbeck, Axel-Cyrille Ngonga
+  Ngomo. "GERBIL — Benchmarking Named Entity Recognition and Linking
+  Consistently." *Semantic Web* 9(5):605–625, 2018. DOI 10.3233/SW-170286.
+  *(A decade of incomparable EL numbers traced partly to underspecified
+  annotation matching and aggregation; the source of 07's explicit
+  strict/weak matching modes and micro/macro dual reporting.)*
+- **[TAC-KBP 2013]** "TAC KBP 2013 Entity Linking Task Description v1.0."
+  NIST Text Analysis Conference, 2013. *(The B³+ lineage: linking accuracy
+  and NIL clustering scored conjunctively, never separately — the ancestor
+  of 07's grounded-query rate.)*
+- **[Zhong 2020]** Ruiqi Zhong, Tao Yu, Dan Klein. "Semantic Evaluation for
+  Text-to-SQL with Distilled Test Suites." EMNLP 2020, 396–411.
+  arXiv:2010.02840. *(Single-instance execution accuracy silently accepts
+  semantically wrong queries — 2.5% average, 8.1% worst-case on Spider;
+  the reason 07's targets are denotation-verified and matched
+  column-strict.)*
+- **[Thakur 2021]** Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek
+  Srivastava, Iryna Gurevych. "BEIR: A Heterogeneous Benchmark for
+  Zero-shot Evaluation of Information Retrieval Models." NeurIPS 2021
+  Datasets and Benchmarks. arXiv:2104.08663. *(BM25 is a top-tier zero-shot
+  retriever; in-domain wins do not transfer out of domain; heterogeneous
+  corpora must not be averaged. The lexical ablation is a first-class row
+  because of this result.)*
+- **[Petroni 2021]** Fabio Petroni et al. "KILT: a Benchmark for Knowledge
+  Intensive Language Tasks." NAACL 2021, 2523–2544. arXiv:2009.02252.
+  *(KILT-scores award the answer point only when gold provenance is fully
+  retrieved — the conjunctive answer-plus-evidence pattern 07's agent
+  layer adopts for citation grounding.)*
+- **[Saad-Falcon 2024]** Jon Saad-Falcon, Omar Khattab, Christopher Potts,
+  Matei Zaharia. "ARES: An Automated Evaluation Framework for
+  Retrieval-Augmented Generation Systems." NAACL 2024. arXiv:2311.09476.
+  *(LLM judges corrected against a small human-labeled anchor via
+  prediction-powered inference, yielding valid confidence intervals —
+  the pattern for any judged metric this harness later adopts.)*
+- **[Es 2024]** Shahul Es, Jithin James, Luis Espinosa-Anke, Steven
+  Schockaert. "RAGAs: Automated Evaluation of Retrieval Augmented
+  Generation." EACL 2024 System Demonstrations. arXiv:2309.15217.
+  *(The reference-free judged-metric approach; used here as the contrast
+  case — raw judge scores without a human anchor are not accepted as
+  evidence.)*
+- **[Angelopoulos 2023]** Anastasios N. Angelopoulos, Stephen Bates, Clara
+  Fannjiang, Michael I. Jordan, Tijana Zrnic. "Prediction-Powered
+  Inference." *Science* 382(6671):669–674, 2023. arXiv:2301.09633.
+- **[Smucker 2007]** Mark D. Smucker, James Allan, Ben Carterette. "A
+  Comparison of Statistical Significance Tests for Information Retrieval
+  Evaluation." CIKM 2007, 623–632. DOI 10.1145/1321440.1321528.
+  *(Randomization, bootstrap and t-tests agree with each other;
+  Wilcoxon and sign tests agree with nothing and should be retired —
+  07's grading uses paired randomization accordingly.)*
+- **[Carterette 2012]** Ben Carterette. "Multiple Testing in Statistical
+  Analysis of Systems-Based Information Retrieval Experiments." *ACM
+  TOIS* 30(1):1–34, 2012. DOI 10.1145/2094072.2094076. *(Randomised Tukey
+  HSD for many-system comparisons; the multiple-comparison control for
+  ablation sweeps.)*
+- **[Sakai 2016]** Tetsuya Sakai. "Statistical Significance, Power, and
+  Sample Sizes: A Systematic Review of SIGIR and TOIS, 2006–2015."
+  SIGIR 2016, 5–14. DOI 10.1145/2911451.2911492. *(The field's chronic
+  underreporting of effect sizes and power — why every cell delta in a
+  run report carries a confidence interval, not just a point value.)*
+
 ## G. Embedding geometry: anisotropy, crowding, hubness
 
 - **[Ethayarajh 2019]** Kawin Ethayarajh. "How Contextual are Contextualized
@@ -348,13 +418,6 @@ against primary sources, unlike sections A–G.
 - **[Steck 2024]** Harald Steck, Chaitanya Ekanadham, Nathan Kallus. "Is
   Cosine-Similarity of Embeddings Really About Similarity?" WWW 2024
   Companion. arXiv:2403.05440.
-- **[Xiang 2025]** Yilin Xiang et al. "When to use Graphs in RAG: A
-  Comprehensive Analysis for Graph Retrieval-Augmented Generation"
-  (GraphRAG-Bench). arXiv:2506.05690. *(Tiered tasks by evidence topology;
-  pipeline-layer metrics; the finding that graph structure helps multi-hop
-  and synthesis tiers while vanilla RAG matches or beats it on simple fact
-  retrieval — the discipline behind 07's per-tier matrix and containment
-  grading.)*
 - **[Myllymäki 2017]** Mari Myllymäki, Tomáš Mrkvička, Pavel Grabarnik, Henri
   Seijo, Ulf Hahn. "Global envelope tests for spatial processes." *Journal of
   the Royal Statistical Society Series B* 79(2):381–404, 2017. *(The

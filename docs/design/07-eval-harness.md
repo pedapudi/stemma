@@ -60,6 +60,76 @@ so the core harness is exact-match, deterministic, and cheap enough to run
 on every commit. LLM judgment appears only in the (separately gated)
 agent-grounding layer, and even there mechanical checks are preferred.
 
+## What the older evaluation traditions add
+
+Value linking sits at the junction of four fields with mature evaluation
+literatures — entity linking, text-to-SQL, ad-hoc retrieval, and RAG — and
+each contributes a hard-won lesson this harness adopts.
+
+**Entity linking: matching modes must be explicit, and NIL is part of the
+headline score.** GERBIL [Röder 2018] standardized EL evaluation after a
+decade in which systems were incomparable partly because *annotation
+matching* was underspecified — does a predicted span count when it overlaps
+the gold span, or only when it equals it? We adopt its discipline twice:
+mention-detection F is reported under both **strict** (byte-identical span)
+and **weak** (token-overlap) matching, because greedy segmentation
+legitimately shifts boundaries ("Chen" vs "Chen's") and the strict/weak gap
+is itself a segmentation-quality signal; and both **micro** (per-mention)
+and **macro** (per-query) aggregates are reported, since our queries carry
+one to four mentions and micro-only reporting would over-weight multi-
+mention queries. From TAC-KBP's decade of EL tracks [TAC-KBP 2013], whose
+B³+ metric refused to score linking and NIL-handling separately: our
+headline per-query credit is **conjunctive** — a query scores fully only
+when its mentions are detected *and* linked to gold rowids, with NIL
+queries scoring only on affirmed absence. Partial credit exists in the
+diagnostic decomposition, never in the headline.
+
+**Text-to-SQL: single-instance execution creates silent false positives.**
+Test-suite accuracy [Zhong 2020] showed that comparing query denotations on
+one database wrongly accepts semantically different SQL whenever the
+instance happens to make them agree (2.5% average, 8.1% worst-case on
+Spider) — the fix was checking against many distilled instances. The
+resolution analog: a candidate whose *value* equals the gold literal may
+still be the wrong record — the same string in the wrong column, or in one
+of several rows the predicate does not select. So targets are
+**denotation-verified** at derivation time (the gold literal must select
+the gold rows under the gold predicate on the actual instance), and
+"points at" matching is scored at two strictnesses: **value-loose** (06's
+normalized equality anywhere) and **column-strict** (equality in the gold
+column). The gap between them is the measured coincidence rate — the exact
+failure class Zhong showed single-instance execution hides.
+
+**Ad-hoc retrieval: the lexical baseline is not a strawman, and deltas
+need statistics.** BEIR [Thakur 2021] found BM25 a top-tier *zero-shot*
+retriever — dense models that win in-domain routinely lose out of domain —
+which is why the `lex` ablation is published in every matrix as a
+first-class row, never as a foil, and why per-corpus numbers are never
+averaged across corpora (BEIR's heterogeneity lesson: the average of
+Spider-clean and BIRD-dirty describes neither). For grading, the IR
+statistics literature is unambiguous: paired randomization or t-tests
+agree with each other while Wilcoxon/sign tests agree with nothing
+[Smucker 2007], and comparing many systems needs multiple-comparison
+control [Carterette 2012], with the field's systematic reviews finding
+chronic underreporting of effect sizes and power [Sakai 2016]. The
+harness therefore attaches a **paired randomization test and a
+bootstrapped confidence interval to every cell delta**, uses randomised
+Tukey HSD when an ablation sweep compares more than two variants, and
+treats the 1-point grading guard as a floor, not a substitute — a
+significant 0.8-point regression on a 250-query tier still fails review.
+
+**RAG evaluation: judged metrics need calibration against humans.** KILT
+[Petroni 2021] made provenance conjunctive — its KILT-scores award the
+answer point only when the gold provenance pages are also retrieved — and
+that is precisely our layer-3 rule: an agent answer is credited only when
+its citations ground to gold rowids in the same turn's tool results.
+Where LLM judges eventually enter (auditing the synthetic set, scaling
+layer-3 beyond mechanical checks), ARES [Saad-Falcon 2024] supplies the
+sober pattern: judge outputs are corrected against a small human-labeled
+set via prediction-powered inference [Angelopoulos 2023] to produce valid
+confidence intervals, rather than trusted raw as reference-free scores
+[Es 2024] are. The ~200-query human skim before freezing the legal set
+doubles as that labeled anchor.
+
 ## Why this is grounded
 
 Two properties keep the harness honest:
@@ -144,12 +214,17 @@ All layer-1 metrics follow 06's definitions and its recall-weighted stance
 (a missed record is unrecoverable downstream; extra candidates are
 filterable noise). Per (tier × ablation) cell:
 
-- **Mention-detection F** (β = 2): do selected spans cover the tokens the
-  gold SQL filters on? Catches segmentation failures independently of
-  retrieval.
+- **Mention-detection F** (β = 2), under both strict and weak span
+  matching, micro- and macro-aggregated [Röder 2018]: do selected spans
+  cover the tokens the gold SQL filters on? Catches segmentation failures
+  independently of retrieval; the strict/weak gap measures boundary drift.
 - **Candidate recall@k** (k = 1, 5, ∞) and **MRR** of the gold row, with
   the k-pattern diagnosis table from 06 (ranking vs threshold vs retrieval
-  failure).
+  failure), each at value-loose and column-strict matching [Zhong 2020].
+- **Grounded-query rate**: the conjunctive headline — mentions detected
+  *and* gold rowids linked (NIL affirmed, for the NIL tier), in the
+  B³+/KILT lineage [TAC-KBP 2013; Petroni 2021]. One number per (tier ×
+  ablation) cell that cannot be gamed by partial success.
 - **NIL-precision / NIL-recall** on the NIL tier: NIL-precision is the
   fraction of no-mention (or below-threshold) outcomes that are correct
   absences; NIL-recall is the fraction of absent-answer queries that did
@@ -177,9 +252,13 @@ where its evidence is not real, and the next corpus will pay for it.
 
 A run passes when:
 
-1. **No cell regresses** by more than 1 point of recall@5 against the
-   accepted baseline (stored in-repo as a small JSON, updated deliberately
-   and reviewed like code).
+1. **No cell regresses** against the accepted baseline (stored in-repo as
+   a small JSON, updated deliberately and reviewed like code). "Regresses"
+   means: a drop exceeding 1 point of recall@5, **or** any drop a paired
+   randomization test marks significant at α = 0.05 [Smucker 2007] — the
+   1-point guard is a floor, not a license. Cell deltas carry bootstrapped
+   confidence intervals; sweeps comparing more than two variants use
+   randomised Tukey HSD for multiple-comparison control [Carterette 2012].
 2. **Tier-mechanism containment holds**: off-target cells move < 1 point in
    either direction (see above — upward drift off-target is also a fail).
 3. **NIL-precision does not drop**; any new confident-wrong on the NIL set
@@ -222,4 +301,34 @@ mechanisms report into, in the same units as everything before them.
 - [Xiang 2025] Yilin Xiang et al. "When to use Graphs in RAG: A
   Comprehensive Analysis for Graph Retrieval-Augmented Generation"
   (GraphRAG-Bench). arXiv:2506.05690.
+- [Röder 2018] Michael Röder, Ricardo Usbeck, Axel-Cyrille Ngonga Ngomo.
+  "GERBIL — Benchmarking Named Entity Recognition and Linking
+  Consistently." Semantic Web 9(5), 2018.
+- [TAC-KBP 2013] "TAC KBP Entity Linking Task Description v1.0" (B³+
+  scoring, NIL clustering). NIST TAC, 2013.
+- [Zhong 2020] Ruiqi Zhong, Tao Yu, Dan Klein. "Semantic Evaluation for
+  Text-to-SQL with Distilled Test Suites." EMNLP 2020. arXiv:2010.02840.
+- [Thakur 2021] Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek
+  Srivastava, Iryna Gurevych. "BEIR: A Heterogeneous Benchmark for
+  Zero-shot Evaluation of Information Retrieval Models." NeurIPS 2021
+  Datasets & Benchmarks. arXiv:2104.08663.
+- [Petroni 2021] Fabio Petroni et al. "KILT: a Benchmark for Knowledge
+  Intensive Language Tasks." NAACL 2021. arXiv:2009.02252.
+- [Saad-Falcon 2024] Jon Saad-Falcon, Omar Khattab, Christopher Potts,
+  Matei Zaharia. "ARES: An Automated Evaluation Framework for
+  Retrieval-Augmented Generation Systems." NAACL 2024. arXiv:2311.09476.
+- [Es 2024] Shahul Es, Jithin James, Luis Espinosa-Anke, Steven Schockaert.
+  "RAGAs: Automated Evaluation of Retrieval Augmented Generation."
+  EACL 2024 Demos. arXiv:2309.15217.
+- [Angelopoulos 2023] Anastasios N. Angelopoulos, Stephen Bates, Clara
+  Fannjiang, Michael I. Jordan, Tijana Zrnic. "Prediction-Powered
+  Inference." Science 382(6671), 2023. arXiv:2301.09633.
+- [Smucker 2007] Mark D. Smucker, James Allan, Ben Carterette. "A
+  Comparison of Statistical Significance Tests for Information Retrieval
+  Evaluation." CIKM 2007.
+- [Carterette 2012] Ben Carterette. "Multiple Testing in Statistical
+  Analysis of Systems-Based Information Retrieval Experiments." ACM TOIS
+  30(1), 2012.
+- [Sakai 2016] Tetsuya Sakai. "Statistical Significance, Power, and Sample
+  Sizes: A Systematic Review of SIGIR and TOIS, 2006–2015." SIGIR 2016.
 - BIRD, DIVER, SEED: see [00-bibliography.md](00-bibliography.md).
