@@ -22,6 +22,7 @@ Question records:
 {
   "question": "...",
   "tier": "L1" | "L2" | "L3" | "L4" | "NIL",
+  "corpus": "legal" | "mini",
   "targets": [
     {"table": "...", "column": "...", "rowids": [1, 2],
      "literal": "optional", "match_mode": "doc" | "value"}
@@ -36,6 +37,8 @@ Question records:
 }
 ```
 
+- `corpus` names the config-file database (`databases` section) the targets
+  resolve against.
 - `match_mode: "doc"` — the gold row is a document (`is_doc` containment
   semantics); `"value"` — exact stored-value semantics, `literal` carries the
   stored value.

@@ -700,6 +700,7 @@ def gen_tier_l1_l2(tier, lex, legal, lm, stream_reg, stream_sec, n, seed,
         rec = {
             "question": q,
             "tier": tier,
+            "corpus": "legal",
             "targets": [target],
             "nil": False,
             "provenance": {
@@ -800,6 +801,7 @@ def gen_tier_l4(lex, legal, lm, stream_reg, n, seed, stats, review,
         rec = {
             "question": q,
             "tier": "L4",
+            "corpus": "legal",
             "targets": [
                 {"table": "regulations", "column": "text",
                  "rowids": [reg_rowid], "match_mode": "doc"},
@@ -868,6 +870,7 @@ def gen_tier_nil(lex, lm, n, seed, rng, stats, review, k=3):
         rec = {
             "question": q,
             "tier": "NIL",
+            "corpus": "legal",
             "targets": [],
             "nil": True,
             "provenance": {
@@ -1019,6 +1022,7 @@ def gen_mini_l3(mini, lm, n, seed, rng, stats, review, k=3):
             rec = {
                 "question": q,
                 "tier": "L3",
+                "corpus": "mini",
                 "targets": case["targets"],
                 "nil": False,
                 "provenance": {
