@@ -125,6 +125,17 @@ failures; the three corpora and what each is for; corpus-construction
 guidelines read as evaluation rules; and the acceptance gate for each
 milestone.
 
+**[07 — The evaluation harness](07-eval-harness.md)**
+The runnable design that 06's protocol becomes: three layers (resolution,
+construction, agent grounding), NL questions as the only input under test,
+queries tiered by the mechanism they are constructed to require with
+mechanically verified tier membership, cumulative mechanism ablations, and
+the mechanism × tier matrix as the primary artifact — with
+tier-mechanism containment graded so that a mechanism moving an off-target
+tier fails the run even when it moves it upward. Grounded in
+GraphRAG-Bench's finding that structure helps only on the tiers that need
+it, and that only per-tier reporting can see this.
+
 **[00 — Bibliography](00-bibliography.md)**
 The shared reference list, grouped by topic, with citation keys disambiguated
 by first-author given name where surnames collide. Sections A–G were checked

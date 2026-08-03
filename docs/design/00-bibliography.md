@@ -348,6 +348,13 @@ against primary sources, unlike sections A–G.
 - **[Steck 2024]** Harald Steck, Chaitanya Ekanadham, Nathan Kallus. "Is
   Cosine-Similarity of Embeddings Really About Similarity?" WWW 2024
   Companion. arXiv:2403.05440.
+- **[Xiang 2025]** Yilin Xiang et al. "When to use Graphs in RAG: A
+  Comprehensive Analysis for Graph Retrieval-Augmented Generation"
+  (GraphRAG-Bench). arXiv:2506.05690. *(Tiered tasks by evidence topology;
+  pipeline-layer metrics; the finding that graph structure helps multi-hop
+  and synthesis tiers while vanilla RAG matches or beats it on simple fact
+  retrieval — the discipline behind 07's per-tier matrix and containment
+  grading.)*
 - **[Myllymäki 2017]** Mari Myllymäki, Tomáš Mrkvička, Pavel Grabarnik, Henri
   Seijo, Ulf Hahn. "Global envelope tests for spatial processes." *Journal of
   the Royal Statistical Society Series B* 79(2):381–404, 2017. *(The

@@ -1,5 +1,8 @@
 # Evaluation
 
+> The runnable harness built on this protocol — tiers, ablations, grading —
+> is designed in [07-eval-harness.md](07-eval-harness.md).
+
 stemma's output is a resolution artifact, not an answer, so it cannot be
 scored by execution accuracy. This document specifies the evaluation
 protocol: why the no-evidence setting is the only honest one, how ground
