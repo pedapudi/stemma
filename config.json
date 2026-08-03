@@ -22,5 +22,9 @@
       "model": "gemma-4-26B-A4B-it-FP8",
       "api_key": ""
     }
+  },
+  "eval": {
+    "bird_dir": "eval/bird/data/dev_20240627",
+    "runs_dir": "eval/runs"
   }
 }

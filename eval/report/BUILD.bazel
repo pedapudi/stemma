@@ -1,0 +1,10 @@
+# The eval report template: dist/template.html is the deno-built,
+# checked-in single-file template (see build.sh) that stemma-eval embeds
+# at compile time and injects each run's JSON into.
+exports_files(["dist/template.html"])
+
+alias(
+    name = "template",
+    actual = "dist/template.html",
+    visibility = ["//visibility:public"],
+)

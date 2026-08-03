@@ -40,17 +40,53 @@ definitions and with the shared bibliography (docs/design/00-bibliography.md).
 # One-time, ~1-2 GB:
 eval/bird/fetch_bird.sh
 
-# Derive targets (all DBs, or slice with repeatable --db-id):
+# Raw target stats (all DBs, or slice with repeatable --db-id):
 bazel run //crates/stemma-eval -- derive \
-  --questions eval/bird/data/dev/dev.json \
+  --questions eval/bird/data/dev_20240627/dev.json \
   --out /tmp/targets.json \
   --db-id california_schools --db-id thrombosis_prediction
+
+# Denotation-verified datasets (one JSONL per corpus, checked in):
+bazel run //crates/stemma-eval -- dataset \
+  --questions eval/bird/data/dev_20240627/dev.json \
+  --db-root eval/bird/data/dev_20240627/dev_databases \
+  --out-dir eval/datasets \
+  --db-id california_schools
+
+# The mechanism-ablation sweep (writes run JSON + self-contained HTML
+# report; grades against eval/baseline/<corpus>.json when one exists):
+bazel run //crates/stemma-eval -- run \
+  --config config.json \
+  --dataset eval/datasets/bird-california_schools.jsonl \
+  --ablation lex --ablation +dense --ablation +kg --ablation +adj
+
+# Grade an existing run (exit 1 + named failures on regression):
+bazel run //crates/stemma-eval -- grade \
+  --run eval/runs/<run-id>.json --baseline eval/baseline/<corpus>.json
+
+# Accept a run as the new baseline (a reviewed change — commit the diff):
+bazel run //crates/stemma-eval -- accept \
+  --run eval/runs/<run-id>.json --out eval/baseline/<corpus>.json
 ```
 
-Output: per-question JSON (`tables`, `value_targets`, `evidence`,
+`derive` output: per-question JSON (`tables`, `value_targets`, `evidence`,
 `parse_error`) plus summary stats — question count, parse failures, and the
 size of the string-value subset. Gold SQL that fails to parse is kept with
 `parse_error` set, not dropped silently.
+
+`dataset` additionally denotation-verifies every string target against the
+database instance (the gold predicate must select rows; failures are
+counted, never silently dropped), records the gold `(table, column, rowid
+set)` per target, and assigns tiers mechanically (L1/L3/L4 for BIRD; L2 and
+NIL come from the synthetic legal set, same JSONL shape). Ablations are
+honest flag combinations of the shipping pipeline — `+coh` is folded into
+`+kg` because collective disambiguation is not separately gateable; see the
+status block of docs/design/07-eval-harness.md for all deviations.
+
+The report template lives in `eval/report/` (deno-built, no npm;
+`eval/report/build.sh` regenerates the checked-in `dist/template.html`
+which the binary embeds). Rebuild it and re-run `cargo build` after
+touching `report.ts`/`report.css`/`template.src.html`.
 
 ## Interpreting derive output
 
@@ -61,23 +97,33 @@ size of the string-value subset. Gold SQL that fails to parse is kept with
   before trusting numbers.
 - Join-key equalities (`a.id = b.a_id`) are correctly excluded from value
   targets (column-to-column, not column-to-literal); tested in
-  `crates/stemma-eval/src/main.rs`.
+  `crates/stemma-eval/src/derive.rs`.
 
 ## Extending the harness
 
-The harness lives in `crates/stemma-eval` (single `main.rs` today; split into
-modules when adding a second subcommand).
+The harness lives in `crates/stemma-eval`, split by concern:
+`derive.rs` (SQL parsing + denotation verification + tiering),
+`dataset.rs` (the JSONL format and its tolerant loader), `metrics.rs`
+(per-query scoring, cell aggregation, calibration), `stats.rs` (paired
+randomization, bootstrap CIs, randomised Tukey HSD — seeded,
+deterministic), `runner.rs` (store prep, metered backend seams, run
+files, baselines), `grade.rs` (the four implemented grading rules),
+`report.rs` (template injection).
 
-**Adding a scoring subcommand** (the milestone-2 task): compare resolver
-output (gRPC Resolve responses) against derived targets. A value target
-`(column, '=', 'Seattle')` is *hit* if any returned candidate resolves to a
-row where that column holds that literal — probe the BIRD SQLite DB directly
-to check (`SELECT count(*) FROM t WHERE col = ?`). Report per-question and
-corpus-level recall/precision/F-beta, sliced by string/numeric and by db_id.
+**Adding a metric**: compute it in `metrics::score_query` /
+`metrics::aggregate`, thread it through `runner::CellReport`, and render
+it in `eval/report/report.ts`. Keep definitions consistent with
+docs/design/06-evaluation.md and 07-eval-harness.md.
+
+**Adding an ablation column** (e.g. cross-encoder reranking when built):
+add the flag combination in `runner::ablation` — it must be a real flag
+of the shipping pipeline, never an eval-only code path — and its target
+tiers in `runner::target_tiers` so containment grading knows what it is
+allowed to move.
 
 **Adding target types**: extend `collect_value_targets` (e.g. `BETWEEN`,
 date functions). Every extension needs a unit test with a hand-written SQL
-snippet — the two existing tests are the pattern.
+snippet — the existing tests are the pattern.
 
 **Adding an eval corpus**: BIRD-format is just `[{question_id, db_id,
 question, evidence, SQL}]` + a directory of SQLite DBs; anything mapped into
