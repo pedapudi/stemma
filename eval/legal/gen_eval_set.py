@@ -229,6 +229,13 @@ class LexIndex:
             self._count_all("lex_trigram", '"' + phrase.replace('"', "") + '"'),
         )
 
+    def doc_freq(self, term):
+        """Corpus document frequency of a token, via the store's fts5vocab."""
+        row = self.db.execute(
+            "SELECT doc FROM lex_vocab WHERE term = ?", (term.lower(),)
+        ).fetchone()
+        return row[0] if row else 0
+
     def top_docs(self, match, src_table, limit=3):
         """Best-bm25 document rows of src_table matching an FTS query."""
         try:
@@ -456,10 +463,13 @@ def stratified_stream(groups, rng):
 # ------------------------------------------------------------------ LM client
 
 class LM:
-    def __init__(self, endpoint, model, api_key=""):
+    def __init__(self, endpoint, model, api_key="", extra_body=None):
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.api_key = api_key
+        # Extra request-body fields from the config's lm section (e.g.
+        # llama.cpp's chat_template_kwargs {"enable_thinking": false}).
+        self.extra_body = extra_body or {}
         self.calls = 0
         self.consecutive_failures = 0
 
@@ -474,6 +484,7 @@ class LM:
                 "type": "json_schema",
                 "json_schema": {"name": "gen", "schema": schema},
             },
+            **self.extra_body,
         }
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -711,7 +722,11 @@ def find_partner(lex, legal, reg_rowid):
     shared distinctive terms with best bm25."""
     text = legal.execute(
         "SELECT text FROM regulations WHERE id = ?", (reg_rowid,)).fetchone()[0]
-    terms = [t for t in frequent_terms(text, 10) if len(t) >= 6]
+    # Rank the row's terms by corpus rarity (fts5vocab document frequency):
+    # a pairing over rare terms is topical, one over ubiquitous terms is not.
+    terms = [t for t in frequent_terms(text, 14) if len(t) >= 6]
+    terms = [t for t in terms if 3 <= lex.doc_freq(t) <= 15000]
+    terms.sort(key=lex.doc_freq)
     # Prefer tighter topical pairing: three shared distinctive terms, then two.
     for combo in itertools.chain(itertools.combinations(terms[:7], 3),
                                  itertools.combinations(terms[:7], 2)):
@@ -1183,7 +1198,8 @@ def main():
     legal = ro_connect(legal_db)
     mini = ro_connect(mini_db)
     lex = LexIndex(stemmadb)
-    lm = LM(lm_cfg["endpoint"], lm_cfg["model"], lm_cfg.get("api_key", ""))
+    lm = LM(lm_cfg["endpoint"], lm_cfg["model"], lm_cfg.get("api_key", ""),
+            lm_cfg.get("extra_body"))
     rng = random.Random(args.seed)
 
     print(f"corpus: {legal_db}\nstore:  {stemmadb}\nlm:     "
