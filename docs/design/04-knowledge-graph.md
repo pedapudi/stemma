@@ -182,6 +182,21 @@ and asserts the discovered edge is labelled `dept →? id` with
 deliberate: the graph should look uncertain where it is uncertain, including
 to a human reading the console.
 
+**Corpus note — the legal citation tables.** `eval/legal/mine_citations.py`
+derives `refs` (the canonical citations each record is) and `citations`
+(cross-references mined from body text) inside the legal corpus database, and
+the compiler picks the citation network up with no changes here: the declared
+`citations.resolved → refs.id` FK lands in the schema layer, and inclusion
+mining proposes `citations.src_id →? regulations.id` and
+`refs.row_id →? regulations.id` at containment 1.000. Those two are real but
+partial — `row_id`/`src_id` are polymorphic over the two corpus tables (the
+`table_name`/`src_table` column picks the parent), and containment only
+reaches the table whose dense id space contains the union, which is why the
+same edges toward `sections` (≈ 0.61) are correctly not proposed. The derived
+tables deliberately use surrogate ids above 10⁷ so *accidental* containments
+against the corpus's dense `1..N` ids do not arise; see
+[eval/legal/README.md](../../eval/legal/README.md).
+
 ## Value profile
 
 `compile_value_profile` finds values worth naming as graph entities:
