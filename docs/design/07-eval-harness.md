@@ -268,10 +268,12 @@ A run passes when:
    JSON; changing them is a reviewed decision).
 5. Layer-3 regression cases stay green.
 
-The report is one Markdown file per run (the matrix, deltas, named
-failures with their trajectories linked), written where the console can
-serve it later — the eval dashboard is downstream product work, the file
-format should not block on it.
+The report is one **self-contained HTML file per run** — the matrix,
+deltas with confidence intervals, calibration curves, named failures —
+in the stemma design language with the console's chrome (theme picker,
+typeface picker, mono-for-data), so a run report reads like a page of the
+console it will eventually be served from. Machine-readable results ride
+alongside as JSON (the baseline file diffs against it).
 
 ## Datasets
 
