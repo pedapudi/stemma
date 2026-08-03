@@ -461,6 +461,7 @@ class LM:
         self.model = model
         self.api_key = api_key
         self.calls = 0
+        self.consecutive_failures = 0
 
     def generate_json(self, prompt, schema, temperature=0.8, max_tokens=900,
                       retries=3):
@@ -488,11 +489,19 @@ class LM:
                 self.calls += 1
                 with urllib.request.urlopen(req, timeout=180) as r:
                     out = json.load(r)
-                return json.loads(out["choices"][0]["message"]["content"])
+                result = json.loads(out["choices"][0]["message"]["content"])
+                self.consecutive_failures = 0
+                return result
             except (urllib.error.URLError, urllib.error.HTTPError,
                     KeyError, json.JSONDecodeError, TimeoutError) as e:
                 last = e
                 time.sleep(2 * (attempt + 1))
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= 3:
+            raise SystemExit(
+                f"LM endpoint unusable ({self.consecutive_failures} calls "
+                f"failed in a row; last: {last}) — aborting. Partial output "
+                "was written after each completed tier.")
         raise RuntimeError(f"LM call failed after {retries} tries: {last}")
 
 
@@ -1206,62 +1215,66 @@ def main():
 
     s_reg_l1, s_sec_l1, s_reg_l2, s_sec_l2, s_reg_l4 = streams()
 
+    def flush():
+        counts = {t: sum(1 for r in records if r["tier"] == t)
+                  for t in ("L1", "L2", "L4", "NIL")}
+        counts["L3"] = 0
+        header = {
+            "type": "header",
+            "dataset": "legal-synth-v1",
+            "version": 1,
+            "generator": GENERATOR,
+            "model": lm_cfg["model"],
+            "seed": args.seed,
+            "corpus": {"legal_db": os.path.basename(legal_db),
+                       "regulations_rows": legal.execute(
+                           "SELECT count(*) FROM regulations").fetchone()[0],
+                       "sections_rows": legal.execute(
+                           "SELECT count(*) FROM sections").fetchone()[0]},
+            "counts": counts,
+            "l3": {"status": "todo", "note": l3_note},
+            "stats": stats,
+        }
+        write_jsonl(out, header, records)
+        mini_header = {
+            "type": "header",
+            "dataset": "mini-l3-v1",
+            "version": 1,
+            "generator": GENERATOR,
+            "model": lm_cfg["model"],
+            "seed": args.seed,
+            "corpus": {"mini_db": os.path.basename(mini_db)},
+            "counts": {"L3": len(mini_records)},
+        }
+        write_jsonl(mini_out, mini_header, mini_records)
+        render_review(html_out, "legal-synth-v1 (+ mini-l3-v1)", args.seed,
+                      stats, review, header)
+
     t0 = time.time()
     if "L1" in tiers:
         print("== L1 (lexical anchor) ==")
         records += gen_tier_l1_l2("L1", lex, legal, lm, s_reg_l1, s_sec_l1,
                                   args.n_per_tier, args.seed, stats, review)
+        flush()
     if "L2" in tiers:
         print("== L2 (semantic, no lexical anchor) ==")
         records += gen_tier_l1_l2("L2", lex, legal, lm, s_reg_l2, s_sec_l2,
                                   args.n_per_tier, args.seed, stats, review)
+        flush()
     if "L4" in tiers:
         print("== L4 (cross-record, state + federal) ==")
         records += gen_tier_l4(lex, legal, lm, s_reg_l4, args.n_per_tier,
                                args.seed, stats, review)
+        flush()
     if "NIL" in tiers:
         print("== NIL (verified absence) ==")
         records += gen_tier_nil(lex, lm, args.n_nil, args.seed, rng, stats, review)
+        flush()
     if "L3" in tiers:
         print("== L3 (relational, mini corpus) ==")
         mini_records = gen_mini_l3(mini, lm, args.n_per_tier, args.seed, rng,
                                    stats, review)
-
-    counts = {t: sum(1 for r in records if r["tier"] == t)
-              for t in ("L1", "L2", "L4", "NIL")}
-    counts["L3"] = 0
-    header = {
-        "type": "header",
-        "dataset": "legal-synth-v1",
-        "version": 1,
-        "generator": GENERATOR,
-        "model": lm_cfg["model"],
-        "seed": args.seed,
-        "corpus": {"legal_db": os.path.basename(legal_db),
-                   "regulations_rows": legal.execute(
-                       "SELECT count(*) FROM regulations").fetchone()[0],
-                   "sections_rows": legal.execute(
-                       "SELECT count(*) FROM sections").fetchone()[0]},
-        "counts": counts,
-        "l3": {"status": "todo", "note": l3_note},
-        "stats": stats,
-    }
-    write_jsonl(out, header, records)
-
-    mini_header = {
-        "type": "header",
-        "dataset": "mini-l3-v1",
-        "version": 1,
-        "generator": GENERATOR,
-        "model": lm_cfg["model"],
-        "seed": args.seed,
-        "corpus": {"mini_db": os.path.basename(mini_db)},
-        "counts": {"L3": len(mini_records)},
-    }
-    write_jsonl(mini_out, mini_header, mini_records)
-
-    render_review(html_out, "legal-synth-v1 (+ mini-l3-v1)", args.seed, stats,
-                  review, header)
+        flush()
 
     dt = time.time() - t0
     print(f"\nwrote {len(records)} legal records -> {out}")
