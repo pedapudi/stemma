@@ -1323,6 +1323,50 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
             ins.execute(stemmadb::rusqlite::params![t, c])?;
         }
     }
+    // Join-explained recurrence is a key relationship, not vocabulary.
+    // A column that is an endpoint of a discovered join (declared or
+    // inferred fk in the compiled graph) recurs across columns BY
+    // CONSTRUCTION — that is what a join is — so its values are keys even
+    // when they are letter-bearing ("18 CCR § 240" in refs.ref and
+    // citations.ref). Issue #2's lesson, applied to text keys: without this,
+    // a citation-mined corpus enqueues every reference string as a card
+    // (~133k on the legal corpus) and the fragment pass grinds for hours.
+    // Reading kg_edges here shares the documented layering deviation
+    // (04-knowledge-graph.md): the graph is in the same store.
+    let has_kg: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_kg > 0 {
+        let pairs: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT replace(n1.key, 'table:', ''), e.label FROM kg_edges e
+                 JOIN kg_nodes n1 ON n1.id = e.src
+                 WHERE e.kind IN ('fk', 'inferred_fk')
+                 UNION ALL
+                 SELECT replace(n2.key, 'table:', ''), e.label FROM kg_edges e
+                 JOIN kg_nodes n2 ON n2.id = e.dst
+                 WHERE e.kind IN ('fk', 'inferred_fk')",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut del = conn.prepare_cached(
+            "DELETE FROM vocab_cols WHERE src_table = ?1 AND src_column = ?2",
+        )?;
+        for (table, label) in pairs {
+            // Labels are "src_col → dst_col" (inferred joins mark "→?");
+            // both endpoint columns are key columns for their tables.
+            for col in label.split('→') {
+                let col = col.trim().trim_start_matches('?').trim();
+                if !col.is_empty() {
+                    del.execute(stemmadb::rusqlite::params![table, col])?;
+                }
+            }
+        }
+    }
 
     // One row per distinct interpretation. The displayed value is the MODAL
     // raw spelling over the rows sharing the value_norm (ties broken
@@ -1439,7 +1483,15 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
         let mut adopt = conn.prepare_cached(
             "UPDATE embed_queue SET serialized = ?2, content_hash = ?3 WHERE id = ?1",
         )?;
+        let mut processed = 0usize;
         for (table, column, rep, value_norm, value, qid, status, stored_hash, covered) in candidates {
+            // Long sweeps must not monopolize the WAL writer: commit every
+            // 500 items so concurrent query_log writes proceed and progress
+            // survives interruption (the sweep is idempotent).
+            processed += 1;
+            if processed % 500 == 0 {
+                conn.execute_batch("COMMIT; BEGIN")?;
+            }
             let fragments: Vec<(String, String)> = frag_stmt
                 .query_map(
                     stemmadb::rusqlite::params![table, column, value_norm],
