@@ -155,7 +155,7 @@ struct Resolver {
     // resolution is read-mostly. Revisit with a connection pool when the
     // pipeline lands.
     dbs: HashMap<String, Mutex<StemmaDb>>,
-    embedder: Option<stemma_embed::OpenAiEmbedder>,
+    embedder: Option<stemma_embed::CooldownEmbedder<stemma_embed::OpenAiEmbedder>>,
     lm: Option<Box<dyn stemma_lm::LmBackend>>,
 }
 
@@ -472,10 +472,11 @@ async fn main() -> anyhow::Result<()> {
                 query_template = embed_template.as_deref().unwrap_or("(bare)"),
                 "dense channel enabled"
             );
-            Some(stemma_embed::OpenAiEmbedder::new(
-                ep,
-                m,
-                embed_template.clone(),
+            Some(stemma_embed::CooldownEmbedder::new(
+                stemma_embed::OpenAiEmbedder::new(ep, m, embed_template.clone()),
+                // One failed probe per window, not one DNS timeout per
+                // query, while the endpoint is down. Operational cadence.
+                std::time::Duration::from_secs(60),
             ))
         }
         _ => None,

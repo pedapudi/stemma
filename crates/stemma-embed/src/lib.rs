@@ -115,7 +115,12 @@ impl Embedder for OpenAiEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let resp: EmbeddingsResponse = ureq::post(&format!("{}/embeddings", self.endpoint))
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(60))
+            .build();
+        let resp: EmbeddingsResponse = agent
+            .post(&format!("{}/embeddings", self.endpoint))
             .timeout(std::time::Duration::from_secs(60))
             .send_json(ureq::json!({ "model": self.model, "input": texts }))
             .map_err(|e| Error::Http(e.to_string()))?
@@ -188,5 +193,56 @@ mod tests {
         );
         assert_eq!(default_query_template("text-embedding-3-small"), None);
         assert_eq!(default_query_template("bge-m3"), None);
+    }
+}
+
+/// A down endpoint must cost one failed probe per cooldown window, not one
+/// connect/DNS timeout per query: degradation is the designed behaviour,
+/// and it has to be cheap to be usable. Wraps any [`Embedder`]; after a
+/// failure, calls short-circuit with the last error until the window
+/// elapses, then one live probe is allowed through.
+pub struct CooldownEmbedder<E> {
+    inner: E,
+    /// Millis since UNIX epoch of the last failure; 0 = healthy.
+    failed_at: std::sync::atomic::AtomicU64,
+    cooldown: std::time::Duration,
+}
+
+impl<E> CooldownEmbedder<E> {
+    pub fn new(inner: E, cooldown: std::time::Duration) -> Self {
+        Self {
+            inner,
+            failed_at: 0.into(),
+            cooldown,
+        }
+    }
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+impl<E: Embedder> Embedder for CooldownEmbedder<E> {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        use std::sync::atomic::Ordering;
+        let failed = self.failed_at.load(Ordering::Relaxed);
+        if failed != 0 && Self::now_ms().saturating_sub(failed) < self.cooldown.as_millis() as u64 {
+            return Err(Error::Http("endpoint cooling down after failure".into()));
+        }
+        match self.inner.embed(texts) {
+            Ok(v) => {
+                self.failed_at.store(0, Ordering::Relaxed);
+                Ok(v)
+            }
+            Err(e) => {
+                self.failed_at.store(Self::now_ms(), Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+    fn identity(&self) -> ModelIdentity {
+        self.inner.identity()
     }
 }

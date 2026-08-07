@@ -1368,6 +1368,54 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
         }
     }
 
+    // Ambiguity is INCIDENTAL sharing; keys and denormalized copies are
+    // SYSTEMATIC sharing. A value qualifies as ambiguous vocabulary only if
+    // it is shared across a column pair whose overlap is a minority of both
+    // columns' vocabularies (majority overlap = same domain — a text join
+    // key like citations.ref↔refs.ref, or a copied column — regardless of
+    // what the join miner asserted; its 0.95 threshold is for CLAIMING a
+    // join, and the burden here is reversed). Majority is a definition, not
+    // a tunable, matching the card-fragment rule.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS vocab_pairs (
+             t1 TEXT NOT NULL, c1 TEXT NOT NULL,
+             t2 TEXT NOT NULL, c2 TEXT NOT NULL, excluded INTEGER NOT NULL
+         );
+         DELETE FROM vocab_pairs;
+         CREATE TEMP TABLE IF NOT EXISTS vocab_values AS
+             SELECT DISTINCT lv.src_table AS t, lv.src_column AS c, lv.value_norm AS vn
+             FROM lex_values lv
+             JOIN vocab_cols vc ON vc.src_table = lv.src_table
+                               AND vc.src_column = lv.src_column
+             WHERE lv.is_doc = 0 AND lv.value_norm GLOB '*[a-z]*';
+         DELETE FROM vocab_values;
+         INSERT INTO vocab_values
+             SELECT DISTINCT lv.src_table, lv.src_column, lv.value_norm
+             FROM lex_values lv
+             JOIN vocab_cols vc ON vc.src_table = lv.src_table
+                               AND vc.src_column = lv.src_column
+             WHERE lv.is_doc = 0 AND lv.value_norm GLOB '*[a-z]*';
+         CREATE INDEX IF NOT EXISTS temp.vocab_values_vn ON vocab_values(vn);
+         INSERT INTO vocab_pairs
+             SELECT a.t, a.c, b.t, b.c,
+                    count(*) * 2 > min(
+                        (SELECT count(*) FROM vocab_values x WHERE x.t = a.t AND x.c = a.c),
+                        (SELECT count(*) FROM vocab_values y WHERE y.t = b.t AND y.c = b.c))
+             FROM vocab_values a
+             JOIN vocab_values b ON b.vn = a.vn
+              AND (a.t || '·' || a.c) < (b.t || '·' || b.c)
+             GROUP BY a.t, a.c, b.t, b.c;
+         CREATE TEMP TABLE IF NOT EXISTS ambiguous_vocab (value_norm TEXT PRIMARY KEY);
+         DELETE FROM ambiguous_vocab;
+         INSERT OR IGNORE INTO ambiguous_vocab
+             SELECT a.vn FROM vocab_values a
+             JOIN vocab_values b ON b.vn = a.vn
+              AND (a.t || '·' || a.c) < (b.t || '·' || b.c)
+             JOIN vocab_pairs p ON p.t1 = a.t AND p.c1 = a.c
+                               AND p.t2 = b.t AND p.c2 = b.c
+             WHERE p.excluded = 0;",
+    )?;
+
     // One row per distinct interpretation. The displayed value is the MODAL
     // raw spelling over the rows sharing the value_norm (ties broken
     // lexicographically) — a property of the set, deterministic under any
@@ -1408,15 +1456,7 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
                                    AND vc.src_column = lv.src_column
                  WHERE lv.is_doc = 0
                    AND lv.value_norm GLOB '*[a-z]*'
-                   AND lv.value_norm IN (
-                       SELECT lv2.value_norm FROM lex_values lv2
-                       JOIN vocab_cols vc2 ON vc2.src_table = lv2.src_table
-                                          AND vc2.src_column = lv2.src_column
-                       WHERE lv2.is_doc = 0
-                         AND lv2.value_norm GLOB '*[a-z]*'
-                       GROUP BY lv2.value_norm
-                       HAVING count(DISTINCT lv2.src_table || '·' || lv2.src_column) >= 2
-                   )
+                   AND lv.value_norm IN (SELECT value_norm FROM ambiguous_vocab)
                  GROUP BY lv.src_table, lv.src_column, lv.value_norm
              ) t
              LEFT JOIN embed_queue q
@@ -2202,7 +2242,13 @@ mod tests {
         println!("warehouse candidacy: untyped predicate {untyped} cards, typed {queued}");
         // Exactly the shared text vocabulary: 40 names × 2 columns + 5
         // brands × 2 + 4 categories × 2.
-        assert_eq!(queued, 98, "untyped predicate would enqueue {untyped}");
+        // With pair-aware recurrence the warehouse enqueues NOTHING: every
+        // cross-column value here is a denormalized copy (product_name/sku
+        // copied into the fact table), i.e. systematic majority overlap —
+        // and a copy is one fact stored twice, not two readings of one
+        // string. Issue #2's own framing, now fully honored: the 98 cards
+        // the typed-but-pair-blind predicate still queued were copies too.
+        assert_eq!(queued, 0, "untyped predicate would enqueue {untyped}");
         let non_text: i64 = db
             .conn()
             .query_row(
@@ -2398,8 +2444,11 @@ mod tests {
             .execute_batch(&format!(
                 "CREATE TABLE src.articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
                  CREATE TABLE src.tags(id INTEGER PRIMARY KEY, label TEXT);
+                 -- one shared title of three: incidental sharing (ambiguity)
+                 -- on both sides, never a majority (a copy/key pair)
                  INSERT INTO src.tags VALUES
-                    (1, 'Coastal permits'), (2, 'Insurance filings'), (3, 'Water rights');
+                    (1, 'Coastal permits'), (2, 'Archived'), (3, 'Pending review'),
+                    (4, 'Superseded'), (5, 'Draft');
                  INSERT INTO src.articles VALUES
                     (1, 'Coastal permits', '{a}'),
                     (2, 'Insurance filings', '{b}'),
@@ -2542,12 +2591,17 @@ mod tests {
                  INSERT INTO src.offices VALUES
                     (17, 'Seattle - Northgate', 'Seattle'),
                     (18, 'Portland Downtown', 'Portland'),
-                    (19, 'Portland Airport', 'Portland');
-                 -- landmarks shares values with offices so the fixture has an
-                 -- ambiguous vocabulary: only cross-column values get cards
+                    (19, 'Portland Airport', 'Portland'),
+                    (20, 'Tacoma Mall', 'Tacoma'),
+                    (21, 'Spokane Valley', 'Spokane'),
+                    (22, 'Olympia Center', 'Olympia');
+                 -- landmarks shares SOME values with offices (incidental
+                 -- sharing = ambiguity); majority overlap would be a
+                 -- key/copy relationship and excluded pair-wise
                  CREATE TABLE src.landmarks(id INTEGER PRIMARY KEY, title TEXT);
                  INSERT INTO src.landmarks VALUES
-                    (1, 'Seattle'), (2, 'Portland'), (3, 'Portland Downtown');",
+                    (1, 'Seattle'), (2, 'Portland'), (3, 'Portland Downtown'),
+                    (4, 'Space Needle'), (5, 'Gasworks Park'), (6, 'Multnomah Falls');",
             )
             .unwrap();
         build_lexical_index(&db, false).unwrap();
@@ -2636,7 +2690,15 @@ mod tests {
                 "CREATE TABLE src.items(id INTEGER PRIMARY KEY,
                      category TEXT, brand TEXT, created_at TEXT);
                  CREATE TABLE src.tags(id INTEGER PRIMARY KEY, label TEXT);
-                 INSERT INTO src.tags VALUES (1, 'Outerwear & Coats'), (2, 'Dresses');",
+                 INSERT INTO src.tags VALUES
+                    (1, 'Outerwear & Coats'), (2, 'Dresses'),
+                    (3, 'Clearance'), (4, 'New Arrivals'), (5, 'Staff Picks');
+                 -- keep category majority-unique so tags↔category sharing is
+                 -- incidental (ambiguity), not systematic (a copy/key pair)
+                 INSERT INTO src.items VALUES
+                    (901, 'Jeans', 'Wrangler', '1700000000.0'),
+                    (902, 'Suits & Sport Coats', 'Halston', '1700000000.0'),
+                    (903, 'Swimwear', 'Speedo', '1700000000.0');",
             )
             .unwrap();
         for (id, category, brand) in rows {
@@ -2895,16 +2957,18 @@ mod tests {
         let embedder = FakeEmbedder::new(8);
         let docs = enqueue_missing_embeddings(&db).unwrap();
         let interps = enqueue_missing_interpretations(&db).unwrap();
-        // titles are shared with src.tags, so each title yields two readings
-        assert_eq!((docs, interps), (3, 6));
+        // exactly one title is shared with src.tags (incidental), so that
+        // value yields two readings; the copies-of-everything case is the
+        // warehouse test, which now expects zero
+        assert_eq!((docs, interps), (3, 2));
         let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
-        assert_eq!((stats.drained, stats.failed, stats.remaining), (9, 0, 0));
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (5, 0, 0));
         let count = |table: &str| -> i64 {
             db.conn()
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!((count("vec_dense"), count("vec_interp")), (3, 6));
+        assert_eq!((count("vec_dense"), count("vec_interp")), (3, 2));
         let registered: i64 = db
             .conn()
             .query_row(
