@@ -1097,46 +1097,71 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
         .collect();
 
     // Pairwise verification, cached: schema paths once per table pair, then
-    // for each surviving candidate pair a LIMIT-1 probe per path until one
-    // verifies. Everything downstream reads this map.
+    // one grouped probe per (column pair, path) that resolves every value
+    // pair at once. Everything downstream reads this map.
+    //
+    // Batching is what makes a value-level probe affordable. Probing each
+    // candidate pair separately means re-walking the same join for every
+    // combination; a single `IN (…) … GROUP BY` walks it once and reports
+    // which readings met. Measured on a 6-table corpus: 16 candidate pairs in
+    // one 356 ms query, against 1.9 s as sixteen.
     let mut path_cache: std::collections::HashMap<(String, String), Vec<Vec<stemma_kg::PathHop>>> =
         std::collections::HashMap::new();
     let mut verified: std::collections::HashMap<(usize, usize, usize, usize), String> =
         std::collections::HashMap::new();
+    // Candidates of one mention, bucketed by the (table, column) they read.
+    // Every candidate in a bucket probes through the same join, so the bucket
+    // is the unit of work.
+    let bucket = |i: usize, k: usize| {
+        let mut m: std::collections::BTreeMap<(String, String), Vec<(usize, String)>> =
+            std::collections::BTreeMap::new();
+        for c in 0..k {
+            let cand = &spans[i].candidates[c];
+            m.entry((cand.table.clone(), cand.column.clone()))
+                .or_default()
+                .push((c, cand.value.clone()));
+        }
+        m
+    };
     for p in 0..winners.len() {
         for q in p + 1..winners.len() {
-            for a in 0..ks[p] {
-                for b in 0..ks[q] {
-                    let ca = &spans[winners[p]].candidates[a];
-                    let cb = &spans[winners[q]].candidates[b];
-                    if ca.table == cb.table {
+            let ga = bucket(winners[p], ks[p]);
+            let gb = bucket(winners[q], ks[q]);
+            for ((ta, cola), va) in &ga {
+                for ((tb, colb), vb) in &gb {
+                    if ta == tb {
                         continue;
                     }
-                    let key = (ca.table.clone(), cb.table.clone());
+                    let key = (ta.clone(), tb.clone());
                     if !path_cache.contains_key(&key) {
                         let paths =
                             store.table_paths(&key.0, &key.1, MAX_PATH_HOPS, MAX_PATHS_PER_PAIR)?;
                         path_cache.insert(key.clone(), paths);
                     }
-                    // An interpretation candidate stands for up to
-                    // SAMPLE_ROWIDS concrete rows: probe the representative
-                    // first and fall back to the remaining samples, since
-                    // any row of the interpretation verifying the link
-                    // verifies the reading. The probed rowids are the ones
-                    // recorded in the evidence.
-                    let ra = probe_rowids(ca);
-                    let rb = probe_rowids(cb);
-                    'paths: for path in &path_cache[&key] {
-                        for &ar in &ra {
-                            for &br in &rb {
-                                if probe_instance_link(db, path, ar, br)? {
+                    let vals_a: Vec<String> = va.iter().map(|(_, v)| v.clone()).collect();
+                    let vals_b: Vec<String> = vb.iter().map(|(_, v)| v.clone()).collect();
+                    for path in &path_cache[&key] {
+                        let links =
+                            probe_value_links(db, path, cola, &vals_a, colb, &vals_b)?;
+                        for (ai, av) in va {
+                            for (bi, bv) in vb {
+                                if verified.contains_key(&(p, q, *ai, *bi)) {
+                                    continue;
+                                }
+                                let lk = (av.to_lowercase(), bv.to_lowercase());
+                                if let Some(&(ar, br)) = links.get(&lk) {
                                     verified.insert(
-                                        (p, q, a, b),
-                                        render_kg_path(path, &ca.table, ar, br),
+                                        (p, q, *ai, *bi),
+                                        render_kg_path(path, ta, ar, br),
                                     );
-                                    break 'paths;
                                 }
                             }
+                        }
+                        // Later paths can only add pairs this one missed.
+                        if va.iter().all(|(ai, _)| {
+                            vb.iter().all(|(bi, _)| verified.contains_key(&(p, q, *ai, *bi)))
+                        }) {
+                            break;
                         }
                     }
                 }
@@ -1207,35 +1232,46 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
     Ok(())
 }
 
-/// The rowids collective disambiguation may probe for a candidate: its
-/// sample rowids (representative first), bounded at SAMPLE_ROWIDS by
-/// construction; the bare representative when no samples were carried.
-fn probe_rowids(c: &Candidate) -> Vec<i64> {
-    if c.sample_rowids.is_empty() {
-        vec![c.rowid]
-    } else {
-        c.sample_rowids.clone()
-    }
-}
-
-/// Verifies that two concrete rows connect along `path` in the user
-/// database: one LIMIT-1 join anchored by rowid at both ends, with the fk
-/// columns taken from the compiled graph's edges.
-fn probe_instance_link(
+/// Which of `from_values` connect to which of `to_values` along `path` in the
+/// user database, and by which rows — one grouped join, fk columns taken from
+/// the compiled graph's edges. Returns `(from_value, to_value) -> (from_rowid,
+/// to_rowid)`, lowercased keys, absent when a pair does not connect.
+///
+/// This asks about READINGS, not rows. The predecessor anchored both ends to
+/// sampled rowids (`WHERE j0.rowid = ? AND jN.rowid = ?`), which verifies only
+/// when the sampled rows happen to be the joined ones. That holds on a corpus
+/// where a value names one row, and collapses everywhere else: for two values
+/// carrying 14,516 and 2,331 rows with 130 connecting pairs, nine sampled
+/// pairs hit with probability ~1 in 28,920, so the pass silently produced
+/// nothing at all. Constraining by value asks the question the caller means —
+/// do these two readings co-occur — and the returned rowids still give the
+/// evidence string concrete rows to cite.
+fn probe_value_links(
     db: &StemmaDb,
     path: &[stemma_kg::PathHop],
-    from_rowid: i64,
-    to_rowid: i64,
-) -> Result<bool> {
+    from_column: &str,
+    from_values: &[String],
+    to_column: &str,
+    to_values: &[String],
+) -> Result<std::collections::HashMap<(String, String), (i64, i64)>> {
+    let mut found = std::collections::HashMap::new();
+    if from_values.is_empty() || to_values.is_empty() {
+        return Ok(found);
+    }
     let Some(first) = path.first() else {
-        return Ok(false);
+        return Ok(found);
     };
     let start = if first.forward {
         &first.src_table
     } else {
         &first.dst_table
     };
-    let mut sql = format!("SELECT 1 FROM {}.\"{start}\" j0", stemmadb::SRC_SCHEMA);
+    let last = path.len();
+    let mut sql = format!(
+        "SELECT j0.\"{from_column}\", j{last}.\"{to_column}\", \
+         min(j0.rowid), min(j{last}.rowid) FROM {}.\"{start}\" j0",
+        stemmadb::SRC_SCHEMA
+    );
     for (i, hop) in path.iter().enumerate() {
         let (next, cond) = if hop.forward {
             (
@@ -1264,12 +1300,42 @@ fn probe_instance_link(
             i + 1
         ));
     }
+    let ph = |range: std::ops::Range<usize>| {
+        range
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     sql.push_str(&format!(
-        " WHERE j0.rowid = ?1 AND j{}.rowid = ?2 LIMIT 1",
-        path.len()
+        " WHERE j0.\"{from_column}\" IN ({}) AND j{last}.\"{to_column}\" IN ({}) \
+         GROUP BY 1, 2",
+        ph(0..from_values.len()),
+        ph(from_values.len()..from_values.len() + to_values.len()),
     ));
-    let mut stmt = db.conn().prepare(&sql)?;
-    Ok(stmt.exists(stemmadb::rusqlite::params![from_rowid, to_rowid])?)
+
+    let params: Vec<&dyn stemmadb::rusqlite::ToSql> = from_values
+        .iter()
+        .chain(to_values.iter())
+        .map(|v| v as &dyn stemmadb::rusqlite::ToSql)
+        .collect();
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (a, b, ar, br) = row?;
+        // Keyed case-insensitively: candidates are one per distinct
+        // `value_norm`, so folding cannot collide two readings, and it keeps
+        // the lookup robust to the representative's casing.
+        found.insert((a.to_lowercase(), b.to_lowercase()), (ar, br));
+    }
+    Ok(found)
 }
 
 /// "people #2 ←lead_id— teams #43": the arrow points from referencing
@@ -2159,6 +2225,82 @@ mod tests {
             .find(|s| s.text == "Billing")
             .expect("Billing mention");
         assert_eq!(billing.candidates[0].coherence.as_deref(), Some(evidence));
+    }
+
+    /// A corpus where every value names many rows, and the one connecting
+    /// pair is not among the sampled ones.
+    ///
+    /// `Fairview` and `Calderon` each carry `WIDE` rows; the single shipment
+    /// joins the last of each. No pair drawn from the first `SAMPLE_ROWIDS`
+    /// rows of either is joined, so an instance-level probe finds nothing —
+    /// which is the shape every real corpus takes once a value names more
+    /// rows than the sample width.
+    fn wide_value_db(tag: &str) -> StemmaDb {
+        const WIDE: i64 = 40;
+        let dir = std::env::temp_dir().join(format!("stemma-resolve-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(
+                "CREATE TABLE warehouses (id INTEGER PRIMARY KEY, city TEXT);
+                 CREATE TABLE buyers (id INTEGER PRIMARY KEY, state TEXT);
+                 CREATE TABLE shipments (
+                     id INTEGER PRIMARY KEY,
+                     warehouse_id INTEGER REFERENCES warehouses(id),
+                     buyer_id INTEGER REFERENCES buyers(id));",
+            )
+            .unwrap();
+            for i in 1..=WIDE {
+                c.execute("INSERT INTO warehouses (id, city) VALUES (?1, 'Fairview')", [i])
+                    .unwrap();
+                c.execute("INSERT INTO buyers (id, state) VALUES (?1, 'Calderon')", [i])
+                    .unwrap();
+            }
+            c.execute(
+                "INSERT INTO shipments (id, warehouse_id, buyer_id) VALUES (1, ?1, ?1)",
+                [WIDE],
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn collective_coherence_verifies_readings_not_sampled_rows() {
+        let db = wide_value_db("wide");
+        stemma_kg::compile(&db, false).unwrap();
+        let trace = resolve_lexical(&db, "shipments from Fairview to Calderon").unwrap();
+        let mention = |text: &str| {
+            trace
+                .mentions
+                .iter()
+                .map(|&i| &trace.spans[i])
+                .find(|s| s.text == text)
+                .unwrap_or_else(|| panic!("{text} mention"))
+        };
+
+        let city = &mention("Fairview").candidates[0];
+        assert_eq!((city.table.as_str(), city.column.as_str()), ("warehouses", "city"));
+        let evidence = city
+            .coherence
+            .as_deref()
+            .expect("the reading connects, so coherence must be recorded");
+        // Cited rows are the ones that actually carry the link, not the
+        // representatives that were sampled up front.
+        assert!(
+            evidence.contains("warehouses #40") && evidence.contains("buyers #40"),
+            "got {evidence:?}"
+        );
+        // Both partners of a verified pair carry the same evidence.
+        let state = &mention("Calderon").candidates[0];
+        assert_eq!((state.table.as_str(), state.column.as_str()), ("buyers", "state"));
+        assert_eq!(state.coherence.as_deref(), Some(evidence));
     }
 
     /// The context-coherence fixture: the value 'Atlas Freight' lives in
