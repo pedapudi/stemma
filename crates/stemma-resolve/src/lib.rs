@@ -2489,6 +2489,8 @@ mod tests {
             snippet: None,
             adjudicated: false,
             coherence: None,
+            row_count: 1,
+            sample_rowids: vec![rowid],
         }
     }
 
