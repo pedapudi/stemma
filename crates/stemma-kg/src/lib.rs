@@ -355,6 +355,14 @@ const INFERRED_FK_MAX_DISTINCT: i64 = 500_000;
 const TOP_COOCCUR_PAIRS: usize = 40;
 /// Minimum conditional co-occurrence (pair docs / min(term docs)).
 const MIN_COOCCUR_RATIO: f64 = 0.25;
+/// Term→column affinity: a mined term keeps edges to at most this many
+/// (table, column)s whose *value* content it recurs in — the columns a
+/// query using that term is probably talking about.
+const TOP_AFFINITY_COLUMNS: usize = 4;
+/// A term must appear in at least this many value cells of a column to earn
+/// an affinity edge — the same recurrence-not-heuristics floor as
+/// MIN_VALUE_COUNT: one co-occurrence is coincidence, two is a pattern.
+const MIN_AFFINITY_MATCHES: i64 = 2;
 
 /// Content fingerprint of one user table: cheap to compute, catches inserts,
 /// deletes, and rowid churn. In-place updates that preserve count, max rowid
@@ -371,7 +379,8 @@ fn fingerprint(db: &StemmaDb, table: &str) -> Result<String> {
     )?;
     // The leading tag versions the COMPILER, not the data: bumping it
     // invalidates every stored fingerprint so algorithm upgrades recompile.
-    Ok(format!("kg2:{n}:{mx}:{sum}"))
+    // kg3: added the term→column affinity pass.
+    Ok(format!("kg3:{n}:{mx}:{sum}"))
 }
 
 /// Compiles (or incrementally refreshes) the schema, discovered-relation and
@@ -433,9 +442,12 @@ pub fn compile(db: &StemmaDb, force: bool) -> Result<KgStats> {
     compile_term_profile(db, &store, &dirty)?;
     // Cross-table passes re-run globally whenever anything changed: removing
     // a dirty table's nodes also removed clean tables' edges into it, and
-    // containment is a global property anyway.
+    // containment is a global property anyway. Term→column affinity is
+    // cross-table in the same way — a clean table's terms keep edges into a
+    // recompiled table's column nodes.
     compile_declared_fks(db, &store, &tables)?;
     compile_inferred_joins(db, &store, &tables)?;
+    compile_term_column_affinity(db, &store, &tables)?;
 
     for t in &dirty {
         let fp = fingerprint(db, t)?;
@@ -895,6 +907,76 @@ fn compile_phrase_entities(
     Ok(())
 }
 
+/// Term→column affinity: for every mined term (TextRank words and mined
+/// phrases alike — both are `kind = 'term'`), which columns' *value* content
+/// the term recurs in, measured with one FTS probe per term grouped by
+/// (src_table, src_column). Kept: the top TOP_AFFINITY_COLUMNS columns with
+/// at least MIN_AFFINITY_MATCHES matching cells, as `col_affinity` edges
+/// from the term node to the existing `column:{table}.{column}` nodes.
+///
+/// Only value cells (`is_doc = 0`) count. A term trivially "co-occurs" with
+/// the document column it was mined from, and the consumer of these edges —
+/// resolution's context-coherence stage — disambiguates *value*
+/// interpretations; letting document columns fill the slots would spend the
+/// budget on edges nothing can use.
+///
+/// Runs globally (all served tables) whenever any table recompiled, like the
+/// other cross-table passes: recompiling table u removes u's column nodes
+/// and with them every clean table's affinity edges into u.
+fn compile_term_column_affinity(
+    db: &StemmaDb,
+    store: &SqliteKnowledgeStore,
+    tables: &[String],
+) -> Result<()> {
+    let conn = db.conn();
+    let terms: Vec<(String, String)> = conn
+        .prepare("SELECT key, label FROM kg_nodes WHERE kind = 'term' ORDER BY key")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    if terms.is_empty() {
+        return Ok(());
+    }
+    let mut probe = conn.prepare_cached(
+        "SELECT v.src_table, v.src_column, count(*) AS n
+         FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
+         WHERE lex_fts MATCH ?1 AND v.is_doc = 0
+         GROUP BY v.src_table, v.src_column
+         HAVING n >= ?2
+         ORDER BY n DESC, v.src_table, v.src_column
+         LIMIT ?3",
+    )?;
+    for (key, label) in &terms {
+        // Quote as an FTS5 string: phrase labels contain spaces, and no
+        // label should be parsed as FTS syntax.
+        let fts_query = format!("\"{}\"", label.replace('"', "\"\""));
+        let cols: Vec<(String, String, i64)> = probe
+            .query_map(
+                stemmadb::rusqlite::params![
+                    fts_query,
+                    MIN_AFFINITY_MATCHES,
+                    TOP_AFFINITY_COLUMNS as i64
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect::<std::result::Result<_, _>>()?;
+        for (t, c, n) in cols {
+            // The lexical index can name tables no longer served; skip
+            // rather than dangle an edge at a missing column node.
+            if !tables.contains(&t) {
+                continue;
+            }
+            store.upsert_edge(&Edge {
+                src_key: key.clone(),
+                dst_key: format!("column:{t}.{c}"),
+                kind: "col_affinity".into(),
+                label: format!("×{n}"),
+                props: format!("{{\"method\":\"profiled\",\"count\":{n}}}"),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Inclusion-dependency mining: propose undeclared joins where an integer
 /// column's distinct values are (almost) contained in another table's
 /// single-column integer primary key.
@@ -1137,6 +1219,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(uncentral, 0);
+    }
+
+    #[test]
+    fn term_column_affinity_points_at_value_columns() {
+        let dir = std::env::temp_dir().join(format!("stemma-kg-{}-affinity", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let storef = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&storef);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            let pad = "Additional routine language follows so each record clears \
+                       the document classification threshold comfortably. "
+                .repeat(3);
+            let themes = [
+                "cargo manifest freight cargo manifest hold",
+                "invoice ledger balance invoice ledger audit",
+                "harbor berth channel harbor berth tide",
+                "diesel engine piston diesel engine torque",
+                "quota tariff duty quota tariff customs",
+                "crane gantry hoist crane gantry winch",
+            ];
+            c.execute_batch(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+                 CREATE TABLE clients (id INTEGER PRIMARY KEY, company TEXT NOT NULL);
+                 CREATE TABLE vendors (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            )
+            .unwrap();
+            for i in 0..30 {
+                let theme = themes[i % 6];
+                c.execute(
+                    "INSERT INTO notes (body) VALUES (?1)",
+                    [format!(
+                        "whereof the {theme} whereof provisions apply {theme} whereof. {pad}"
+                    )],
+                )
+                .unwrap();
+            }
+            c.execute_batch(
+                "INSERT INTO clients (company) VALUES
+                     ('Atlas Freight'), ('Beacon Mills'), ('Coral Imports');
+                 INSERT INTO vendors (name) VALUES
+                     ('Atlas Freight'), ('Cargo Line'), ('Cargo Express'), ('Delta Supply');",
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&storef, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        compile(&db, false).unwrap();
+
+        let affinity = |term: &str| -> Vec<(String, String)> {
+            db.conn()
+                .prepare(
+                    "SELECT cn.key, e.props FROM kg_edges e
+                     JOIN kg_nodes tn ON tn.id = e.src
+                     JOIN kg_nodes cn ON cn.id = e.dst
+                     WHERE e.kind = 'col_affinity' AND tn.label = ?1",
+                )
+                .unwrap()
+                .query_map([term], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+
+        // "cargo" recurs in vendors.name values (Cargo Line, Cargo Express)
+        // and nowhere else that clears the floor — one affinity edge, with
+        // provenance, pointing at the existing column node.
+        let cargo = affinity("cargo");
+        assert_eq!(
+            cargo.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["column:vendors.name"],
+            "got {cargo:?}"
+        );
+        assert!(cargo[0].1.contains("\"method\":\"profiled\""));
+        assert!(cargo[0].1.contains("\"count\":2"));
+        // A term with no recurring value matches earns nothing: document
+        // cells are excluded, so "diesel" (docs only) has no affinity.
+        assert!(affinity("diesel").is_empty());
+        // The budget holds for every term.
+        let max_edges: i64 = db
+            .conn()
+            .query_row(
+                "SELECT coalesce(max(n), 0) FROM (
+                    SELECT count(*) AS n FROM kg_edges
+                    WHERE kind = 'col_affinity' GROUP BY src)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(max_edges as usize <= TOP_AFFINITY_COLUMNS);
+
+        // Cross-table restoration: recompiling the column's table removes
+        // its column nodes (and the affinity edges into them); the global
+        // pass must put the edges back.
+        db.conn()
+            .execute("DELETE FROM kg_meta WHERE src_table = 'vendors'", [])
+            .unwrap();
+        let s = compile(&db, false).unwrap();
+        assert_eq!(s.recompiled_tables, 1);
+        assert_eq!(
+            affinity("cargo")
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            vec!["column:vendors.name"],
+            "affinity edges survive an incremental recompile of the column's table"
+        );
     }
 
     #[test]

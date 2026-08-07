@@ -35,6 +35,22 @@ const MIN_SPAN_CHARS: usize = 3;
 const MAX_SPAN_TOKENS: usize = 4;
 /// Candidates fetched per channel per span.
 const PER_CHANNEL_LIMIT: usize = 8;
+/// The candidate unit for value hits is the *interpretation* — one distinct
+/// (table, column, normalized value) — not the row. Each interpretation
+/// carries up to this many concrete sample rowids (ascending; the first is
+/// the representative `rowid`), enough for citation and for the collective
+/// stage's instance probes without hauling whole row sets around.
+const SAMPLE_ROWIDS: usize = 3;
+/// Document hits keep per-row identity (each document is its own reading),
+/// but within a channel one (table, column) may fill at most this many of
+/// the PER_CHANNEL_LIMIT slots — max(2, PER_CHANNEL_LIMIT / 2) — so a table
+/// with many matching documents can no longer starve every other table out
+/// of the channel budget.
+const DOC_COLUMN_QUOTA: usize = if PER_CHANNEL_LIMIT / 2 > 2 {
+    PER_CHANNEL_LIMIT / 2
+} else {
+    2
+};
 /// Fused score below which a candidate is kept in the trace but not selected.
 const SELECT_THRESHOLD: f64 = 0.35;
 /// Max selected candidates per mention.
@@ -71,6 +87,16 @@ const COHERENCE_BOOST: f64 = 0.15;
 /// Coherence never lifts a candidate into the exact band (0.9+): if the
 /// user typed the stored value, they meant the stored value.
 const COHERENCE_CAP: f64 = 0.9;
+/// Context coherence: bonus per distinct query context term (a non-mention
+/// content token that is a compiled KG term) whose col_affinity edge points
+/// at a value candidate's (table, column). Sized below the ≈ 0.067 RRF gap
+/// of one rank step so context refines an ordering the channels left close
+/// rather than overriding lexical evidence; two supporting terms clear it.
+const CONTEXT_TERM_BONUS: f64 = 0.05;
+/// At most this many distinct context terms may support one candidate —
+/// the same tiebreaker-not-retrieval-signal discipline as the doc-coherence
+/// bonus; the summed bonus is further capped at COHERENCE_CAP.
+const CONTEXT_TERM_MAX: usize = 2;
 
 /// Stopwords: never a mention on their own (still allowed inside longer spans).
 const STOPWORDS: &[&str] = &[
@@ -126,6 +152,14 @@ pub struct Candidate {
     /// the user database during collective disambiguation — a human-readable
     /// path like "people #2 ←lead_id— teams #43".
     pub coherence: Option<String>,
+    /// For value candidates: how many user rows share this interpretation
+    /// (table, column, normalized value) — "40 brands named Ellis". `rowid`
+    /// is a representative of that set (its smallest rowid). Always 1 for
+    /// document candidates, which keep per-row identity.
+    pub row_count: u32,
+    /// Up to [`SAMPLE_ROWIDS`] concrete rowids carrying the interpretation,
+    /// ascending; the first is `rowid`.
+    pub sample_rowids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,6 +330,7 @@ pub fn resolve_full(
         let hits = raw.remove(&span.id).unwrap_or_default();
         let mut candidates = fuse(&span.text, hits);
         apply_kg_coherence(db, &span.text, &mut candidates)?;
+        apply_context_coherence(db, &tokens, span.start, span.end, &mut candidates)?;
         span.candidates = candidates;
         if span.candidates.is_empty() {
             span.status = "no_candidates".into();
@@ -520,6 +555,8 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
 struct RawHit {
     table: String,
     column: String,
+    /// Representative rowid: for value hits, the smallest rowid of the
+    /// interpretation; for document hits, the matched row itself.
     rowid: i64,
     value: String,
     channel: &'static str,
@@ -527,17 +564,58 @@ struct RawHit {
     raw: f64,
     is_doc: bool,
     snippet: Option<String>,
+    /// Rows sharing the interpretation (1 for documents).
+    row_count: u32,
+    /// Up to SAMPLE_ROWIDS rowids, ascending, first = `rowid`.
+    sample_rowids: Vec<i64>,
+}
+
+/// Up to SAMPLE_ROWIDS concrete rowids of one value interpretation,
+/// ascending, cached per (table, column, value_norm) across channels.
+fn interpretation_samples(
+    conn: &stemmadb::rusqlite::Connection,
+    cache: &mut std::collections::HashMap<(String, String, String), Vec<i64>>,
+    table: &str,
+    column: &str,
+    value_norm: &str,
+) -> Result<Vec<i64>> {
+    let key = (table.to_string(), column.to_string(), value_norm.to_string());
+    if let Some(hit) = cache.get(&key) {
+        return Ok(hit.clone());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_rowid FROM lex_values
+         WHERE src_table = ?1 AND src_column = ?2 AND value_norm = ?3
+         ORDER BY src_rowid LIMIT ?4",
+    )?;
+    let rowids: Vec<i64> = stmt
+        .query_map(
+            stemmadb::rusqlite::params![table, column, value_norm, SAMPLE_ROWIDS as i64],
+            |r| r.get(0),
+        )?
+        .collect::<std::result::Result<_, _>>()?;
+    cache.insert(key, rowids.clone());
+    Ok(rowids)
 }
 
 fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
     let conn = db.conn();
     let mut hits: Vec<RawHit> = Vec::new();
+    let mut samples = std::collections::HashMap::new();
 
     // Channel 1: exact (case/whitespace-normalized), short values only.
+    // Aggregated per interpretation — (table, column, normalized value) —
+    // so 40 rows sharing one value spend one candidate slot, not eight, and
+    // every distinct reading of the span surfaces. Every exact hit is equal
+    // evidence about the value, so every interpretation enters at rank 0:
+    // no fabricated decay across identical values.
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT src_table, src_column, src_rowid, value FROM lex_values
+            "SELECT src_table, src_column, min(src_rowid), value, value_norm, count(*)
+             FROM lex_values
              WHERE value_norm = lower(trim(?1)) AND length(value) <= ?2
+             GROUP BY src_table, src_column
+             ORDER BY src_table, src_column
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
@@ -552,48 +630,85 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             },
         )?;
-        for (rank, row) in rows.enumerate() {
-            let (table, column, rowid, value) = row?;
+        for row in rows {
+            let (table, column, rowid, value, value_norm, n) = row?;
+            let sample_rowids =
+                interpretation_samples(&conn, &mut samples, &table, &column, &value_norm)?;
             hits.push(RawHit {
                 table,
                 column,
                 rowid,
                 value,
                 channel: "exact",
-                rank,
+                rank: 0,
                 raw: 1.0,
                 is_doc: false,
                 snippet: None,
+                row_count: n as u32,
+                sample_rowids,
             });
         }
     }
 
     // Channels 2 & 3: BM25 token search and trigram fuzzy/substring search.
+    // Value hits are aggregated per interpretation in SQL (best bm25, row
+    // count, representative rowid); document hits keep per-row identity but
+    // are windowed to DOC_COLUMN_QUOTA per (table, column) before the
+    // channel-wide LIMIT, so one document table cannot starve another.
     for (channel, fts_table) in [("bm25", "lex_fts"), ("trigram", "lex_trigram")] {
         let sql = format!(
-            "SELECT v.src_table, v.src_column, v.src_rowid, v.value, bm25({fts}),
-                    v.is_doc, snippet({fts}, 0, '⟨', '⟩', '…', 10)
-             FROM {fts} f JOIN lex_values v ON v.id = f.rowid
-             WHERE {fts} MATCH ?1 ORDER BY bm25({fts}) LIMIT ?2",
+            // MATERIALIZED: the CTE is read by both UNION arms, and FTS5
+            // auxiliary functions (bm25, snippet) are only usable inside
+            // the MATCH query itself — materialization keeps them there.
+            "WITH matched AS MATERIALIZED (
+                SELECT v.src_table AS t, v.src_column AS c, v.src_rowid AS r,
+                       v.value AS value, v.value_norm AS vn, v.is_doc AS is_doc,
+                       bm25({fts}) AS b,
+                       CASE WHEN v.is_doc = 1
+                            THEN snippet({fts}, 0, '⟨', '⟩', '…', 10) END AS snip
+                FROM {fts} f JOIN lex_values v ON v.id = f.rowid
+                WHERE {fts} MATCH ?1
+             )
+             SELECT t, c, rep, value, vn, b, is_doc, n, snip FROM (
+                SELECT t, c, min(r) AS rep, min(value) AS value, vn,
+                       min(b) AS b, 0 AS is_doc, count(*) AS n, NULL AS snip
+                FROM matched WHERE is_doc = 0 GROUP BY t, c, vn
+                UNION ALL
+                SELECT t, c, r AS rep, value, NULL AS vn, b, 1 AS is_doc,
+                       1 AS n, snip
+                FROM (SELECT *, row_number() OVER (
+                          PARTITION BY t, c ORDER BY b) AS rn
+                      FROM matched WHERE is_doc = 1)
+                WHERE rn <= ?3
+             )
+             ORDER BY b, t, c LIMIT ?2",
             fts = fts_table
         );
         let mut stmt = conn.prepare_cached(&sql)?;
         // Quote as an FTS5 string so query punctuation isn't FTS syntax.
         let fts_query = format!("\"{}\"", span.replace('"', "\"\""));
         let rows = stmt.query_map(
-            stemmadb::rusqlite::params![fts_query, PER_CHANNEL_LIMIT as i64],
+            stemmadb::rusqlite::params![
+                fts_query,
+                PER_CHANNEL_LIMIT as i64,
+                DOC_COLUMN_QUOTA as i64
+            ],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
-                    r.get::<_, f64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, f64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         );
@@ -603,12 +718,28 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
             // query legitimately unmatchable — treat as zero hits.
             Err(_) => continue,
         };
-        for (rank, row) in rows.enumerate() {
-            let (table, column, rowid, value, bm25, is_doc, snippet) = match row {
+        // Competition ranking on the channel-native score: entries with an
+        // identical bm25 are identical evidence and share a rank, so two
+        // interpretations of the same surface string fuse identically.
+        let mut prev_raw = f64::INFINITY;
+        let mut rank = 0usize;
+        for (idx, row) in rows.enumerate() {
+            let (table, column, rowid, value, vn, bm25, is_doc, n, snippet) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             let is_doc = is_doc != 0;
+            let raw = -bm25; // SQLite bm25() is lower-is-better; negate.
+            if raw < prev_raw {
+                rank = idx;
+                prev_raw = raw;
+            }
+            let sample_rowids = match &vn {
+                Some(vn) => {
+                    interpretation_samples(&conn, &mut samples, &table, &column, vn)?
+                }
+                None => vec![rowid],
+            };
             hits.push(RawHit {
                 table,
                 column,
@@ -616,9 +747,11 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
                 value,
                 channel,
                 rank,
-                raw: -bm25, // SQLite bm25() is lower-is-better; negate.
+                raw,
                 is_doc,
                 snippet: if is_doc { snippet } else { None },
+                row_count: n as u32,
+                sample_rowids,
             });
         }
     }
@@ -672,6 +805,8 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
                 raw: cosine,
                 is_doc: is_doc != 0,
                 snippet: None,
+                row_count: 1,
+                sample_rowids: vec![rowid],
             });
         }
     }
@@ -762,6 +897,97 @@ fn apply_kg_coherence(db: &StemmaDb, span: &str, candidates: &mut [Candidate]) -
     Ok(())
 }
 
+/// Context coherence for *value* candidates: the query's own non-mention
+/// content words disambiguate between interpretations of the same string,
+/// with no model call. Each context token that is a compiled KG term and has
+/// a col_affinity edge to a candidate's (table, column) is one supporting
+/// term; a candidate earns CONTEXT_TERM_BONUS per distinct supporting term
+/// (at most CONTEXT_TERM_MAX), capped at COHERENCE_CAP — context refines
+/// orderings below the exact band and never demotes or outranks an exact
+/// match. The support is recorded as a "kg" channel entry (raw = the bonus)
+/// so trajectories show it even where the cap left the score unchanged.
+fn apply_context_coherence(
+    db: &StemmaDb,
+    tokens: &[Token],
+    span_start: usize,
+    span_end: usize,
+    candidates: &mut Vec<Candidate>,
+) -> Result<()> {
+    if candidates.iter().all(|c| c.is_doc) {
+        return Ok(());
+    }
+    let conn = db.conn();
+    let has_kg: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_kg == 0 {
+        return Ok(());
+    }
+
+    // Context terms: content tokens outside the current span.
+    let mut context: Vec<String> = tokens
+        .iter()
+        .filter(|t| t.end <= span_start || t.start >= span_end)
+        .filter(|t| !t.stopword && t.text.chars().count() >= MIN_SPAN_CHARS)
+        .map(|t| t.text.to_lowercase())
+        .collect();
+    context.sort();
+    context.dedup();
+    if context.is_empty() {
+        return Ok(());
+    }
+
+    // For each context term that is a compiled KG term, the set of column
+    // node keys its col_affinity edges point at (≤ 4 per term by
+    // construction — see stemma-kg's affinity pass).
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT cn.key FROM kg_nodes tn
+         JOIN kg_edges e ON e.src = tn.id AND e.kind = 'col_affinity'
+         JOIN kg_nodes cn ON cn.id = e.dst
+         WHERE tn.kind = 'term' AND lower(tn.label) = ?1",
+    )?;
+    let mut supports: Vec<std::collections::HashSet<String>> = Vec::new();
+    for term in &context {
+        let cols: std::collections::HashSet<String> = stmt
+            .query_map([term], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !cols.is_empty() {
+            supports.push(cols);
+        }
+    }
+    if supports.is_empty() {
+        return Ok(());
+    }
+
+    let mut touched = false;
+    for c in candidates.iter_mut().filter(|c| !c.is_doc) {
+        let key = format!("column:{}.{}", c.table, c.column);
+        let m = supports
+            .iter()
+            .filter(|cols| cols.contains(&key))
+            .count()
+            .min(CONTEXT_TERM_MAX);
+        if m > 0 {
+            let bonus = CONTEXT_TERM_BONUS * m as f64;
+            c.score = c.score.max((c.score + bonus).min(COHERENCE_CAP));
+            c.channels.push(ChannelScore {
+                channel: "kg".into(),
+                rank: 0,
+                raw: bonus,
+            });
+            touched = true;
+        }
+    }
+    if touched {
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    }
+    Ok(())
+}
+
 /// Collective disambiguation (AIDA-lineage joint tuple scoring): the
 /// associative mention — "Chen's team" — is unresolvable span by span when
 /// there are two Chens, but the *pair* is: the right Chen is the one with a
@@ -834,13 +1060,25 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
                             store.table_paths(&key.0, &key.1, MAX_PATH_HOPS, MAX_PATHS_PER_PAIR)?;
                         path_cache.insert(key.clone(), paths);
                     }
-                    for path in &path_cache[&key] {
-                        if probe_instance_link(db, path, ca.rowid, cb.rowid)? {
-                            verified.insert(
-                                (p, q, a, b),
-                                render_kg_path(path, &ca.table, ca.rowid, cb.rowid),
-                            );
-                            break;
+                    // An interpretation candidate stands for up to
+                    // SAMPLE_ROWIDS concrete rows: probe the representative
+                    // first and fall back to the remaining samples, since
+                    // any row of the interpretation verifying the link
+                    // verifies the reading. The probed rowids are the ones
+                    // recorded in the evidence.
+                    let ra = probe_rowids(ca);
+                    let rb = probe_rowids(cb);
+                    'paths: for path in &path_cache[&key] {
+                        for &ar in &ra {
+                            for &br in &rb {
+                                if probe_instance_link(db, path, ar, br)? {
+                                    verified.insert(
+                                        (p, q, a, b),
+                                        render_kg_path(path, &ca.table, ar, br),
+                                    );
+                                    break 'paths;
+                                }
+                            }
                         }
                     }
                 }
@@ -907,6 +1145,17 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
         spans[i].candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
     Ok(())
+}
+
+/// The rowids collective disambiguation may probe for a candidate: its
+/// sample rowids (representative first), bounded at SAMPLE_ROWIDS by
+/// construction; the bare representative when no samples were carried.
+fn probe_rowids(c: &Candidate) -> Vec<i64> {
+    if c.sample_rowids.is_empty() {
+        vec![c.rowid]
+    } else {
+        c.sample_rowids.clone()
+    }
 }
 
 /// Verifies that two concrete rows connect along `path` in the user
@@ -1007,7 +1256,14 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
         value: String,
         is_doc: bool,
         snippet: Option<String>,
+        row_count: u32,
+        sample_rowids: Vec<i64>,
     }
+    // The candidate key for values is the interpretation: channels report
+    // one hit per (table, column, normalized value) with the interpretation's
+    // smallest rowid as representative, so grouping on (table, column,
+    // representative rowid) is grouping on the reading, not on a cell.
+    // Documents keep per-row identity, and their rowid is the row itself.
     let mut grouped: BTreeMap<(String, String, i64), Group> = BTreeMap::new();
     for h in hits {
         let entry = grouped
@@ -1017,10 +1273,16 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 value: h.value.clone(),
                 is_doc: h.is_doc,
                 snippet: None,
+                row_count: h.row_count,
+                sample_rowids: h.sample_rowids.clone(),
             });
         entry.is_doc |= h.is_doc;
         if entry.snippet.is_none() {
             entry.snippet = h.snippet.clone();
+        }
+        entry.row_count = entry.row_count.max(h.row_count);
+        if h.sample_rowids.len() > entry.sample_rowids.len() {
+            entry.sample_rowids = h.sample_rowids.clone();
         }
         entry.channels.push(ChannelScore {
             channel: h.channel.to_string(),
@@ -1079,6 +1341,12 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 snippet: g.snippet,
                 adjudicated: false,
                 coherence: None,
+                row_count: g.row_count.max(1),
+                sample_rowids: if g.sample_rowids.is_empty() {
+                    vec![rowid]
+                } else {
+                    g.sample_rowids
+                },
             }
         })
         .collect();
@@ -1245,6 +1513,8 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                         is_doc: c.is_doc,
                         adjudicated: c.adjudicated,
                         coherence: c.coherence.clone().unwrap_or_default(),
+                        row_count: c.row_count,
+                        sample_rowids: c.sample_rowids.clone(),
                         channels: c
                             .channels
                             .iter()
@@ -1429,6 +1699,148 @@ mod tests {
         assert_eq!(best.rowid, 1);
     }
 
+    /// Builds a scratch user DB from the given SQL batch and ingests it.
+    fn custom_db(tag: &str, ddl: &str) -> StemmaDb {
+        let dir = std::env::temp_dir().join(format!("stemma-resolve-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(ddl).unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn duplicate_rows_do_not_hide_rival_interpretations() {
+        // The issue #1 repro, verbatim: "Ellis" is both a brand and a
+        // surname. 40 brand rows share the value, 5 people rows share it,
+        // and both tables carry filler so neither is degenerate. Before
+        // interpretation candidacy, the 40 brand rows consumed every
+        // candidate slot and people.surname never appeared at all.
+        let mut ddl = String::from(
+            "CREATE TABLE brands (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE people (id INTEGER PRIMARY KEY, surname TEXT NOT NULL);",
+        );
+        for _ in 0..40 {
+            ddl.push_str("INSERT INTO brands (name) VALUES ('Ellis');");
+        }
+        for filler in ["Acme", "Zenith", "Northwind"] {
+            ddl.push_str(&format!("INSERT INTO brands (name) VALUES ('{filler}');"));
+        }
+        for _ in 0..5 {
+            ddl.push_str("INSERT INTO people (surname) VALUES ('Ellis');");
+        }
+        for filler in ["Okafor", "Natarajan", "Silva"] {
+            ddl.push_str(&format!("INSERT INTO people (surname) VALUES ('{filler}');"));
+        }
+        let db = custom_db("ellis", &ddl);
+
+        let trace = resolve_lexical(&db, "Ellis").unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Ellis")
+            .expect("Ellis mention");
+        for c in &span.candidates {
+            println!(
+                "{}.{} #{} '{}' score={:.3} row_count={} samples={:?} selected={}",
+                c.table, c.column, c.rowid, c.value, c.score, c.row_count,
+                c.sample_rowids, c.selected
+            );
+        }
+
+        // One candidate per interpretation — duplicate rows collapsed.
+        let brands: Vec<_> = span.candidates.iter().filter(|c| c.table == "brands").collect();
+        let people: Vec<_> = span.candidates.iter().filter(|c| c.table == "people").collect();
+        assert_eq!(brands.len(), 1, "one candidate per interpretation");
+        assert_eq!(people.len(), 1, "the rival reading must surface");
+        let (brand, person) = (brands[0], people[0]);
+
+        // Interpretation bookkeeping: row counts, representative rowid,
+        // bounded ascending samples led by the representative.
+        assert_eq!(brand.row_count, 40);
+        assert_eq!(person.row_count, 5);
+        for c in [brand, person] {
+            assert_eq!(c.sample_rowids[0], c.rowid);
+            assert!(c.sample_rowids.len() <= 3);
+            assert!(c.sample_rowids.windows(2).all(|w| w[0] < w[1]));
+        }
+
+        // Equal evidence, equal score: both interpretations enter the exact
+        // channel at rank 0 — no fabricated decay over identical values.
+        for c in [brand, person] {
+            let exact = c
+                .channels
+                .iter()
+                .find(|ch| ch.channel == "exact")
+                .expect("exact channel");
+            assert_eq!(exact.rank, 0);
+            assert_eq!(exact.raw, 1.0);
+        }
+        assert_eq!(brand.score, person.score, "identical evidence, identical score");
+
+        // TOP_K selection carries both readings.
+        assert!(brand.selected && person.selected);
+
+        // And the interpretation fields survive into the Explain proto.
+        let explain = trace_to_explain_proto(&trace);
+        let pb_span = &explain.spans[span.id];
+        let pb_brand = pb_span
+            .candidates
+            .iter()
+            .find(|c| c.table == "brands")
+            .unwrap();
+        assert_eq!(pb_brand.row_count, 40);
+        assert_eq!(pb_brand.sample_rowids.len(), 3);
+        assert_eq!(pb_brand.sample_rowids[0], pb_brand.rowid);
+    }
+
+    #[test]
+    fn doc_quota_keeps_rival_tables_in_the_channel() {
+        // A document table with many strong matches must not starve another
+        // document table out of the FTS channel budget.
+        let pad = "Further procedural language follows to reach the document \
+                   classification threshold with room to spare in every row. "
+            .repeat(3);
+        let mut ddl = String::from(
+            "CREATE TABLE manuals (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE TABLE memos (id INTEGER PRIMARY KEY, body TEXT);",
+        );
+        for i in 0..10 {
+            ddl.push_str(&format!(
+                "INSERT INTO manuals (body) VALUES ('Turbine maintenance step {i}: {pad}');"
+            ));
+        }
+        for i in 0..2 {
+            ddl.push_str(&format!(
+                "INSERT INTO memos (body) VALUES ('Turbine budget note {i}: {pad}');"
+            ));
+        }
+        let db = custom_db("quota", &ddl);
+        let trace = resolve_lexical(&db, "turbine").unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "turbine")
+            .expect("turbine mention");
+        let tables: std::collections::HashSet<&str> =
+            span.candidates.iter().map(|c| c.table.as_str()).collect();
+        assert!(
+            tables.contains("memos"),
+            "the smaller table must survive the channel budget, got {tables:?}"
+        );
+        let manuals = span.candidates.iter().filter(|c| c.table == "manuals").count();
+        assert!(manuals <= DOC_COLUMN_QUOTA, "per-column quota holds");
+    }
+
     #[test]
     fn collective_disambiguation_prefers_connected_chen() {
         // The associative-mention case: "Chen" alone matches both Wei Chen
@@ -1474,6 +1886,110 @@ mod tests {
             .find(|s| s.text == "Billing")
             .expect("Billing mention");
         assert_eq!(billing.candidates[0].coherence.as_deref(), Some(evidence));
+    }
+
+    /// The context-coherence fixture: the value 'Atlas Freight' lives in
+    /// two columns, and a document corpus gives the compiler a term
+    /// ("cargo") whose content affinity points at exactly one of them
+    /// (vendors.name, via the recurring Cargo* values).
+    fn context_db(tag: &str) -> StemmaDb {
+        let pad = "Additional routine language follows so each record clears \
+                   the document classification threshold comfortably. "
+            .repeat(3);
+        let themes = [
+            "cargo manifest freight cargo manifest hold",
+            "invoice ledger balance invoice ledger audit",
+            "harbor berth channel harbor berth tide",
+            "diesel engine piston diesel engine torque",
+            "quota tariff duty quota tariff customs",
+            "crane gantry hoist crane gantry winch",
+        ];
+        let mut ddl = String::from(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE TABLE clients (id INTEGER PRIMARY KEY, company TEXT NOT NULL);
+             CREATE TABLE vendors (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+        );
+        for i in 0..30 {
+            let theme = themes[i % 6];
+            ddl.push_str(&format!(
+                "INSERT INTO notes (body) VALUES ('whereof the {theme} whereof provisions apply {theme} whereof. {pad}');"
+            ));
+        }
+        // The shared value, plus the recurring Cargo* values that give the
+        // term its affinity to vendors.name — and none to clients.company.
+        ddl.push_str(
+            "INSERT INTO clients (company) VALUES
+                 ('Atlas Freight'), ('Beacon Mills'), ('Coral Imports');
+             INSERT INTO vendors (name) VALUES
+                 ('Atlas Freight'), ('Cargo Line'), ('Cargo Express'), ('Delta Supply');",
+        );
+        custom_db(tag, &ddl)
+    }
+
+    #[test]
+    fn context_term_affinity_flips_value_interpretations() {
+        let db = context_db("ctxflip");
+        stemma_kg::compile(&db, false).unwrap();
+        let trace = resolve_lexical(&db, "cargo Atlas").unwrap();
+        let span = trace
+            .spans
+            .iter()
+            .find(|s| s.text == "Atlas")
+            .expect("Atlas span");
+        for c in &span.candidates {
+            println!(
+                "{}.{} '{}' score={:.3} channels={:?}",
+                c.table, c.column, c.value, c.score,
+                c.channels.iter().map(|ch| (ch.channel.as_str(), ch.rank, ch.raw)).collect::<Vec<_>>()
+            );
+        }
+        let vendor = span.candidates.iter().find(|c| c.table == "vendors").unwrap();
+        let client = span.candidates.iter().find(|c| c.table == "clients").unwrap();
+        // Identical lexical evidence — the flip is the context term's doing,
+        // and it is recorded as a "kg" channel entry carrying the bonus.
+        let kg = vendor
+            .channels
+            .iter()
+            .find(|ch| ch.channel == "kg")
+            .expect("kg channel on the supported interpretation");
+        assert!((kg.raw - CONTEXT_TERM_BONUS).abs() < 1e-9);
+        assert!(client.channels.iter().all(|ch| ch.channel != "kg"));
+        assert!(
+            (vendor.score - client.score - CONTEXT_TERM_BONUS).abs() < 1e-9,
+            "vendor {} vs client {}",
+            vendor.score,
+            client.score
+        );
+        assert_eq!(
+            span.candidates[0].table, "vendors",
+            "the context-supported interpretation must rank first"
+        );
+    }
+
+    #[test]
+    fn neutral_context_earns_no_bonus() {
+        let db = context_db("ctxneutral");
+        stemma_kg::compile(&db, false).unwrap();
+        // "diesel" is a compiled term of the corpus, but it has no affinity
+        // to either column holding 'Atlas Freight' — and a bare mention has
+        // no context at all. Neither may move the ordering.
+        for query in ["Atlas", "diesel Atlas"] {
+            let trace = resolve_lexical(&db, query).unwrap();
+            let span = trace
+                .spans
+                .iter()
+                .find(|s| s.text == "Atlas")
+                .expect("Atlas span");
+            let vendor = span.candidates.iter().find(|c| c.table == "vendors").unwrap();
+            let client = span.candidates.iter().find(|c| c.table == "clients").unwrap();
+            assert_eq!(vendor.score, client.score, "query {query:?}");
+            assert!(
+                span.candidates
+                    .iter()
+                    .all(|c| c.channels.iter().all(|ch| ch.channel != "kg")),
+                "no kg evidence without supporting context, query {query:?}"
+            );
+        }
     }
 
     #[test]
@@ -1588,6 +2104,8 @@ mod tests {
             snippet: None,
             adjudicated: false,
             coherence: None,
+            row_count: 1,
+            sample_rowids: vec![rowid],
         }
     }
 

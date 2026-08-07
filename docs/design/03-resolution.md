@@ -42,6 +42,8 @@ Every tunable in the pipeline, with its source and its job:
 | `MIN_SPAN_CHARS` | 3 | stemma-resolve | Spans shorter than this are never looked up |
 | `MAX_SPAN_TOKENS` | 4 | stemma-resolve | Longest mention considered, in tokens |
 | `PER_CHANNEL_LIMIT` | 8 | stemma-resolve | Candidates fetched per channel per span |
+| `SAMPLE_ROWIDS` | 3 | stemma-resolve | Concrete rowids carried per value interpretation |
+| `DOC_COLUMN_QUOTA` | max(2, `PER_CHANNEL_LIMIT`/2) = 4 | stemma-resolve | FTS-channel slots one (table, column) of documents may fill |
 | `SELECT_THRESHOLD` | 0.35 | stemma-resolve | Fused score below which a candidate is traced but not selected |
 | `TOP_K` | 5 | stemma-resolve | Max selected candidates per mention |
 | `DENSE_MAX_SPANS` | 4 | stemma-resolve | Spans per query that get a dense KNN probe |
@@ -49,6 +51,8 @@ Every tunable in the pipeline, with its source and its job:
 | `EXACT_MAX_LEN` | 120 | stemma-ingest | Values longer than this are excluded from the exact channel |
 | `DOC_MIN_LEN` | 200 | stemma-ingest | Values at least this long are classified `is_doc` |
 | KG bonus | 0.04 / matched co-term | stemma-resolve | Coherence increment, capped at 0.9 |
+| `CONTEXT_TERM_BONUS` | 0.05 / supporting term | stemma-resolve | Context-coherence increment for value candidates, capped at 0.9 |
+| `CONTEXT_TERM_MAX` | 2 | stemma-resolve | Distinct context terms that may support one candidate |
 | KG span nudge | ×1.08 | stemma-resolve | Selection preference for spans matching a KG entity |
 | `MAX_TUPLE_MENTIONS` | 4 | stemma-resolve | Provisional mentions entering joint tuple scoring |
 | `MAX_TUPLE_K` | 4 | stemma-resolve | Candidates per mention in joint tuple scoring |
@@ -209,6 +213,42 @@ was for [Cormack 2009]. (The fourth channel, dense, *is* conditional —
 see [stage 4b](#stage-4b--the-dense-channel-targeted) — because its cost
 profile is different by two orders of magnitude.)
 
+### The candidate unit: interpretations, not rows
+
+For **value** hits (`is_doc = 0`), the unit every channel retrieves and the
+budget is spent on is the **interpretation** — one distinct
+`(table, column, normalized value)` — not the cell. A value that occurs 40
+times in one column is *one* reading of the span, not 40 candidates; before
+this, those 40 rows consumed the whole channel budget and any rival reading
+of the same string in another table never surfaced at all (the issue #1
+failure). Each interpretation carries:
+
+- `row_count` — how many rows share it ("40 brands named Ellis"),
+- a **representative rowid** — the interpretation's smallest, so consumers
+  can still cite `table.column #rowid`,
+- up to `SAMPLE_ROWIDS = 3` concrete rowids (ascending, representative
+  first), enough for collective disambiguation's instance probes without
+  hauling row sets around.
+
+**Documents** (`is_doc = 1`) keep per-row identity — each document is its
+own reading — but get a fairness bound instead: inside each FTS channel one
+`(table, column)` may fill at most `DOC_COLUMN_QUOTA = max(2,
+PER_CHANNEL_LIMIT/2) = 4` of the 8 slots (a `ROW_NUMBER() OVER (PARTITION BY
+src_table, src_column ORDER BY bm25)` window before the channel-wide
+`LIMIT`), so one prolific document table can no longer starve every other
+table out of the channel.
+
+### Ranks: equal evidence, equal rank
+
+Within a channel, entries whose channel-native score is identical are
+identical evidence, and they **share a rank** (competition ranking: an
+entry's rank is the count of strictly better entries). Every exact hit has
+`raw = 1.0`, so every exact interpretation enters at rank 0 — the old
+behaviour, where identical values received rank-decayed scores of
+1.000/0.980/0.967… in storage order, fabricated a difference that did not
+exist and is gone. Two interpretations of the same surface string now fuse
+identically unless a channel genuinely ordered them apart.
+
 It is worth being explicit that the lexical channels are not a legacy
 fallback waiting to be replaced by the dense one. BM25 over an inverted index
 remains a strong baseline for exactly this problem: Sparkly, a TF/IDF blocker
@@ -219,15 +259,24 @@ a channel that matches them character-for-character is the right tool.
 ### Channel 1 — exact
 
 ```sql
-SELECT src_table, src_column, src_rowid, value FROM lex_values
+SELECT src_table, src_column, min(src_rowid), value, value_norm, count(*)
+FROM lex_values
 WHERE value_norm = lower(trim(?1)) AND length(value) <= 120
+GROUP BY src_table, src_column
+ORDER BY src_table, src_column
 LIMIT 8
 ```
 
 Served by the `lex_values_norm` B-tree index. Case-insensitive and
 edge-whitespace-insensitive, since `value_norm` is `lower(trim(value))` and
-the probe applies the same normalization to the span. `raw` score is 1.0 for
-every hit; rank is result order.
+the probe applies the same normalization to the span. The `GROUP BY` is the
+interpretation aggregation: one row per `(table, column)` holding the value,
+with `count(*)` as the interpretation's `row_count` and `min(src_rowid)` as
+its representative. `raw` is 1.0 and rank is 0 for **every** hit — all exact
+matches are equal evidence — and the deterministic `ORDER BY` replaces the
+old storage-order walk. Up to `SAMPLE_ROWIDS` concrete rowids per
+interpretation are fetched by a follow-up indexed probe, cached per
+interpretation across channels.
 
 The `length(value) <= EXACT_MAX_LEN` guard is what keeps the channel
 meaningful: a mention does not "equal" an 800 KB regulation, and without the
@@ -237,17 +286,42 @@ guard a long value that happened to normalize to the span text would take the
 ### Channel 2 — BM25 token search
 
 ```sql
-SELECT v.src_table, v.src_column, v.src_rowid, v.value, bm25(lex_fts),
-       v.is_doc, snippet(lex_fts, 0, '⟨', '⟩', '…', 10)
-FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
-WHERE lex_fts MATCH ?1 ORDER BY bm25(lex_fts) LIMIT 8
+WITH matched AS MATERIALIZED (
+    SELECT v.src_table AS t, v.src_column AS c, v.src_rowid AS r,
+           v.value AS value, v.value_norm AS vn, v.is_doc AS is_doc,
+           bm25(lex_fts) AS b,
+           CASE WHEN v.is_doc = 1
+                THEN snippet(lex_fts, 0, '⟨', '⟩', '…', 10) END AS snip
+    FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
+    WHERE lex_fts MATCH ?1
+)
+SELECT t, c, rep, value, vn, b, is_doc, n, snip FROM (
+    -- value hits: one row per interpretation, best bm25 kept
+    SELECT t, c, min(r) AS rep, min(value) AS value, vn,
+           min(b) AS b, 0 AS is_doc, count(*) AS n, NULL AS snip
+    FROM matched WHERE is_doc = 0 GROUP BY t, c, vn
+    UNION ALL
+    -- document hits: per-row, quota'd per (table, column)
+    SELECT t, c, r AS rep, value, NULL AS vn, b, 1 AS is_doc, 1 AS n, snip
+    FROM (SELECT *, row_number() OVER (
+              PARTITION BY t, c ORDER BY b) AS rn
+          FROM matched WHERE is_doc = 1)
+    WHERE rn <= 4          -- DOC_COLUMN_QUOTA
+)
+ORDER BY b, t, c LIMIT 8   -- PER_CHANNEL_LIMIT
 ```
 
 The span is wrapped as an FTS5 phrase — `format!("\"{}\"", span.replace('"',
 "\"\""))` — so query punctuation is treated as text, not as FTS5 operators,
 and so the tokens must appear adjacently and in order. SQLite's `bm25()` is
 lower-is-better; the pipeline stores `raw = -bm25` so that larger is better
-uniformly across channels.
+uniformly across channels. The CTE is `MATERIALIZED` because both `UNION`
+arms read it and FTS5's auxiliary functions (`bm25`, `snippet`) are only
+usable inside the `MATCH` query itself. Value hits are aggregated to
+interpretations in SQL (best bm25 per group, since every row of a group is
+the same evidence about the reading); document hits keep row identity under
+the per-column quota; the deterministic `ORDER BY b, t, c` tie-break feeds
+competition ranking in the caller.
 
 ### Channel 3 — trigram fuzzy/substring search
 
@@ -364,9 +438,15 @@ knowledge-graph coherence bonus, and refines span status.
 
 ## Stage 5 — reciprocal rank fusion
 
-Hits from all channels are grouped by `(src_table, src_column, src_rowid)` —
-one candidate per *matched cell*, carrying one `ChannelScore { channel, rank,
-raw }` per channel that found it.
+Hits from all channels are grouped by `(src_table, src_column, rowid)`, where
+`rowid` is the interpretation's representative for value hits and the row
+itself for documents — so for values this is one candidate per
+*interpretation*, and for documents one per matched row, each carrying one
+`ChannelScore { channel, rank, raw }` per channel that found it. The group
+also merges the interpretation bookkeeping: `row_count` (largest across
+channels, since the exact channel's length guard can trim a group) and the
+`sample_rowids`, which land on the `Candidate` and travel through the JSON
+trace and `TraceCandidate` (proto fields 14/15).
 
 ### The fused base
 
@@ -526,6 +606,21 @@ Legal corpus, query *"appeals of coastal permit denials"*, span
 | `regulations.text #29055` | bm25 1, trigram 1 | 0.400 | 0.533 | doc | **0.453** |
 | `regulations.text #29052` | bm25 2, trigram 2 | 0.333 | 0.444 | doc | **0.378** |
 
+The issue #1 corpus — 40 `brands.name = 'Ellis'` rows, 5
+`people.surname = 'Ellis'` rows, filler in both tables — query *"Ellis"*.
+Before interpretation candidacy the trace held eight `brands.name` rows at
+1.000/0.980/0.967/… and `people.surname` **never appeared**; now:
+
+| candidate | row_count | samples | channels (rank) | score |
+|---|---:|---|---|---:|
+| `brands.name #1 'Ellis'` | 40 | 1, 2, 3 | exact 0, bm25 0, trigram 0 | **1.000** |
+| `people.surname #1 'Ellis'` | 5 | 1, 2, 3 | exact 0, bm25 0, trigram 0 | **1.000** |
+
+Two candidates, one per reading, equal scores — because the evidence is
+equal (identical values produce identical bm25, so the FTS ranks tie too) —
+and both selected. The regression test is
+`duplicate_rows_do_not_hide_rival_interpretations`.
+
 ### Why documents need their own branch: the careg failure mode
 
 This is the most consequential scoring decision in the pipeline, and it is
@@ -631,6 +726,55 @@ the strength of containing terms the corpus's own co-occurrence graph
 associates with *facility*. The `kg` channel appears in the trace and in the
 gRPC evidence, so the reordering is inspectable rather than mysterious.
 
+## Stage 6a — context coherence over term→column affinity
+
+The mirror image of stage 6, for **value** candidates, running in the same
+phase. Where stage 6 asks "does this *document* contain the span's
+neighbourhood", stage 6a asks "does the *query's own context* point at this
+column" — the user's surrounding words disambiguating between
+interpretations of the same string, with no model call.
+
+1. Collect the query's **context terms**: tokens outside the current span,
+   non-stopword, ≥ `MIN_SPAN_CHARS` characters, lowercased and deduplicated.
+2. For each context term that is a compiled KG term, fetch the columns its
+   `col_affinity` edges point at (≤ 4 per term by compiler construction —
+   see [04-knowledge-graph.md](04-knowledge-graph.md#step-6--termcolumn-affinity)).
+3. For each value candidate, count the **distinct supporting terms** — those
+   whose affinity set contains `column:{table}.{column}` — capped at
+   `CONTEXT_TERM_MAX = 2`.
+4. With `m > 0` supporting terms:
+   `score ← max(score, min(score + 0.05·m, 0.9))`, and push a
+   `ChannelScore { channel: "kg", rank: 0, raw: 0.05·m }`.
+5. Re-sort by score.
+
+**Sizing.** `CONTEXT_TERM_BONUS = 0.05` sits just below the ≈ 0.067 RRF gap
+of a single rank step, so one supporting term breaks ties and refines
+close orderings while never overriding a genuine one-rank lexical
+disagreement on its own; two supporting terms can. The cap is the shared
+`COHERENCE_CAP = 0.9` with the same never-demote form as the collective
+boost: context can lift a fuzzy interpretation toward the exact band but
+never *into* it, and an exact match is never reduced — if the user typed the
+stored value, no amount of context outranks that. Inside the exact band the
+`kg` channel entry is still recorded, so the trajectory shows which
+interpretation the context supports even where the cap left the ordering to
+the exact/FTS evidence.
+
+**A measured flip**, from the regression fixture
+(`context_term_affinity_flips_value_interpretations`): the value
+`'Atlas Freight'` lives in both `clients.company` and `vendors.name`; the
+corpus's compiled term *cargo* has `col_affinity` only to `vendors.name`
+(the recurring `Cargo Line` / `Cargo Express` values). Query
+*"cargo Atlas"*, span `Atlas`:
+
+| candidate | lexical (identical) | kg | final |
+|---|---:|---|---:|
+| `vendors.name 'Atlas Freight'` | 0.515 | +0.05 (*cargo*) | **0.565** |
+| `clients.company 'Atlas Freight'` | 0.515 | — | 0.515 |
+
+With neutral context (query *"Atlas"*, or a context term with no affinity to
+either column) neither candidate carries a `kg` entry and the scores stay
+equal (`neutral_context_earns_no_bonus`).
+
 ## Stage 6b — collective disambiguation over join paths
 
 The associative mention — *"Chen's team"* — is not resolvable span by span:
@@ -661,6 +805,12 @@ has a compiled graph.
      `lead_id = 2`). Probes run only for pairs a schema path survived. A
      schema path alone contributes nothing: in a small schema every table
      pair is connected within two hops, so only the data discriminates.
+     Because a value candidate is an interpretation standing for up to
+     `row_count` rows, the probe tries the representative rowid first and
+     falls back to the candidate's remaining `sample_rowids` (≤ 3 per side)
+     — any row of the interpretation verifying the link verifies the
+     reading, and the rowids actually probed are the ones recorded in the
+     evidence path.
 4. **Joint scoring.** Every tuple in the product of the shortlists is
    scored: sum of local fused scores plus `COHERENCE_BOOST` per verified
    pair. At most 4⁴ tuples with at most six pair lookups each — exhaustive
@@ -760,6 +910,12 @@ Five span statuses, each meaning a different kind of "no":
 Three reject reasons, each meaning a different kind of loss:
 `below_threshold`, `outranked`, `span_not_selected`.
 
+Value candidates additionally carry their interpretation bookkeeping —
+`row_count` and `sample_rowids` (representative first) — in the JSON trace
+and on `TraceCandidate` (proto fields 14 and 15), so a consumer can render
+*"40 brands named Ellis"* and cite concrete rows without a follow-up query.
+Document candidates carry `row_count = 1` and their own rowid.
+
 `Resolve` returns the projection (`trace_to_proto`); `Explain` returns the
 whole thing (`trace_to_explain_proto`). Both are served from the *same*
 trace by the same code path in `stemma-server`, so `Explain` is never a
@@ -789,7 +945,10 @@ $$
 2 + S' \cdot (\underbrace{1}_{\text{kg alias}} + \underbrace{1}_{\text{exact}} + \underbrace{2}_{\text{FTS}}) + \sum_{s \in S'_{\text{doc}}} \left(2 + 4\,|D_s|\right)
 $$
 
-where `|D_s| ≤ 32` is the number of document candidates for span *s*. With
+where `|D_s| ≤ 32` is the number of document candidates for span *s*. Value
+interpretations add up to one indexed sample-rowid probe each (cached across
+channels, ≤ `PER_CHANNEL_LIMIT` per channel per span), and stage 6a adds one
+affinity lookup per context term per span when a compiled graph exists. With
 the dense channel enabled, add **one HTTP round trip** to the embedding
 endpoint (batched, all target spans in one request) and at most
 `DENSE_MAX_SPANS = 4` KNN probes. The pipeline is therefore **linear in query
@@ -893,10 +1052,13 @@ tokens are stopwords, so *"appeals of"* and *"of coastal"* are enumerated,
 retrieved for, and scored — three SQL queries each — before losing to a
 better span. They cost latency and add noise to the trace.
 
-**The exact channel's ranks are arbitrary.** `SELECT … LIMIT 8` with no
-`ORDER BY` returns rows in whatever order the index walk produces, and those
-positions become RRF ranks. When one span has several exact matches, their
-relative fused scores are determined by storage order.
+**Interpretation surface forms are folded.** Aggregating value hits by
+`(table, column, value_norm)` folds case and edge-whitespace variants of one
+stored string into one candidate whose displayed `value` is an arbitrary
+(lexicographically smallest) member of the group. For a column storing both
+`'IBM'` and `'ibm'` as meaningfully different values, the trace shows one
+reading where a purist would want two. The `row_count` and `sample_rowids`
+make the fold visible; nothing yet lets a consumer split it back open.
 
 **Co-term selection is unordered.** The coherence query is documented in the
 code as returning co-occurring terms "strongest first", but the SQL has no
@@ -913,11 +1075,15 @@ emits it. A consumer must string-match the channel name to know it is looking
 at a similarity rather than a BM25 score, and the model identity is not on
 the evidence at all.
 
-**Candidates are cells, not records.** One user row matching in two columns
-produces two candidates that are never merged. For the legal corpus this is
-harmless (one text column matters); for a `people(first_name, last_name)`
-schema it means the same person appears twice and consumes two of the five
-`TOP_K` slots.
+**Candidates are interpretations (or document cells), not records.** Value
+candidacy is per `(table, column, normalized value)` — duplicate rows of one
+reading no longer consume the budget or fabricate rank-decayed score
+differences — but one user row matching in two *columns* still produces two
+candidates that are never merged. For the legal corpus this is harmless (one
+text column matters); for a `people(first_name, last_name)` schema it means
+the same person appears twice and consumes two of the five `TOP_K` slots.
+Merging across columns needs the designed instance layer's per-record
+entities.
 
 **Scores are not calibrated.** `Candidate.score` is documented in the proto
 as *"Calibrated confidence in [0, 1]"*. It is a fused heuristic in [0, 1]

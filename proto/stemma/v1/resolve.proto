@@ -72,6 +72,13 @@ message TraceCandidate {
   // user database during collective disambiguation — a human-readable path
   // like "people #2 ←lead_id— teams #43". Empty when no such evidence.
   string coherence = 13;
+  // For value candidates: how many user rows share this interpretation
+  // (table, column, normalized value). `rowid` is a representative of the
+  // set. 1 for document candidates, which keep per-row identity.
+  uint32 row_count = 14;
+  // Up to three concrete rowids carrying the interpretation, ascending;
+  // the first is the representative `rowid`.
+  repeated int64 sample_rowids = 15;
 }
 
 message TraceSpan {
