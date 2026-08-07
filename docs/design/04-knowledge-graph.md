@@ -450,7 +450,9 @@ content the term recurs in:
 ```sql
 SELECT v.src_table, v.src_column, count(*) AS n
 FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
-WHERE lex_fts MATCH '"<term>"' AND v.is_doc = 0
+JOIN lex_columns lc ON lc.src_table = v.src_table
+                   AND lc.src_column = v.src_column
+WHERE lex_fts MATCH '"<term>"' AND v.is_doc = 0 AND lc.kind = 'text'
 GROUP BY v.src_table, v.src_column
 HAVING n >= 2                 -- MIN_AFFINITY_MATCHES
 ORDER BY n DESC LIMIT 4       -- TOP_AFFINITY_COLUMNS
@@ -462,13 +464,17 @@ already-existing `column:{table}.{column}` nodes, labelled `×{n}` with
 
 Two deliberate choices:
 
-- **Only value cells count** (`is_doc = 0`). A term trivially "co-occurs"
-  with the document column it was mined from, and the consumer of these
-  edges — resolution's context-coherence stage
+- **Only value cells in `text`-kind columns count** (`is_doc = 0`, plus the
+  [column typology](02-data-model.md#lex_columns--column-typology)). A term
+  trivially "co-occurs" with the document column it was mined from, and the
+  consumer of these edges — resolution's context-coherence stage
   ([03-resolution.md](03-resolution.md#stage-6a--context-coherence-over-termcolumn-affinity)),
   which disambiguates *value* interpretations — could never use a
   document-column edge. Letting the mined-from column fill the top-4 slots
-  would spend the whole budget on edges nothing consumes.
+  would spend the whole budget on edges nothing consumes. The typology
+  restriction is the same argument one level up: no mention of a term ever
+  resolves to a timestamp, key or code value, so affinity into those
+  columns is budget spent on edges nothing can use.
 - **The floor is recurrence, not a score** — `MIN_AFFINITY_MATCHES = 2`,
   the same discipline as `MIN_VALUE_COUNT`: one co-occurrence is
   coincidence, two is a pattern, and no "column-relatedness" heuristic is

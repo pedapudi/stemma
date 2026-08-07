@@ -210,10 +210,13 @@ impl ResolveService for Resolver {
     }
 }
 
-/// Enqueues missing embeddings for one database — document cells and value
-/// interpretations, into the same queue — and drains it to empty, batch by
-/// batch, on its own store connection. The drain routes each item by kind:
-/// documents into vec_dense, interpretation cards into vec_interp.
+/// Enqueues missing embeddings for one database and drains them on its own
+/// store connection, documents strictly before interpretation cards:
+/// enqueue docs → drain to empty → enqueue interps → drain to empty. The
+/// document sweep is small (the corpus's long cells) while the card sweep
+/// can be large, so this ordering lights the dense document channel in
+/// seconds instead of after the full interpretation pass. The drain routes
+/// each item by kind: documents into vec_dense, cards into vec_interp.
 fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str) {
     let store = user_db.with_extension("stemmadb");
     let db = match StemmaDb::open(&store, user_db) {
@@ -224,13 +227,27 @@ fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str
         }
     };
     let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model);
+
+    let start = std::time::Instant::now();
     let queued_docs = match stemma_ingest::enqueue_missing_embeddings(&db) {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!(name, error = %e, "embed drain: enqueue failed");
+            tracing::warn!(name, error = %e, "embed drain: document enqueue failed");
             return;
         }
     };
+    tracing::info!(
+        name,
+        queued_docs,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "embed drain: documents enqueued"
+    );
+    log_dense_building(name, &db);
+    if !drain_to_empty(name, &db, &embedder, "documents") {
+        return;
+    }
+
+    let start = std::time::Instant::now();
     let queued_interps = match stemma_ingest::enqueue_missing_interpretations(&db) {
         Ok(n) => n,
         Err(e) => {
@@ -240,32 +257,60 @@ fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str
     };
     tracing::info!(
         name,
-        queued_docs,
         queued_interps,
-        "embed drain: queue filled"
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "embed drain: interpretations enqueued"
     );
+    log_dense_building(name, &db);
+    drain_to_empty(name, &db, &embedder, "interpretations");
+}
+
+/// One line distinguishing "dense index still building" from "no
+/// dense-channel candidates": while items are pending and either vector
+/// table has yet to materialize, a dense query legitimately returns nothing.
+fn log_dense_building(name: &str, db: &StemmaDb) {
+    let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    let tables = count(
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('vec_dense', 'vec_interp')",
+    );
+    let docs = count("SELECT count(*) FROM embed_queue WHERE status = 'pending' AND serialized = ''");
+    let interps =
+        count("SELECT count(*) FROM embed_queue WHERE status = 'pending' AND serialized != ''");
+    if tables < 2 && docs + interps > 0 {
+        tracing::info!(
+            name,
+            "dense channel building: {docs} docs, {interps} interps pending"
+        );
+    }
+}
+
+/// Drains the queue until nothing is pending; false = stopped on error
+/// (left-over items keep their attempt counts for the next server start).
+fn drain_to_empty(
+    name: &str,
+    db: &StemmaDb,
+    embedder: &dyn stemma_embed::Embedder,
+    phase: &str,
+) -> bool {
     loop {
-        match stemma_ingest::drain_embed_queue(&db, &embedder, stemma_ingest::EMBED_BATCH) {
+        match stemma_ingest::drain_embed_queue(db, embedder, stemma_ingest::EMBED_BATCH) {
             Ok(stats) => {
                 tracing::info!(
                     name,
-                    queued_docs,
-                    queued_interps,
+                    phase,
                     drained = stats.drained,
                     failed = stats.failed,
                     remaining = stats.remaining,
                     "embed drain: batch"
                 );
                 if stats.remaining == 0 {
-                    tracing::info!(name, "embed drain: queue empty");
-                    return;
+                    tracing::info!(name, phase, "embed drain: queue empty");
+                    return true;
                 }
             }
             Err(e) => {
-                // Left-over items stay pending with their attempt counts;
-                // the next server start picks them back up.
-                tracing::warn!(name, error = %e, "embed drain: stopped");
-                return;
+                tracing::warn!(name, phase, error = %e, "embed drain: stopped");
+                return false;
             }
         }
     }

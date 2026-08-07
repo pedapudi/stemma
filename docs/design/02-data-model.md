@@ -553,14 +553,69 @@ database, two tables) produces:
 
 Two honest observations from that table. First, **three quarters of the
 index is not worth indexing**: `uuid` is all-distinct and never mentioned in
-prose, `license` and `category` are single-valued constants. A per-column
-profiling pass that skips all-distinct identifier-shaped columns and
-single-valued constants is designed but unbuilt; the knowledge compiler
-already computes the distinctness statistics that would drive it. Second,
-the maximum `regulations.text` length is 870 KB — a single cell nearly a
-megabyte long, which the trigram index must tokenize into hundreds of
-thousands of trigrams. Document-shaped corpora stress the index in ways
-value-shaped corpora do not.
+prose, `license` and `category` are single-valued constants. The column
+typology below now *classifies* such columns (both `uuid` columns profile as
+`identifier`) so downstream passes can skip them; the indexing itself still
+pays for them. Second, the maximum `regulations.text` length is 870 KB — a
+single cell nearly a megabyte long, which the trigram index must tokenize
+into hundreds of thousands of trigrams. Document-shaped corpora stress the
+index in ways value-shaped corpora do not.
+
+### `lex_columns` — column typology
+
+```sql
+CREATE TABLE IF NOT EXISTS lex_columns (
+    src_table      TEXT NOT NULL,
+    src_column     TEXT NOT NULL,
+    n_values       INTEGER NOT NULL,
+    n_distinct     INTEGER NOT NULL,   -- over value_norm
+    distinct_ratio REAL NOT NULL,
+    alpha_ratio    REAL NOT NULL,      -- values containing any [a-z]
+    numeric_ratio  REAL NOT NULL,      -- digits and . e + - only
+    temporal_ratio REAL NOT NULL,      -- epoch-ranged numbers or ISO dates
+    idlike_ratio   REAL NOT NULL,      -- uuid / long hex / long digit runs
+    doc_ratio      REAL NOT NULL,      -- fraction past DOC_MIN_LEN
+    avg_len        REAL NOT NULL,
+    kind           TEXT NOT NULL,
+    PRIMARY KEY (src_table, src_column)
+) STRICT;
+```
+
+`lex_values` records what values exist; `lex_columns` records what **kind**
+of thing each column holds. `stemma_ingest::profile_columns` fills it in one
+grouped pass over `lex_values` at the end of every index (re)build — it is
+derived state with the same lifecycle as the FTS tables: dropped and rebuilt
+with the index, never migrated, no store schema version involved. A store
+built before the table existed gets profiled on the next
+`build_lexical_index` call without reindexing.
+
+`kind` is assigned by the first matching rule, thresholds in
+[`stemma-ingest`](../../crates/stemma-ingest/src/lib.rs) as `KIND_*`
+constants:
+
+| kind | rule |
+|---|---|
+| `document` | `doc_ratio` > 0.5 |
+| `temporal` | `temporal_ratio` > 0.8 |
+| `numeric` | `numeric_ratio` > 0.8 |
+| `identifier` | `idlike_ratio` > 0.8, or `distinct_ratio` > 0.95 with `alpha_ratio` < 0.5 |
+| `code` | `distinct_ratio` > 0.95 and most values space-free (SKU-shaped) |
+| `text` | everything else |
+
+Priority matters: a copied epoch column is numeric too, but `temporal` is
+the more specific truth, and near-distinct digit keys read as `numeric`
+before anything cardinality-based fires. The two cardinality-gated rules
+(`identifier`-by-distinctness, `code`) additionally require
+`n_values >= 20` (`KIND_CARDINALITY_MIN_VALUES`) — below that every column
+is trivially near-distinct and small columns default honestly to `text`.
+
+Two consumers exist today: interpretation-card candidacy admits only
+`text` columns (see
+[05-encoders-decoders.md](05-encoders-decoders.md#what-gets-embedded)), and
+the knowledge compiler's term→column affinity pass only points affinity at
+`text` columns. Plausible future consumers — inclusion-dependency mining
+seeded by `identifier`/`numeric` key candidates, per-corpus threshold
+calibration — are noted, not promised.
 
 ### `lex_vocab`
 

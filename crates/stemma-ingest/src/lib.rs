@@ -72,6 +72,25 @@ CREATE TABLE IF NOT EXISTS lex_values (
 CREATE INDEX IF NOT EXISTS lex_values_norm ON lex_values(value_norm);
 CREATE INDEX IF NOT EXISTS lex_values_src ON lex_values(src_table, src_rowid);
 
+-- Column typology: one profile row per indexed (table, column), derived from
+-- lex_values by profile_columns(). Same lifecycle as the rest of the lexical
+-- index — dropped and rebuilt with it, never migrated.
+CREATE TABLE IF NOT EXISTS lex_columns (
+    src_table      TEXT NOT NULL,
+    src_column     TEXT NOT NULL,
+    n_values       INTEGER NOT NULL,
+    n_distinct     INTEGER NOT NULL,
+    distinct_ratio REAL NOT NULL,
+    alpha_ratio    REAL NOT NULL,
+    numeric_ratio  REAL NOT NULL,
+    temporal_ratio REAL NOT NULL,
+    idlike_ratio   REAL NOT NULL,
+    doc_ratio      REAL NOT NULL,
+    avg_len        REAL NOT NULL,
+    kind           TEXT NOT NULL,
+    PRIMARY KEY (src_table, src_column)
+) STRICT;
+
 -- Token index: BM25-ranked word search.
 CREATE VIRTUAL TABLE IF NOT EXISTS lex_fts USING fts5(
     value, content='lex_values', content_rowid='id', tokenize='unicode61'
@@ -116,6 +135,13 @@ pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
     let existing: i64 = conn.query_row("SELECT count(*) FROM lex_values", [], |r| r.get(0))?;
     let columns = text_columns(db)?;
     if existing > 0 && !force {
+        // Stores built before column typology existed have rows but no
+        // profiles; derive them now — same data, no reindex needed.
+        let profiled: i64 =
+            conn.query_row("SELECT count(*) FROM lex_columns", [], |r| r.get(0))?;
+        if profiled == 0 {
+            profile_columns(db)?;
+        }
         return Ok(IndexStats {
             tables: count_tables(&columns),
             text_columns: columns.len(),
@@ -151,6 +177,7 @@ pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
         "INSERT INTO lex_fts(rowid, value) SELECT id, value FROM lex_values;
          INSERT INTO lex_trigram(rowid, value) SELECT id, value FROM lex_values;",
     )?;
+    profile_columns(db)?;
 
     Ok(IndexStats {
         tables: count_tables(&columns),
@@ -159,6 +186,174 @@ pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
         rebuilt: true,
         elapsed_ms: start.elapsed().as_millis(),
     })
+}
+
+// --- Column typology -------------------------------------------------------
+//
+// The lexical index records what values exist; `lex_columns` records what
+// KIND of thing each column holds. Downstream passes consume the kind rather
+// than re-deriving per-value shape heuristics: interpretation candidacy
+// admits only `text` columns, and the KG's term→column affinity only points
+// at `text` columns. The profile is derived state with the same lifecycle as
+// lex_values — rebuilt whenever the index rebuilds, never migrated.
+
+/// A column is `document` when more than this fraction of its cells crossed
+/// [`DOC_MIN_LEN`].
+pub const KIND_DOC_MIN: f64 = 0.5;
+/// A column is `temporal` when more than this fraction of its values are
+/// epoch numbers ([`TEMPORAL_EPOCH_RANGES`]) or ISO-date shaped.
+pub const KIND_TEMPORAL_MIN: f64 = 0.8;
+/// A column is `numeric` when more than this fraction of its values consist
+/// only of digits and the characters `. e + -`.
+pub const KIND_NUMERIC_MIN: f64 = 0.8;
+/// A column is `identifier` when more than this fraction of its values are
+/// id-shaped: uuid, 16+ chars of pure hex/digits, or 6+ pure digits.
+pub const KIND_IDLIKE_MIN: f64 = 0.8;
+/// Cardinality gate for the `identifier`-by-distinctness and `code` rules: a
+/// column whose values are (almost) all distinct behaves like a key or a
+/// code list, not vocabulary.
+pub const KIND_DISTINCT_MIN: f64 = 0.95;
+/// `identifier`-by-distinctness also requires that fewer than this fraction
+/// of values contain any letter — near-unique *prose* (names, titles) stays
+/// `text`.
+pub const KIND_ALPHA_MAX: f64 = 0.5;
+/// `code` (SKU-shaped): near-all-distinct and more than this fraction of
+/// values are space-free tokens.
+pub const KIND_CODE_NOSPACE_MIN: f64 = 0.5;
+/// Cardinality-based rules (`identifier` by distinctness, `code`) need a
+/// sample: below this many values every column is trivially near-distinct,
+/// so only the shape-based rules apply and small columns default to `text`.
+pub const KIND_CARDINALITY_MIN_VALUES: i64 = 20;
+/// Numeric values inside either range read as epoch timestamps:
+/// seconds (1e8..4e9 ≈ 1973..2096) and milliseconds (1e11..4e12).
+pub const TEMPORAL_EPOCH_RANGES: [(f64, f64); 2] = [(1e8, 4e9), (1e11, 4e12)];
+
+/// Classification priority: first predicate that fires names the column.
+/// Order matters — a copied epoch column is numeric too, but `temporal` is
+/// the more specific truth; near-distinct digit keys are numeric before
+/// they are anything else.
+fn classify_kind(
+    n_values: i64,
+    distinct_ratio: f64,
+    alpha_ratio: f64,
+    numeric_ratio: f64,
+    temporal_ratio: f64,
+    idlike_ratio: f64,
+    doc_ratio: f64,
+    nospace_ratio: f64,
+) -> &'static str {
+    let big = n_values >= KIND_CARDINALITY_MIN_VALUES;
+    if doc_ratio > KIND_DOC_MIN {
+        "document"
+    } else if temporal_ratio > KIND_TEMPORAL_MIN {
+        "temporal"
+    } else if numeric_ratio > KIND_NUMERIC_MIN {
+        "numeric"
+    } else if idlike_ratio > KIND_IDLIKE_MIN
+        || (big && distinct_ratio > KIND_DISTINCT_MIN && alpha_ratio < KIND_ALPHA_MAX)
+    {
+        "identifier"
+    } else if big && distinct_ratio > KIND_DISTINCT_MIN && nospace_ratio > KIND_CODE_NOSPACE_MIN {
+        "code"
+    } else {
+        "text"
+    }
+}
+
+/// Rebuilds `lex_columns` from `lex_values`: one grouped pass computing the
+/// per-column value-shape ratios, classified into a `kind` by
+/// [`classify_kind`]. Called at the end of every index (re)build; returns the
+/// number of columns profiled.
+pub fn profile_columns(db: &StemmaDb) -> Result<usize> {
+    let conn = db.conn();
+    // GLOB shapes over value_norm (already lower(trim())). In a GLOB set,
+    // `^` first negates and `-` last is literal.
+    let numeric = "value_norm GLOB '*[0-9]*' AND value_norm NOT GLOB '*[^0-9.e+-]*'";
+    let h = "[0-9a-f]";
+    let uuid = format!(
+        "{a}-{b}-{b}-{b}-{c}",
+        a = h.repeat(8),
+        b = h.repeat(4),
+        c = h.repeat(12)
+    );
+    let epoch = TEMPORAL_EPOCH_RANGES
+        .iter()
+        .map(|(lo, hi)| format!("CAST(value_norm AS REAL) BETWEEN {lo:e} AND {hi:e}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!(
+        "SELECT src_table, src_column, count(*), count(DISTINCT value_norm),
+                avg(value_norm GLOB '*[a-z]*'),
+                avg({numeric}),
+                avg(({numeric} AND ({epoch}))
+                    OR value_norm GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'),
+                avg(value_norm GLOB '{uuid}'
+                    OR (length(value_norm) >= 16 AND value_norm NOT GLOB '*[^0-9a-f]*')
+                    OR (length(value_norm) >= 6 AND value_norm NOT GLOB '*[^0-9]*')),
+                avg(is_doc),
+                avg(length(value)),
+                avg(value_norm NOT GLOB '* *')
+         FROM lex_values
+         GROUP BY src_table, src_column"
+    );
+    type Row = (String, String, i64, i64, f64, f64, f64, f64, f64, f64, f64);
+    let profiles: Vec<Row> = conn
+        .prepare(&sql)?
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    conn.execute("DELETE FROM lex_columns", [])?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO lex_columns (src_table, src_column, n_values, n_distinct,
+             distinct_ratio, alpha_ratio, numeric_ratio, temporal_ratio,
+             idlike_ratio, doc_ratio, avg_len, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    let n = profiles.len();
+    for (table, column, n_values, n_distinct, alpha, numeric, temporal, idlike, doc, avg_len, nospace) in
+        profiles
+    {
+        let distinct_ratio = n_distinct as f64 / n_values.max(1) as f64;
+        let kind = classify_kind(
+            n_values,
+            distinct_ratio,
+            alpha,
+            numeric,
+            temporal,
+            idlike,
+            doc,
+            nospace,
+        );
+        insert.execute(stemmadb::rusqlite::params![
+            table,
+            column,
+            n_values,
+            n_distinct,
+            distinct_ratio,
+            alpha,
+            numeric,
+            temporal,
+            idlike,
+            doc,
+            avg_len,
+            kind
+        ])?;
+    }
+    Ok(n)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -349,6 +544,11 @@ fn interpretation_card(
 /// corpora nothing crosses `DOC_MIN_LEN`, so a documents-only dense channel
 /// is inert, and a value appearing in two columns needs column context to be
 /// separable at all. The card carries that context.
+///
+/// Candidacy is restricted to columns `lex_columns` classified as `text`:
+/// temporal, numeric, identifier and code columns recur across tables by
+/// construction (denormalization copies them), not because their values are
+/// ambiguous vocabulary, and no paraphrase query can ever retrieve them.
 pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     let conn = db.conn();
     let has_interp: i64 = conn.query_row(
@@ -380,23 +580,39 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     // to the row that achieved MIN(src_rowid) (SQLite's documented bare-
     // column-with-min semantics), which is exactly the representative cell.
     //
-    // Only the ambiguous vocabulary is embedded: a card is consulted solely
-    // when the same value ties across DISTINCT (table, column) readings, so
-    // values living in a single column — every uuid, every near-unique
-    // identifier — can never be looked up and would be pure drain cost
-    // (legal: 448k cards without this filter, a few hundred with it).
+    // Candidacy is column-typed. A card is consulted solely when the same
+    // value ties across DISTINCT (table, column) readings — but on
+    // denormalized schemas cross-column recurrence is dominated by *copied
+    // data* (timestamps, join keys, SKUs repeated into fact tables), which is
+    // structurally guaranteed to recur and can never be reached by a
+    // natural-language paraphrase. So both the outer selection and the
+    // recurrence subquery are restricted to columns lex_columns classified as
+    // `text`, with a per-value letter guard for non-linguistic strays inside
+    // otherwise-texty columns. Expectation: the queue holds the shared
+    // *vocabulary* of the corpus — typically orders of magnitude below the
+    // untyped predicate on warehouse shapes (issue #2: 846,989 cards, 90.4%
+    // epoch floats, against 98 useful documents).
     let missing: Vec<(String, String, i64, String)> = {
         let mut stmt = conn.prepare(
             "SELECT t.src_table, t.src_column, t.rep, t.value FROM (
-                 SELECT src_table, src_column, MIN(src_rowid) AS rep, value
-                 FROM lex_values
-                 WHERE is_doc = 0
-                   AND value_norm IN (
-                       SELECT value_norm FROM lex_values WHERE is_doc = 0
-                       GROUP BY value_norm
-                       HAVING count(DISTINCT src_table || '·' || src_column) >= 2
+                 SELECT lv.src_table, lv.src_column, MIN(lv.src_rowid) AS rep, lv.value
+                 FROM lex_values lv
+                 JOIN lex_columns lc ON lc.src_table = lv.src_table
+                                    AND lc.src_column = lv.src_column
+                 WHERE lv.is_doc = 0
+                   AND lc.kind = 'text'
+                   AND lv.value_norm GLOB '*[a-z]*'
+                   AND lv.value_norm IN (
+                       SELECT lv2.value_norm FROM lex_values lv2
+                       JOIN lex_columns lc2 ON lc2.src_table = lv2.src_table
+                                           AND lc2.src_column = lv2.src_column
+                       WHERE lv2.is_doc = 0
+                         AND lc2.kind = 'text'
+                         AND lv2.value_norm GLOB '*[a-z]*'
+                       GROUP BY lv2.value_norm
+                       HAVING count(DISTINCT lv2.src_table || '·' || lv2.src_column) >= 2
                    )
-                 GROUP BY src_table, src_column, value_norm
+                 GROUP BY lv.src_table, lv.src_column, lv.value_norm
              ) t
              WHERE NOT EXISTS (
                  SELECT 1 FROM covered_interp c
@@ -769,6 +985,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fuzzy, 2); // 'Seattle' and 'Seattle - Northgate'
+    }
+
+    /// One column of each kind, 24 rows per table so the cardinality-gated
+    /// rules (identifier-by-distinctness, code) are live. All columns are
+    /// TEXT-typed — the CSV-import shape where epoch floats, dates and keys
+    /// arrive as strings, which is exactly when typology matters.
+    fn typology_db() -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE src.events(id INTEGER PRIMARY KEY,
+                 occurred_at TEXT, day TEXT, amount TEXT);
+             CREATE TABLE src.assets(id INTEGER PRIMARY KEY,
+                 uid TEXT, sku TEXT, name TEXT, body TEXT);
+             CREATE TABLE src.parents(id INTEGER PRIMARY KEY, pid TEXT);
+             CREATE TABLE src.children(id INTEGER PRIMARY KEY, parent_id TEXT);",
+        )
+        .unwrap();
+        let names = ["Harbor Crane", "North Pier", "Dock Office"];
+        let amounts = ["19.99", "24.50", "5", "120"];
+        for i in 0i64..24 {
+            conn.execute(
+                "INSERT INTO src.events (occurred_at, day, amount) VALUES (?1, ?2, ?3)",
+                stemmadb::rusqlite::params![
+                    format!("{}.{:03}", 1_700_000_000 + i * 9973, i),
+                    format!("2024-{:02}-{:02}", i % 12 + 1, i % 28 + 1),
+                    amounts[i as usize % amounts.len()],
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO src.assets (uid, sku, name, body) VALUES (?1, ?2, ?3, ?4)",
+                stemmadb::rusqlite::params![
+                    format!("{i:08x}-{i:04x}-{i:04x}-{i:04x}-{i:012x}"),
+                    format!("SKU-{i:04}-Q{}", i % 7),
+                    names[i as usize % names.len()],
+                    format!(
+                        "Operating notes for asset {i}: the body repeats procedural \
+                         language until it comfortably crosses the two-hundred \
+                         character document threshold, so the classifier files it \
+                         as a document rather than a value, as any manual page \
+                         or long free-text field would be."
+                    ),
+                ],
+            )
+            .unwrap();
+            // The same digit key stored in two tables — the FK shape.
+            let key = (1000 + i).to_string();
+            conn.execute("INSERT INTO src.parents (pid) VALUES (?1)", [&key])
+                .unwrap();
+            conn.execute("INSERT INTO src.children (parent_id) VALUES (?1)", [&key])
+                .unwrap();
+        }
+        build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn column_kinds_classify_the_typology_fixture() {
+        let db = typology_db();
+        let kind = |t: &str, c: &str| -> String {
+            db.conn()
+                .query_row(
+                    "SELECT kind FROM lex_columns WHERE src_table = ?1 AND src_column = ?2",
+                    [t, c],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(kind("events", "occurred_at"), "temporal", "epoch floats");
+        assert_eq!(kind("events", "day"), "temporal", "ISO dates");
+        assert_eq!(kind("events", "amount"), "numeric", "plain decimals");
+        assert_eq!(kind("assets", "uid"), "identifier", "uuids");
+        assert_eq!(kind("assets", "sku"), "code", "SKU-shaped tokens");
+        assert_eq!(kind("assets", "name"), "text", "recurring names");
+        assert_eq!(kind("assets", "body"), "document", "long bodies");
+        // Digit keys are numeric-shaped before anything else; both sides of
+        // the copied-key pair classify away from 'text' identically.
+        assert_eq!(kind("parents", "pid"), "numeric", "digit keys");
+        assert_eq!(kind("children", "parent_id"), "numeric", "copied digit keys");
+
+        // Ratio spot checks: the profile stores what the kinds derive from.
+        let (n, distinct, temporal): (i64, f64, f64) = db
+            .conn()
+            .query_row(
+                "SELECT n_values, distinct_ratio, temporal_ratio FROM lex_columns
+                 WHERE src_table = 'events' AND src_column = 'occurred_at'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 24);
+        assert_eq!(distinct, 1.0);
+        assert_eq!(temporal, 1.0);
+    }
+
+    /// Issue #2 in miniature: a denormalized warehouse whose fact table
+    /// copies timestamps, keys and SKUs from its dimension tables. Under the
+    /// untyped recurrence predicate every copied column qualified as
+    /// "ambiguous vocabulary" (846,989 cards on the reported dataset, 90.4%
+    /// epoch floats); column-typed candidacy must admit only the text
+    /// columns' shared vocabulary.
+    fn warehouse_db() -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE TABLE src.products(id TEXT, name TEXT, brand TEXT,
+                 category TEXT, sku TEXT);
+             CREATE TABLE src.orders(id TEXT, user_id TEXT,
+                 created_at TEXT, shipped_at TEXT);
+             CREATE TABLE src.order_items(id TEXT, order_id TEXT, product_id TEXT,
+                 product_name TEXT, brand TEXT, category TEXT, sku TEXT,
+                 created_at TEXT, shipped_at TEXT);",
+        )
+        .unwrap();
+        let brands = ["allegra k", "calvin klein", "levi's", "carhartt", "nike"];
+        let cats = ["Outerwear & Coats", "Dresses", "Suits & Sport Coats", "Jeans"];
+        for i in 0i64..40 {
+            conn.execute(
+                "INSERT INTO src.products VALUES (?1, ?2, ?3, ?4, ?5)",
+                stemmadb::rusqlite::params![
+                    (i + 1).to_string(),
+                    format!("product {i}"),
+                    brands[i as usize % brands.len()],
+                    cats[i as usize % cats.len()],
+                    format!("{:032x}", 0x9e3779b97f4a7c15u64 ^ (i as u64) << 17),
+                ],
+            )
+            .unwrap();
+        }
+        for i in 0i64..80 {
+            let created = format!("{}.{:07}", 1_700_000_000 + i * 9973, i * 13);
+            let shipped = format!("{}.{:07}", 1_700_086_400 + i * 9973, i * 13);
+            conn.execute(
+                "INSERT INTO src.orders VALUES (?1, ?2, ?3, ?4)",
+                stemmadb::rusqlite::params![
+                    (i + 1).to_string(),
+                    (i % 30).to_string(),
+                    created,
+                    shipped
+                ],
+            )
+            .unwrap();
+            let p = i % 40;
+            // Denormalized: the same name/brand/category/sku/instants, copied.
+            conn.execute(
+                "INSERT INTO src.order_items
+                 SELECT ?1, ?1, p.id, p.name, p.brand, p.category, p.sku, ?2, ?3
+                 FROM src.products p WHERE p.id = ?4",
+                stemmadb::rusqlite::params![
+                    (i + 1).to_string(),
+                    created,
+                    shipped,
+                    (p + 1).to_string()
+                ],
+            )
+            .unwrap();
+        }
+        build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn warehouse_candidacy_excludes_copied_timestamps_keys_and_skus() {
+        let db = warehouse_db();
+
+        // The untyped predicate from before issue #2, for contrast: copied
+        // epochs, keys and SKUs all recur across (table, column) pairs by
+        // construction, so it floods.
+        let untyped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM (
+                     SELECT src_table, src_column, value_norm FROM lex_values
+                     WHERE is_doc = 0
+                       AND value_norm IN (
+                           SELECT value_norm FROM lex_values WHERE is_doc = 0
+                           GROUP BY value_norm
+                           HAVING count(DISTINCT src_table || '·' || src_column) >= 2)
+                     GROUP BY src_table, src_column, value_norm)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(untyped > 800, "the untyped predicate floods: {untyped}");
+
+        let queued = enqueue_missing_interpretations(&db).unwrap();
+        println!("warehouse candidacy: untyped predicate {untyped} cards, typed {queued}");
+        // Exactly the shared text vocabulary: 40 names × 2 columns + 5
+        // brands × 2 + 4 categories × 2.
+        assert_eq!(queued, 98, "untyped predicate would enqueue {untyped}");
+        let non_text: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM embed_queue q
+                 WHERE (q.src_table, q.src_column) NOT IN (VALUES
+                     ('products', 'name'), ('products', 'brand'),
+                     ('products', 'category'), ('order_items', 'product_name'),
+                     ('order_items', 'brand'), ('order_items', 'category'))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            non_text, 0,
+            "no cards for timestamps, keys, SKUs or any other copied column"
+        );
     }
 
     #[test]
