@@ -914,11 +914,15 @@ fn compile_phrase_entities(
 /// at least MIN_AFFINITY_MATCHES matching cells, as `col_affinity` edges
 /// from the term node to the existing `column:{table}.{column}` nodes.
 ///
-/// Only value cells (`is_doc = 0`) count. A term trivially "co-occurs" with
-/// the document column it was mined from, and the consumer of these edges —
-/// resolution's context-coherence stage — disambiguates *value*
-/// interpretations; letting document columns fill the slots would spend the
-/// budget on edges nothing can use.
+/// Only value cells (`is_doc = 0`) in columns whose `lex_columns.kind` is
+/// `text` count. A term trivially "co-occurs" with the document column it was
+/// mined from, and the consumer of these edges — resolution's
+/// context-coherence stage — disambiguates *value* interpretations; letting
+/// document columns fill the slots would spend the budget on edges nothing
+/// can use. The column-typology restriction is the same argument one level
+/// up: term affinity into a timestamp, key or code column is meaningless —
+/// no mention of the term ever resolves to those values — so only `text`
+/// columns may hold affinity.
 ///
 /// Runs globally (all served tables) whenever any table recompiled, like the
 /// other cross-table passes: recompiling table u removes u's column nodes
@@ -939,7 +943,9 @@ fn compile_term_column_affinity(
     let mut probe = conn.prepare_cached(
         "SELECT v.src_table, v.src_column, count(*) AS n
          FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
-         WHERE lex_fts MATCH ?1 AND v.is_doc = 0
+         JOIN lex_columns lc ON lc.src_table = v.src_table
+                            AND lc.src_column = v.src_column
+         WHERE lex_fts MATCH ?1 AND v.is_doc = 0 AND lc.kind = 'text'
          GROUP BY v.src_table, v.src_column
          HAVING n >= ?2
          ORDER BY n DESC, v.src_table, v.src_column

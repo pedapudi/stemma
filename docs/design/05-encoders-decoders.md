@@ -174,9 +174,27 @@ applying the instruction on the document side would desert the space the
 queries live in. Documents longer than the encoder's context are truncated
 by the endpoint today — chunking is designed, not built.
 
-*Interpretation cards, one vector per distinct value interpretation.* For
-every distinct `(src_table, src_column, value_norm)` with `is_doc = 0`, the
-ingest pass serializes a card —
+*Interpretation cards, one vector per distinct value interpretation.*
+**Candidacy is column-typed.** A card is only ever consulted when the same
+value ties across distinct `(table, column)` readings, so recurrence across
+≥ 2 columns has always been required — but on denormalized schemas
+recurrence is dominated by *copied data* (a foreign key exists precisely
+because the same value lives in two columns, and fact tables copy their
+dimensions' timestamps and SKUs), which no natural-language paraphrase can
+ever retrieve. Issue #2 measured the failure: 846,989 cards on one 6-table
+warehouse, 90.4% of them epoch floats, queued ahead of the corpus's 98
+useful documents. The fix is semantic, not per-value regex: candidacy —
+both the outer selection and the recurrence subquery — is restricted to
+columns whose [`lex_columns.kind`](02-data-model.md#lex_columns--column-typology)
+is `text`, plus a per-value guard that the normalized value contains a
+letter. Timestamps, keys and codes are excluded because of what their
+*columns* are, and the expectation is honest again: the queue holds the
+corpus's shared vocabulary, typically a few hundred cards. (The letter
+guard means purely non-Latin values rely on the column-level classifier
+alone — `alpha_ratio` shares the same `[a-z]` definition.)
+
+For every qualifying distinct `(src_table, src_column, value_norm)` with
+`is_doc = 0`, the ingest pass serializes a card —
 
 ```
 offices · city · Seattle · name: Seattle - Northgate
@@ -225,11 +243,20 @@ configured, each database gets a background task on its own store connection
 
 1. `stemma_ingest::enqueue_missing_embeddings` inserts a pending
    `embed_queue` item for every document cell with no `vec_dense` vector,
-   and `stemma_ingest::enqueue_missing_interpretations` one for every
-   distinct value interpretation with no `vec_interp` vector — keyed by the
-   interpretation's representative `MIN(src_rowid)`, with the card in
-   `serialized`. Both are idempotent via the unique provenance key, and a
-   `done` item is only reset if its vector has since disappeared.
+   and the queue is drained **to empty** before
+   `stemma_ingest::enqueue_missing_interpretations` runs — one item per
+   qualifying distinct value interpretation (`text` columns only, see
+   above) with no `vec_interp` vector, keyed by the interpretation's
+   representative `MIN(src_rowid)`, with the card in `serialized` —
+   followed by a second drain. Documents strictly first: the document sweep
+   is small and is what makes the dense channel useful, so it must not sit
+   behind the (potentially much larger) card sweep. Both enqueues are
+   idempotent via the unique provenance key, log their count and duration,
+   and a `done` item is only reset if its vector has since disappeared.
+   While items are pending and a vector table has yet to materialize, the
+   task logs `dense channel building: N docs, M interps pending` — the line
+   that distinguishes "index still building" from "no dense-channel
+   candidates".
 2. `stemma_ingest::drain_embed_queue` repeats until the queue is empty:
    take a batch of 32 pending items (least-retried first), fetch each item's
    text — the raw document for document items, the stored card for
@@ -237,9 +264,8 @@ configured, each database gets a background task on its own store connection
    each vector into its item's table (`vec_dense` or `vec_interp`) —
    creating either vec0 table at the embedder's observed dimension with its
    `model_registry` row on first use — and mark the items `done`. Progress
-   (`queued_docs`, `queued_interps`, `drained`, `failed`, `remaining`) is
-   logged per batch, and the task exits when the queue is empty; there is no
-   polling loop.
+   (`drained`, `failed`, `remaining`, per phase) is logged per batch, and
+   the task exits when the queue is empty; there is no polling loop.
 
 Model identity is checked before any embedding work: if `model_registry`
 already binds `vec_dense` *or* `vec_interp` to a *different* model, the
@@ -260,10 +286,10 @@ Honest limits of what is built: the drain runs at startup and exits — no
 watcher notices data changes afterward, and re-embedding after an edit means
 restarting the server; there is no online re-embed and no blue-green
 generation swap (the next section is still designed, not built); and the
-interpretation cards inherit the lexical index's column-selection blind
-spots — an all-distinct identifier column (uuids) yields one card per row,
-paying embedding cost for interpretations nothing will ever tie on, until
-the designed per-column profiling pass lands.
+column typology gating candidacy is threshold-based on fixed constants —
+adequate for the corpora measured so far, but not calibrated per corpus, and
+a column that straddles a threshold flips kind wholesale rather than
+degrading gracefully.
 
 ### Query-time requirements
 
@@ -296,6 +322,15 @@ agree on everything:
    the one requirement on this list that cannot be violated silently.
 
 ### Entering fusion
+
+What enters fusion is one candidate per *interpretation*, in the dense
+channel like everywhere else: the KNN is over-fetched
+(`PER_CHANNEL_LIMIT × DENSE_OVERFETCH`) and collapsed by
+`(src_table, src_column, value_norm)` — nearest member as representative,
+copies counted into `row_count`, document hits quota'd per column — before
+truncation, so a fact table repeating one document 24× spends one slot, not
+all eight. Mechanics in
+[03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted).
 
 The dense channel joins as a fourth channel in
 [reciprocal rank fusion](03-resolution.md#stage-5--reciprocal-rank-fusion) —
