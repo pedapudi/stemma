@@ -76,6 +76,15 @@ pub struct TraceCandidate {
     /// like "people #2 ←lead_id— teams #43". Empty when no such evidence.
     #[prost(string, tag = "13")]
     pub coherence: ::prost::alloc::string::String,
+    /// For value candidates: how many user rows share this interpretation
+    /// (table, column, normalized value). `rowid` is a representative of the
+    /// set. 1 for document candidates, which keep per-row identity.
+    #[prost(uint32, tag = "14")]
+    pub row_count: u32,
+    /// Up to three concrete rowids carrying the interpretation, ascending;
+    /// the first is the representative `rowid`.
+    #[prost(int64, repeated, tag = "15")]
+    pub sample_rowids: ::prost::alloc::vec::Vec<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraceSpan {

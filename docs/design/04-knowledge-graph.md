@@ -61,7 +61,7 @@ consumers are expected to weight them differently.
 | Schema | `table`, `column` | `has_column`, `fk` | Declared — certain |
 | Discovered relations | — | `inferred_fk` | Statistical, confidence-scored |
 | Value profile | `value` | `frequent_value` | Observed counts |
-| Term profile | `term` (words), `term` (phrases) | `term`, `cooccurs` | Mined, ranked |
+| Term profile | `term` (words), `term` (phrases) | `term`, `cooccurs`, `col_affinity` | Mined, ranked |
 | Instance | *(designed)* | *(designed)* | — |
 
 ### Compilation order
@@ -76,8 +76,9 @@ compile(db, force)
  ├─ compile_term_profile   (dirty tables)  ─┬─ TextRank terms
  │                                          ├─ co-occurrence edges
  │                                          └─ compile_phrase_entities
- ├─ compile_declared_fks   (ALL tables)
- ├─ compile_inferred_joins (ALL tables)
+ ├─ compile_declared_fks          (ALL tables)
+ ├─ compile_inferred_joins        (ALL tables)
+ ├─ compile_term_column_affinity  (ALL tables' terms)
  ├─ stamp fingerprints for dirty tables
  └─ compute_centrality     (whole graph)
 ```
@@ -86,7 +87,9 @@ The per-table passes are scoped to dirty tables; the cross-table passes run
 globally whenever *anything* changed. That asymmetry is forced: removing a
 dirty table's nodes also removes clean tables' edges *into* it, so the
 relational passes must be able to restore them. Containment is a global
-property anyway.
+property anyway — and term→column affinity is cross-table in the same way,
+since a clean table's terms keep `col_affinity` edges into a recompiled
+table's column nodes.
 
 ## Schema layer
 
@@ -437,6 +440,49 @@ layer is what supersedes it, and the comment in the code says exactly that:
 replaces, this."* Deterministic mining remains the floor that works with no
 model available.
 
+### Step 6 — term→column affinity
+
+`compile_term_column_affinity` connects the mined vocabulary back to the
+*schema*: for every term node — TextRank words and mined phrases alike, both
+are `kind = 'term'` — one FTS probe measures which columns' **value**
+content the term recurs in:
+
+```sql
+SELECT v.src_table, v.src_column, count(*) AS n
+FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
+WHERE lex_fts MATCH '"<term>"' AND v.is_doc = 0
+GROUP BY v.src_table, v.src_column
+HAVING n >= 2                 -- MIN_AFFINITY_MATCHES
+ORDER BY n DESC LIMIT 4       -- TOP_AFFINITY_COLUMNS
+```
+
+The survivors become `col_affinity` edges from the term node to the
+already-existing `column:{table}.{column}` nodes, labelled `×{n}` with
+`{"method": "profiled", "count": n}`.
+
+Two deliberate choices:
+
+- **Only value cells count** (`is_doc = 0`). A term trivially "co-occurs"
+  with the document column it was mined from, and the consumer of these
+  edges — resolution's context-coherence stage
+  ([03-resolution.md](03-resolution.md#stage-6a--context-coherence-over-termcolumn-affinity)),
+  which disambiguates *value* interpretations — could never use a
+  document-column edge. Letting the mined-from column fill the top-4 slots
+  would spend the whole budget on edges nothing consumes.
+- **The floor is recurrence, not a score** — `MIN_AFFINITY_MATCHES = 2`,
+  the same discipline as `MIN_VALUE_COUNT`: one co-occurrence is
+  coincidence, two is a pattern, and no "column-relatedness" heuristic is
+  needed.
+
+Unlike the per-table profile passes, this one runs **globally** whenever any
+table recompiled, alongside FK compilation and inclusion mining, because its
+edges cross tables: recompiling table *u* removes *u*'s column nodes and
+with them every clean table's affinity edges into *u*, which the global
+re-run restores (`term_column_affinity_points_at_value_columns` asserts
+exactly this round trip). The pass is what lets a query's own wording — a
+term like *cargo* whose affinity points at `vendors.name` — prefer one
+interpretation of an ambiguous value over another without any model call.
+
 ## Graph-wide centrality
 
 After every compile, `compute_centrality` runs PageRank over the *compiled
@@ -467,7 +513,7 @@ maintenance model is fingerprint-driven dirty tracking.
 
 ```rust
 SELECT count(*), coalesce(max(rowid),0), coalesce(sum(rowid),0) FROM src."{table}"
-// → "kg2:{n}:{mx}:{sum}"
+// → "kg3:{n}:{mx}:{sum}"
 ```
 
 Three aggregates over the rowid column, no text hashing: O(n) with a tiny
@@ -481,11 +527,13 @@ escape hatch. A content hash would close the gap at the cost of reading every
 byte of every table on every startup, which for the 789 MB legal corpus is
 the difference between a fast start and a slow one.
 
-**The `kg2:` prefix versions the compiler, not the data.** Bump it and every
+**The `kg3:` prefix versions the compiler, not the data.** Bump it and every
 stored fingerprint mismatches, so every table recompiles on the next run —
 which is exactly what an improvement to term selection or join mining
-requires. Algorithm upgrades therefore need no migration, no store version
-bump, and no user action. This is the mechanism that keeps the knowledge
+requires — the bump from `kg2` to `kg3` when the term→column affinity pass
+landed is exactly this mechanism in action: every existing store gains the
+new edges on its next compile. Algorithm upgrades therefore need no
+migration, no store version bump, and no user action. This is the mechanism that keeps the knowledge
 graph safe to keep changing.
 
 ### The recompilation unit
@@ -560,7 +608,7 @@ edge is a hole in the evidence chain.
 
 ## How the graph feeds resolution today
 
-Four live consumers, plus two derived surfaces.
+Five live consumers, plus two derived surfaces.
 
 ### 1. Mention detection — `kg_alias` spans
 
@@ -594,18 +642,32 @@ graph's co-occurring neighbours of *facility* and #42595 contains none. The
 lexical channels ranked them the other way round; the corpus's own topical
 structure broke the tie.
 
-### 3. Collective disambiguation — join paths plus instance probes
+### 3. Candidate scoring — context coherence from `col_affinity`
+
+Detailed in
+[03-resolution.md](03-resolution.md#stage-6a--context-coherence-over-termcolumn-affinity).
+In short: the query's non-mention content tokens that are compiled terms are
+looked up, and a *value* candidate whose `(table, column)` one of their
+`col_affinity` edges points at earns +0.05 per distinct supporting term (at
+most 2, cap 0.9), recorded as a `kg` channel entry carrying the bonus. This
+is the affinity pass paying off at query time: the user's own surrounding
+words choose between interpretations of an ambiguous value — *cargo* in the
+query prefers the `vendors.name` reading of `'Atlas Freight'` over the
+`clients.company` one — with no model call.
+
+### 4. Collective disambiguation — join paths plus instance probes
 
 Detailed in
 [03-resolution.md](03-resolution.md#stage-6b--collective-disambiguation-over-join-paths)
 and [below](#built-collective-disambiguation-over-join-paths). In short: the
 `fk`/`inferred_fk` edges answer, through the trait's `table_paths` method,
 whether two candidates' tables connect within two hops; a `LIMIT 1` probe
-against the user database then verifies the two actual rows connect along
-that path, and verified candidates of the winning tuple earn a boost with
-the path recorded as evidence.
+against the user database then verifies the actual rows connect along that
+path — for interpretation candidates, trying the representative rowid first
+and then the remaining sample rowids — and verified candidates of the
+winning tuple earn a boost with the path recorded as evidence.
 
-### 4. Query suggestions
+### 5. Query suggestions
 
 `StoreBrowser.examples()` mines the strongest `cooccurs` pairs (ordered by
 `props.$.docs`) into two-word query suggestions, and the highest-count
@@ -613,7 +675,7 @@ the path recorded as evidence.
 are therefore generated *from the corpus*, not authored — a new database gets
 sensible starting queries with no configuration.
 
-### 5. Orientation surfaces
+### 6. Orientation surfaces
 
 The MCP `knowledge_graph` tool returns a digest — table nodes with row
 counts, the 30 most central characteristic terms, and every `fk`/`inferred_fk`
@@ -622,16 +684,18 @@ unfamiliar corpus". The console's graph view renders the whole thing.
 
 ### A note on the layering exception
 
-The resolution pipeline's mention-detection and term-coherence queries
-(consumers 1 and 2) go directly against `kg_nodes` and `kg_edges` rather
-than through the `KnowledgeStore` trait, each guarded by an existence check
-on `sqlite_master`. That is a real deviation from the invariant that graph
-SQL stays in its backend, taken knowingly. Collective disambiguation shows
-the correct pattern — its path search went onto the trait as `table_paths`
-from the start — and adding `is_entity(label)` / `neighbours(label)` is the
-fix for the two older queries. The exception is listed here because a design
-document that describes the invariant without naming its violations is
-describing a different codebase.
+The resolution pipeline's mention-detection, term-coherence and
+context-coherence queries (consumers 1–3) go directly against `kg_nodes` and
+`kg_edges` rather than through the `KnowledgeStore` trait, each guarded by
+an existence check on `sqlite_master`. That is a real deviation from the
+invariant that graph SQL stays in its backend, taken knowingly — and the
+new context-coherence query extends it rather than fixing it. Collective
+disambiguation shows the correct pattern — its path search went onto the
+trait as `table_paths` from the start — and adding `is_entity(label)` /
+`neighbours(label)` / `term_affinities(label)` is the fix for the three
+direct queries. The exception is listed here because a design document that
+describes the invariant without naming its violations is describing a
+different codebase.
 
 ## Built: collective disambiguation over join paths
 
@@ -751,6 +815,8 @@ Two further uses of the compiled graph, both cheap:
 | `TOP_PHRASES_PER_TABLE` | 20 | Phrase nodes kept per table |
 | `TOP_COOCCUR_PAIRS` | 40 | Co-occurrence edges kept per table |
 | `MIN_COOCCUR_RATIO` | 0.25 | Conditional co-occurrence floor |
+| `TOP_AFFINITY_COLUMNS` | 4 | col_affinity edges kept per term |
+| `MIN_AFFINITY_MATCHES` | 2 | Value cells needed for an affinity edge |
 | `INFERRED_FK_MIN_CONTAINMENT` | 0.95 | Containment needed to propose a join |
 | `INFERRED_FK_MAX_DISTINCT` | 500,000 | Cardinality guard on inclusion mining |
 | PageRank damping | 0.85 | Both TextRank and graph centrality |

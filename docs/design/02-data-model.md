@@ -444,10 +444,10 @@ The knowledge compiler carries a third kind of version, orthogonal to both.
 compiler tag:
 
 ```rust
-Ok(format!("kg2:{n}:{mx}:{sum}"))   // count, max(rowid), sum(rowid)
+Ok(format!("kg3:{n}:{mx}:{sum}"))   // count, max(rowid), sum(rowid)
 ```
 
-The `kg2:` prefix versions the *algorithm*, not the data. Bumping it
+The `kg3:` prefix versions the *algorithm*, not the data. Bumping it
 invalidates every stored fingerprint at once, so an improvement to term
 selection or join mining recompiles every table on the next run without any
 migration machinery and without touching `PRAGMA user_version`. This is the
@@ -655,7 +655,11 @@ The compiled legal-corpus graph:
 
 `kind = 'term'` covers both single-word TextRank terms (24 per document
 table) and mined capitalized phrases (20 per table); the two are told apart
-by their key prefix (`term:` vs `phrase:`) and by `props.phrase`.
+by their key prefix (`term:` vs `phrase:`) and by `props.phrase`. The
+counts are a pre-`kg3` snapshot: the `kg3` compiler additionally emits
+`col_affinity` edges (term → column; see
+[04-knowledge-graph.md](04-knowledge-graph.md#step-6--termcolumn-affinity)),
+not reflected here.
 
 ## Evidence and trace model
 
