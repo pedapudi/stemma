@@ -20,9 +20,10 @@ building and running it:
   them, and adding one would be an eval-only code path, which this design
   forbids. The sweep is `lex → +dense → +kg → +adj`, with `+kg` carrying
   all three assists; `stemma-eval` rejects `+coh` with an explanation.
-- **`+dense` is inert on BIRD.** The embedding policy is documents-only
-  (`is_doc`, ≥200 chars) and the BIRD dev databases contain **zero**
-  document-shaped cells (measured across all candidate DBs), so no vector
+- **`+dense` is inert on BIRD.** The document channel embeds only document
+  columns (`is_doc`, derived per corpus from the length distribution) and
+  the BIRD dev databases contain **zero**
+  document-shaped columns (measured across all candidate DBs), so no vector
   table is ever built and the only behavioral difference is the
   whole-query span. Dense lift (and the L2 tier) must be measured on the
   legal corpus, which is what the tier design predicted anyway.

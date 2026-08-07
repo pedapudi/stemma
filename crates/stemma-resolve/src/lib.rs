@@ -1407,8 +1407,9 @@ fn render_kg_path(
 // ===========================================================================
 // Context affinity over interpretation cards (vec_interp) — self-contained.
 //
-// Motivation: on relational corpora the dense channel is inert (nothing
-// crosses DOC_MIN_LEN), and a value that appears in two columns — the same
+// Motivation: on relational corpora the dense channel is inert (no column
+// crosses the derived document boundary), and a value that appears in two
+// columns — the same
 // string as a city and as a product name — produces two lexically identical
 // candidates fusion cannot order. The ingest layer embeds one interpretation
 // card per distinct (table, column, value); the card carries the column's

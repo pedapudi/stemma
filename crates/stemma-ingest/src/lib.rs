@@ -3,9 +3,25 @@
 //!
 //! Current scope: the lexical value index — every text value of every user
 //! table, indexed three ways: normalized for exact lookup, FTS5/unicode61 for
-//! BM25 token search, FTS5/trigram for fuzzy and substring matching. This is
-//! the milestone-2 candidate-generation substrate; the dense (vec0) and
-//! knowledge-store compilation passes join it in later milestones.
+//! BM25 token search, FTS5/trigram for fuzzy and substring matching — plus
+//! the column measurement profile the purpose predicates read, and the embed
+//! queue the dense channel drains.
+//!
+//! Two disciplines govern everything here:
+//!
+//! - **Configuration becomes derivation.** No guessed thresholds: document
+//!   boundaries are derived per corpus from the length distribution (Otsu's
+//!   natural break over column median log-lengths), and shape judgments use
+//!   Jeffreys lower confidence bounds so small samples yield weak claims
+//!   instead of firing gates. `lex_columns` stores measurements; predicates
+//!   ([`is_document_column`], [`is_paraphrasable_column`],
+//!   [`is_vocabulary_column`]) interpret them.
+//! - **The refresh discipline.** Every derived artifact records a receipt in
+//!   `derivations` — what inputs (fingerprint) and what algorithm
+//!   (derivation version) produced it. [`build_lexical_index`] compares
+//!   receipts against per-table content fingerprints and re-ingests only
+//!   what changed; embed-queue items carry a content hash so a changed row
+//!   re-embeds without a rebuild.
 
 use stemma_embed::Embedder;
 use stemmadb::{StemmaDb, SRC_SCHEMA};
@@ -36,12 +52,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Values longer than this are indexed for full-text search but excluded from
 /// the exact-match channel: a 3,000-char regulation body is a document, not a
 /// value a mention equals.
+///
+/// This constant survives the derivation pass on purpose. It is not an
+/// epistemic guess about the corpus — it is a transport/UX bound on the
+/// *exact channel*: what a user's mention can literally equal, what a
+/// candidate can carry over the wire unabridged, what an evidence line can
+/// display. Because it defines where "being a value" operationally ends, it
+/// also anchors the document derivation: see [`derive_doc_boundary`].
 pub const EXACT_MAX_LEN: usize = 120;
-
-/// Values at or above this length are classified as documents (`is_doc`):
-/// mentions resolve *into* them (BM25/snippet semantics) rather than *equal*
-/// them, and scoring must not punish them for their length.
-pub const DOC_MIN_LEN: usize = 200;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IndexStats {
@@ -49,6 +67,9 @@ pub struct IndexStats {
     pub text_columns: usize,
     pub values: usize,
     pub rebuilt: bool,
+    /// Tables whose lexical rows were (re-)ingested by this call; 0 means
+    /// every fingerprint matched its receipt and only profiles were checked.
+    pub reingested_tables: usize,
     pub elapsed_ms: u128,
 }
 
@@ -71,24 +92,51 @@ CREATE TABLE IF NOT EXISTS lex_values (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS lex_values_norm ON lex_values(value_norm);
 CREATE INDEX IF NOT EXISTS lex_values_src ON lex_values(src_table, src_rowid);
+CREATE INDEX IF NOT EXISTS lex_values_col ON lex_values(src_table, src_column);
 
--- Column typology: one profile row per indexed (table, column), derived from
--- lex_values by profile_columns(). Same lifecycle as the rest of the lexical
--- index — dropped and rebuilt with it, never migrated.
+-- Column measurements: one row per indexed (table, column), derived from
+-- lex_values by profile_columns(). Measurements only — no classifications.
+-- Each shape ratio is paired with its Jeffreys lower confidence bound at
+-- CONFIDENCE_LEVEL, so consumers can require *confident* majorities and a
+-- five-row column naturally makes no strong claims. The purpose predicates
+-- (is_document_column, is_paraphrasable_column, is_vocabulary_column) are
+-- functions over these rows, not stored labels. Same lifecycle as the rest
+-- of the lexical index — dropped and rebuilt with it, never migrated.
 CREATE TABLE IF NOT EXISTS lex_columns (
     src_table      TEXT NOT NULL,
     src_column     TEXT NOT NULL,
     n_values       INTEGER NOT NULL,
     n_distinct     INTEGER NOT NULL,
     distinct_ratio REAL NOT NULL,
+    distinct_lcb   REAL NOT NULL,
     alpha_ratio    REAL NOT NULL,
+    alpha_lcb      REAL NOT NULL,
     numeric_ratio  REAL NOT NULL,
+    numeric_lcb    REAL NOT NULL,
     temporal_ratio REAL NOT NULL,
+    temporal_lcb   REAL NOT NULL,
     idlike_ratio   REAL NOT NULL,
-    doc_ratio      REAL NOT NULL,
+    idlike_lcb     REAL NOT NULL,
     avg_len        REAL NOT NULL,
-    kind           TEXT NOT NULL,
+    median_len     REAL NOT NULL,
     PRIMARY KEY (src_table, src_column)
+) STRICT;
+
+-- Provenance receipts for derived state: which inputs (fingerprint) and
+-- which algorithm (derivation_version) produced each artifact, when, and —
+-- for scalar derivations like the document cut — the derived value itself.
+-- Artifacts today: 'lex:{table}' (that table's lexical rows), 'profiles'
+-- (lex_columns as a whole), 'doc_cut' (the document boundary, holding both
+-- the freshly derived and the adopted value; see profile_columns).
+-- The knowledge compiler's kg_meta table is the same discipline with the
+-- version folded into the fingerprint tag; it predates this table and is
+-- deliberately not migrated into it.
+CREATE TABLE IF NOT EXISTS derivations (
+    artifact           TEXT PRIMARY KEY,
+    input_fingerprint  TEXT NOT NULL,
+    derivation_version INTEGER NOT NULL,
+    derived_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    value_json         TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 
 -- Token index: BM25-ranked word search.
@@ -102,172 +150,621 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lex_trigram USING fts5(
 );
 "#;
 
-/// Builds (or verifies) the lexical index. Skips work when the index already
-/// has rows unless `force` is set.
+/// Version of the lexical derivation algorithms. Recorded in every receipt;
+/// bumping it invalidates all lexical receipts at once, so an algorithm
+/// change re-derives everything on the next registration without any
+/// migration machinery. v2: measurement profiles + derived document
+/// boundary replaced the fixed-threshold kind ladder.
+pub const LEX_DERIVATION_VERSION: i64 = 2;
+
+/// Builds — or incrementally refreshes — the lexical index. Each table's
+/// content fingerprint is compared against its `derivations` receipt: only
+/// changed (or new, or receipt-less) tables re-ingest, and profiles plus the
+/// document boundary re-derive whenever any table moved. `force` treats
+/// every table as changed. Unchanged corpora cost one aggregate scan per
+/// table and no writes.
 pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
     let start = std::time::Instant::now();
     let conn = db.conn();
 
-    // Older stores predate the is_doc column; the index is derived state, so
-    // shape changes are handled by dropping and rebuilding.
-    let has_is_doc: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM pragma_table_info('lex_values') WHERE name = 'is_doc'",
-            [],
-            |r| r.get(0),
+    // Shape self-healing (derived state, never migrated): stores from before
+    // document classification lack lex_values.is_doc — drop the whole index;
+    // stores from the kind-ladder era lack lex_columns.median_len — drop just
+    // the profile table, which re-derives from lex_values without a reindex.
+    let has_column = |table: &str, column: &str| -> bool {
+        conn.query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name = ?1)
+                    AND (SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2)",
+            [table, column],
+            |r| r.get::<_, i64>(0),
         )
-        .unwrap_or(0);
+        .unwrap_or(0)
+            > 0
+    };
     let lex_exists: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE name = 'lex_values'",
         [],
         |r| r.get(0),
     )?;
-    let force = force || (lex_exists > 0 && has_is_doc == 0);
-    if lex_exists > 0 && has_is_doc == 0 {
+    if lex_exists > 0 && !has_column("lex_values", "is_doc") {
         conn.execute_batch(
             "DROP TABLE lex_values;
              DROP TABLE IF EXISTS lex_fts;
-             DROP TABLE IF EXISTS lex_trigram;",
+             DROP TABLE IF EXISTS lex_trigram;
+             DROP TABLE IF EXISTS lex_columns;",
         )?;
+    }
+    let lc_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'lex_columns'",
+        [],
+        |r| r.get(0),
+    )?;
+    if lc_exists > 0 && !has_column("lex_columns", "median_len") {
+        conn.execute_batch("DROP TABLE lex_columns;")?;
     }
     conn.execute_batch(LEX_SCHEMA)?;
 
-    let existing: i64 = conn.query_row("SELECT count(*) FROM lex_values", [], |r| r.get(0))?;
     let columns = text_columns(db)?;
-    if existing > 0 && !force {
-        // Stores built before column typology existed have rows but no
-        // profiles; derive them now — same data, no reindex needed.
-        let profiled: i64 =
-            conn.query_row("SELECT count(*) FROM lex_columns", [], |r| r.get(0))?;
-        if profiled == 0 {
-            profile_columns(db)?;
-        }
-        return Ok(IndexStats {
-            tables: count_tables(&columns),
-            text_columns: columns.len(),
-            values: existing as usize,
-            rebuilt: false,
-            elapsed_ms: start.elapsed().as_millis(),
-        });
-    }
-
-    conn.execute_batch(
-        "DELETE FROM lex_values;
-         INSERT INTO lex_fts(lex_fts) VALUES('delete-all');
-         INSERT INTO lex_trigram(lex_trigram) VALUES('delete-all');",
-    )?;
-
-    let mut values = 0usize;
+    let mut by_table: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for tc in &columns {
-        // Identifiers come from sqlite_master/table_info, quoted defensively.
-        let sql = format!(
-            "INSERT INTO lex_values (src_table, src_column, src_rowid, value, value_norm, is_doc)
-             SELECT ?1, ?2, rowid, \"{col}\", lower(trim(\"{col}\")),
-                    length(\"{col}\") >= {doc_min}
-             FROM {src}.\"{tbl}\"
-             WHERE \"{col}\" IS NOT NULL AND trim(\"{col}\") != ''",
-            col = tc.column,
-            tbl = tc.table,
-            src = SRC_SCHEMA,
-            doc_min = DOC_MIN_LEN,
-        );
-        values += conn.execute(&sql, stemmadb::rusqlite::params![tc.table, tc.column])?;
+        by_table
+            .entry(tc.table.clone())
+            .or_default()
+            .push(tc.column.clone());
     }
-    conn.execute_batch(
-        "INSERT INTO lex_fts(rowid, value) SELECT id, value FROM lex_values;
-         INSERT INTO lex_trigram(rowid, value) SELECT id, value FROM lex_values;",
-    )?;
-    profile_columns(db)?;
 
+    // Change detection: per-table content fingerprint vs. stored receipt.
+    let mut dirty: Vec<(String, String)> = Vec::new(); // (table, fingerprint)
+    for table in by_table.keys() {
+        let fp = db.src_table_fingerprint(table)?;
+        let stored = read_receipt(conn, &format!("lex:{table}"))?;
+        if force || stored.as_deref() != Some(fp.as_str()) {
+            dirty.push((table.clone(), fp));
+        }
+    }
+    // Dropped (or no-longer-text-bearing) tables leave stale rows; sweep
+    // them. Indexed tables are known through their receipts, unioned with
+    // lex_values itself so pre-receipt stores sweep correctly too.
+    let known: Vec<String> = conn
+        .prepare(
+            "SELECT substr(artifact, 5) FROM derivations WHERE artifact LIKE 'lex:%'
+             UNION SELECT DISTINCT src_table FROM lex_values",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let gone: Vec<String> = known
+        .into_iter()
+        .filter(|t| !by_table.contains_key(t))
+        .collect();
+
+    let tx = conn.unchecked_transaction()?;
+    for table in &gone {
+        remove_table_rows(conn, table)?;
+        conn.execute(
+            "DELETE FROM derivations WHERE artifact = ?1",
+            [format!("lex:{table}")],
+        )?;
+    }
+    for (table, fp) in &dirty {
+        ingest_table(conn, table, &by_table[table])?;
+        write_receipt(conn, &format!("lex:{table}"), fp, "{}")?;
+    }
+    tx.commit()?;
+
+    // Profiles and the document boundary are corpus-level: they re-derive
+    // whenever any table moved, or when their own receipt is stale (new
+    // store, or LEX_DERIVATION_VERSION bumped).
+    let corpus_fp = corpus_fingerprint(conn)?;
+    if !dirty.is_empty() || !gone.is_empty() || read_receipt(conn, "profiles")? != Some(corpus_fp)
+    {
+        profile_columns(db)?;
+    }
+
+    let values: i64 = conn.query_row("SELECT count(*) FROM lex_values", [], |r| r.get(0))?;
     Ok(IndexStats {
-        tables: count_tables(&columns),
+        tables: by_table.len(),
         text_columns: columns.len(),
-        values,
-        rebuilt: true,
+        values: values as usize,
+        rebuilt: !dirty.is_empty() || !gone.is_empty(),
+        reingested_tables: dirty.len(),
         elapsed_ms: start.elapsed().as_millis(),
     })
 }
 
-// --- Column typology -------------------------------------------------------
-//
-// The lexical index records what values exist; `lex_columns` records what
-// KIND of thing each column holds. Downstream passes consume the kind rather
-// than re-deriving per-value shape heuristics: interpretation candidacy
-// admits only `text` columns, and the KG's term→column affinity only points
-// at `text` columns. The profile is derived state with the same lifecycle as
-// lex_values — rebuilt whenever the index rebuilds, never migrated.
+/// Removes one table's rows from lex_values and both FTS mirrors. The FTS
+/// tables are external-content, so each row must be deleted *with its text*
+/// (the special `'delete'` command) while the content row still exists.
+fn remove_table_rows(conn: &stemmadb::rusqlite::Connection, table: &str) -> Result<()> {
+    for fts in ["lex_fts", "lex_trigram"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {fts}({fts}, rowid, value)
+                 SELECT 'delete', id, value FROM lex_values WHERE src_table = ?1"
+            ),
+            [table],
+        )?;
+    }
+    conn.execute("DELETE FROM lex_values WHERE src_table = ?1", [table])?;
+    Ok(())
+}
 
-/// A column is `document` when more than this fraction of its cells crossed
-/// [`DOC_MIN_LEN`].
-pub const KIND_DOC_MIN: f64 = 0.5;
-/// A column is `temporal` when more than this fraction of its values are
-/// epoch numbers ([`TEMPORAL_EPOCH_RANGES`]) or ISO-date shaped.
-pub const KIND_TEMPORAL_MIN: f64 = 0.8;
-/// A column is `numeric` when more than this fraction of its values consist
-/// only of digits and the characters `. e + -`.
-pub const KIND_NUMERIC_MIN: f64 = 0.8;
-/// A column is `identifier` when more than this fraction of its values are
-/// id-shaped: uuid, 16+ chars of pure hex/digits, or 6+ pure digits.
-pub const KIND_IDLIKE_MIN: f64 = 0.8;
-/// Cardinality gate for the `identifier`-by-distinctness and `code` rules: a
-/// column whose values are (almost) all distinct behaves like a key or a
-/// code list, not vocabulary.
-pub const KIND_DISTINCT_MIN: f64 = 0.95;
-/// `identifier`-by-distinctness also requires that fewer than this fraction
-/// of values contain any letter — near-unique *prose* (names, titles) stays
-/// `text`.
-pub const KIND_ALPHA_MAX: f64 = 0.5;
-/// `code` (SKU-shaped): near-all-distinct and more than this fraction of
-/// values are space-free tokens.
-pub const KIND_CODE_NOSPACE_MIN: f64 = 0.5;
-/// Cardinality-based rules (`identifier` by distinctness, `code`) need a
-/// sample: below this many values every column is trivially near-distinct,
-/// so only the shape-based rules apply and small columns default to `text`.
-pub const KIND_CARDINALITY_MIN_VALUES: i64 = 20;
+/// Re-ingests one table: reads the previous per-column `is_doc` stamps,
+/// removes the table's rows, then inserts the fresh cells carrying those
+/// stamps forward (new columns default to 0). `is_doc` is re-stamped per
+/// column by profile_columns afterwards; preserving the stamp across the
+/// re-ingest means an unchanged classification causes no churn downstream.
+fn ingest_table(
+    conn: &stemmadb::rusqlite::Connection,
+    table: &str,
+    cols: &[String],
+) -> Result<usize> {
+    let prior: std::collections::HashMap<String, i64> = conn
+        .prepare("SELECT DISTINCT src_column, is_doc FROM lex_values WHERE src_table = ?1")?
+        .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    remove_table_rows(conn, table)?;
+    let mut values = 0usize;
+    for col in cols {
+        // Identifiers come from sqlite_master/table_info, quoted defensively.
+        let sql = format!(
+            "INSERT INTO lex_values (src_table, src_column, src_rowid, value, value_norm, is_doc)
+             SELECT ?1, ?2, rowid, \"{col}\", lower(trim(\"{col}\")), ?3
+             FROM {src}.\"{table}\"
+             WHERE \"{col}\" IS NOT NULL AND trim(\"{col}\") != ''",
+            src = SRC_SCHEMA,
+        );
+        values += conn.execute(
+            &sql,
+            stemmadb::rusqlite::params![table, col, prior.get(col).copied().unwrap_or(0)],
+        )?;
+    }
+    for fts in ["lex_fts", "lex_trigram"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {fts}(rowid, value)
+                 SELECT id, value FROM lex_values WHERE src_table = ?1"
+            ),
+            [table],
+        )?;
+    }
+    Ok(values)
+}
+
+// --- Provenance receipts ---------------------------------------------------
+
+/// Reads the `derivations` receipt for one artifact, returning its input
+/// fingerprint only when the derivation version also matches — a receipt
+/// from an older algorithm is stale by definition.
+fn read_receipt(
+    conn: &stemmadb::rusqlite::Connection,
+    artifact: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT input_fingerprint FROM derivations
+             WHERE artifact = ?1 AND derivation_version = ?2",
+            stemmadb::rusqlite::params![artifact, LEX_DERIVATION_VERSION],
+            |r| r.get(0),
+        )
+        .ok())
+}
+
+fn write_receipt(
+    conn: &stemmadb::rusqlite::Connection,
+    artifact: &str,
+    fingerprint: &str,
+    value_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO derivations
+             (artifact, input_fingerprint, derivation_version, derived_at, value_json)
+         VALUES (?1, ?2, ?3, datetime('now'), ?4)
+         ON CONFLICT(artifact) DO UPDATE SET
+             input_fingerprint = ?2, derivation_version = ?3,
+             derived_at = datetime('now'), value_json = ?4",
+        stemmadb::rusqlite::params![artifact, fingerprint, LEX_DERIVATION_VERSION, value_json],
+    )?;
+    Ok(())
+}
+
+/// Fingerprint of the whole ingested corpus: the per-table receipts folded
+/// through a content hash. Cheap, and exactly as fresh as the receipts.
+fn corpus_fingerprint(conn: &stemmadb::rusqlite::Connection) -> Result<String> {
+    let joined: Option<String> = conn.query_row(
+        "SELECT group_concat(artifact || '=' || input_fingerprint, ';')
+         FROM (SELECT artifact, input_fingerprint FROM derivations
+               WHERE artifact LIKE 'lex:%' ORDER BY artifact)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(content_hash(joined.as_deref().unwrap_or("")))
+}
+
+// --- Column measurements and purpose predicates ----------------------------
+//
+// The lexical index records what values exist; `lex_columns` records
+// per-column MEASUREMENTS — counts, shape ratios with confidence bounds,
+// length statistics. What used to be a stored six-kind classification is now
+// three exported predicates, each a documented function over the
+// measurements, evaluated where it is consumed. The structural shape tests
+// (parses as a number, uuid/hex, epoch ranges, ISO dates) are definitions,
+// not tunables, and remain fixed; every *threshold* has been replaced by a
+// derivation (the document boundary) or by the symmetric point of a
+// confident majority (LCB > 1/2).
+
 /// Numeric values inside either range read as epoch timestamps:
 /// seconds (1e8..4e9 ≈ 1973..2096) and milliseconds (1e11..4e12).
 pub const TEMPORAL_EPOCH_RANGES: [(f64, f64); 2] = [(1e8, 4e9), (1e11, 4e12)];
 
-/// Classification priority: first predicate that fires names the column.
-/// Order matters — a copied epoch column is numeric too, but `temporal` is
-/// the more specific truth; near-distinct digit keys are numeric before
-/// they are anything else.
-fn classify_kind(
-    n_values: i64,
-    distinct_ratio: f64,
-    alpha_ratio: f64,
-    numeric_ratio: f64,
-    temporal_ratio: f64,
-    idlike_ratio: f64,
-    doc_ratio: f64,
-    nospace_ratio: f64,
-) -> &'static str {
-    let big = n_values >= KIND_CARDINALITY_MIN_VALUES;
-    if doc_ratio > KIND_DOC_MIN {
-        "document"
-    } else if temporal_ratio > KIND_TEMPORAL_MIN {
-        "temporal"
-    } else if numeric_ratio > KIND_NUMERIC_MIN {
-        "numeric"
-    } else if idlike_ratio > KIND_IDLIKE_MIN
-        || (big && distinct_ratio > KIND_DISTINCT_MIN && alpha_ratio < KIND_ALPHA_MAX)
-    {
-        "identifier"
-    } else if big && distinct_ratio > KIND_DISTINCT_MIN && nospace_ratio > KIND_CODE_NOSPACE_MIN {
-        "code"
+/// The one conventional confidence level for every uncertainty-aware ratio
+/// test: shape claims about a column are made at a Jeffreys lower confidence
+/// bound of this level. 95% is the statistical convention, not a tuned
+/// value; it is the only probability constant in the crate.
+pub const CONFIDENCE_LEVEL: f64 = 0.95;
+
+/// FNV-1a hash of a text, hex-encoded — the content hash carried by
+/// embed-queue items and folded into corpus fingerprints. Not
+/// cryptographic; it only needs to make "did this text change?" cheap.
+pub fn content_hash(text: &str) -> String {
+    let mut state: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        state ^= *b as u64;
+        state = state.wrapping_mul(0x100000001b3);
+    }
+    format!("{state:016x}")
+}
+
+/// Jeffreys lower confidence bound at [`CONFIDENCE_LEVEL`] for observing
+/// `successes` in `n` trials: the lower tail quantile of
+/// Beta(successes + 1/2, n − successes + 1/2). This is what makes small
+/// samples honest without a minimum-N gate: 5/5 bounds a proportion at only
+/// ~0.69, while 80/80 bounds it above 0.97 — certainty has to be earned
+/// with data, not asserted past a cutoff.
+pub fn jeffreys_lcb(successes: i64, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let (a, b) = (successes as f64 + 0.5, (n - successes) as f64 + 0.5);
+    beta_quantile(a, b, 1.0 - CONFIDENCE_LEVEL)
+}
+
+/// Quantile of the Beta(a, b) distribution by bisection on the regularized
+/// incomplete beta function. The CDF is monotone, so 200 halvings pin the
+/// quantile far below any precision this crate consumes.
+fn beta_quantile(a: f64, b: f64, p: f64) -> f64 {
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if reg_inc_beta(a, b, mid) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Regularized incomplete beta I_x(a, b) via the standard continued-fraction
+/// expansion (modified Lentz), using the symmetry I_x(a,b) = 1 − I_{1−x}(b,a)
+/// to keep the fraction in its fast-converging region.
+fn reg_inc_beta(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let front =
+        (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * beta_cf(a, b, x) / a
     } else {
-        "text"
+        1.0 - front * beta_cf(b, a, 1.0 - x) / b
     }
 }
 
-/// Rebuilds `lex_columns` from `lex_values`: one grouped pass computing the
-/// per-column value-shape ratios, classified into a `kind` by
-/// [`classify_kind`]. Called at the end of every index (re)build; returns the
-/// number of columns profiled.
+fn beta_cf(a: f64, b: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-30;
+    let (qab, qap, qam) = (a + b, a + 1.0, a - 1.0);
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < TINY {
+        d = TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..200 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        // even step
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        // odd step
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-12 {
+            break;
+        }
+    }
+    h
+}
+
+/// Lanczos approximation of ln Γ(x), g = 7, n = 9 — accurate to well beyond
+/// the demands of a confidence bound.
+fn ln_gamma(x: f64) -> f64 {
+    const G: [f64; 9] = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ];
+    if x < 0.5 {
+        // reflection
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut acc = G[0];
+    for (i, g) in G.iter().enumerate().skip(1) {
+        acc += g / (x + i as f64);
+    }
+    let t = x + 7.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + acc.ln()
+}
+
+/// Otsu's 2-class natural break over a small sample: the threshold that
+/// maximizes between-class variance, returned as the midpoint of the gap it
+/// splits. `None` when fewer than two distinct values exist — there is no
+/// break in a point mass.
+fn otsu_cut(values: &[f64]) -> Option<f64> {
+    let mut xs = values.to_vec();
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    if n < 2 || xs[0] == xs[n - 1] {
+        return None;
+    }
+    let total: f64 = xs.iter().sum();
+    let mut best = (f64::MIN, 0usize);
+    let mut lower_sum = 0.0;
+    for k in 1..n {
+        lower_sum += xs[k - 1];
+        if xs[k - 1] == xs[k] {
+            continue; // not a real boundary
+        }
+        let (w0, w1) = (k as f64, (n - k) as f64);
+        let (mu0, mu1) = (lower_sum / w0, (total - lower_sum) / w1);
+        let between = w0 * w1 * (mu0 - mu1) * (mu0 - mu1);
+        if between > best.0 {
+            best = (between, k);
+        }
+    }
+    Some(0.5 * (xs[best.1 - 1] + xs[best.1]))
+}
+
+/// The corpus's document boundary, derived by [`derive_doc_boundary`] and
+/// applied by [`is_document_column`]. `Cut` carries a threshold over
+/// `ln(1 + median_len)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocBoundary {
+    /// Every column's typical value is beyond value scale: a pure document
+    /// corpus, however its lengths cluster.
+    AllDocs,
+    /// Columns whose median log-length exceeds the cut are document columns.
+    Cut(f64),
+}
+
+/// Derives the document boundary from the per-column median value lengths
+/// (raw characters). Parameter-free: the corpus's own length distribution
+/// decides, anchored only by [`EXACT_MAX_LEN`] — the operational definition
+/// of where "being a value" ends, since a value the exact channel cannot
+/// match is not a value in any sense the pipeline can use.
+///
+/// - Medians uniformly beyond value scale → [`DocBoundary::AllDocs`]: the
+///   corpus is prose everywhere (single-column article stores land here).
+/// - Otherwise the boundary is Otsu's natural break over the median
+///   log-lengths, never lowered below value scale. On value-shaped corpora
+///   (BIRD and its kin) the break sits among short medians, the value-scale
+///   floor prevails, and no column is a document — the degenerate unimodal
+///   case falls out of the same expression.
+///
+/// The break being *corpus-relative* is the point: a 150-char-median column
+/// clusters with values in a corpus whose documents run 3,000 chars, and the
+/// derived cut says so, where any fixed length would have guessed.
+pub fn derive_doc_boundary(median_lens: &[f64]) -> DocBoundary {
+    let prose = ((EXACT_MAX_LEN + 1) as f64).ln();
+    if !median_lens.is_empty() && median_lens.iter().all(|m| (1.0 + m).ln() > prose) {
+        return DocBoundary::AllDocs;
+    }
+    let logs: Vec<f64> = median_lens.iter().map(|m| (1.0 + m).ln()).collect();
+    DocBoundary::Cut(otsu_cut(&logs).map_or(prose, |c| c.max(prose)))
+}
+
+/// One `lex_columns` row: the measurements every purpose predicate reads.
+#[derive(Debug, Clone)]
+pub struct ColumnProfile {
+    pub src_table: String,
+    pub src_column: String,
+    pub n_values: i64,
+    pub n_distinct: i64,
+    pub distinct_ratio: f64,
+    pub distinct_lcb: f64,
+    pub alpha_ratio: f64,
+    pub alpha_lcb: f64,
+    pub numeric_ratio: f64,
+    pub numeric_lcb: f64,
+    pub temporal_ratio: f64,
+    pub temporal_lcb: f64,
+    pub idlike_ratio: f64,
+    pub idlike_lcb: f64,
+    pub avg_len: f64,
+    pub median_len: f64,
+}
+
+/// Reads the measurement profiles out of `lex_columns`.
+pub fn column_profiles(db: &StemmaDb) -> Result<Vec<ColumnProfile>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT src_table, src_column, n_values, n_distinct, distinct_ratio,
+                distinct_lcb, alpha_ratio, alpha_lcb, numeric_ratio, numeric_lcb,
+                temporal_ratio, temporal_lcb, idlike_ratio, idlike_lcb,
+                avg_len, median_len
+         FROM lex_columns ORDER BY src_table, src_column",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ColumnProfile {
+            src_table: r.get(0)?,
+            src_column: r.get(1)?,
+            n_values: r.get(2)?,
+            n_distinct: r.get(3)?,
+            distinct_ratio: r.get(4)?,
+            distinct_lcb: r.get(5)?,
+            alpha_ratio: r.get(6)?,
+            alpha_lcb: r.get(7)?,
+            numeric_ratio: r.get(8)?,
+            numeric_lcb: r.get(9)?,
+            temporal_ratio: r.get(10)?,
+            temporal_lcb: r.get(11)?,
+            idlike_ratio: r.get(12)?,
+            idlike_lcb: r.get(13)?,
+            avg_len: r.get(14)?,
+            median_len: r.get(15)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Is this column a document column under the given boundary? Document
+/// columns hold text that mentions resolve *into* (BM25/snippet semantics)
+/// rather than *equal*; the property is a fact about the column's place in
+/// the corpus's length distribution, so it is decided per column, not per
+/// cell. The stamped `lex_values.is_doc` bit is this predicate applied under
+/// the *adopted* boundary (see [`profile_columns`] for the hysteresis).
+pub fn is_document_column(profile: &ColumnProfile, boundary: &DocBoundary) -> bool {
+    match boundary {
+        DocBoundary::AllDocs => true,
+        DocBoundary::Cut(cut) => (1.0 + profile.median_len).ln() > *cut,
+    }
+}
+
+/// Can a natural-language paraphrase plausibly reach this column's values?
+/// Letter-bearing by simple majority, and not *confidently* shape-structural:
+/// a column is disqualified only when the Jeffreys lower bound of its
+/// numeric, temporal or id-like fraction clears 1/2 — evidence that most of
+/// the column is structural, not a hunch from three rows. Admission is the
+/// default and denial carries the burden of proof, which is exactly how the
+/// old minimum-sample gate behaved without needing one: a small column
+/// cannot be confidently condemned, so it stays eligible.
+///
+/// Deliberately absent: any cardinality test. Near-unique prose (names,
+/// titles) is legitimate vocabulary, and key-like columns are already caught
+/// by their shape. A letter-bearing code scheme (`SKU-0001-Q3`) is admitted
+/// — the recurrence requirement downstream keeps it harmless, and denying it
+/// would take a distinctness threshold this crate no longer owns.
+pub fn is_paraphrasable_column(profile: &ColumnProfile) -> bool {
+    profile.alpha_ratio > 0.5
+        && profile.numeric_lcb <= 0.5
+        && profile.temporal_lcb <= 0.5
+        && profile.idlike_lcb <= 0.5
+}
+
+/// Which columns may hold knowledge-graph term affinity. Today this IS
+/// [`is_paraphrasable_column`] — a term can recur meaningfully exactly in
+/// the columns a paraphrase can reach — kept as its own name so the two
+/// consumers state their purpose and can diverge without a hunt.
+pub fn is_vocabulary_column(profile: &ColumnProfile) -> bool {
+    is_paraphrasable_column(profile)
+}
+
+/// The `(table, column)` pairs eligible for vocabulary purposes — the
+/// vocabulary predicate minus document columns (their cells are prose to
+/// resolve into, not values to disambiguate). Consumed by interpretation
+/// candidacy here and the knowledge compiler's affinity pass.
+pub fn vocabulary_columns(db: &StemmaDb) -> Result<Vec<(String, String)>> {
+    let boundary = read_adopted_boundary(db.conn())?;
+    Ok(column_profiles(db)?
+        .into_iter()
+        .filter(|p| {
+            is_vocabulary_column(p)
+                && !boundary
+                    .as_ref()
+                    .is_some_and(|b| is_document_column(p, b))
+        })
+        .map(|p| (p.src_table, p.src_column))
+        .collect())
+}
+
+fn boundary_json(b: &DocBoundary) -> String {
+    match b {
+        DocBoundary::AllDocs => "{\"kind\":\"all_docs\"}".into(),
+        DocBoundary::Cut(c) => format!("{{\"kind\":\"cut\",\"cut\":{c}}}"),
+    }
+}
+
+/// The adopted document boundary from the `doc_cut` receipt, if one exists.
+fn read_adopted_boundary(
+    conn: &stemmadb::rusqlite::Connection,
+) -> Result<Option<DocBoundary>> {
+    let row: Option<(String, Option<f64>)> = conn
+        .query_row(
+            "SELECT json_extract(value_json, '$.adopted.kind'),
+                    json_extract(value_json, '$.adopted.cut')
+             FROM derivations WHERE artifact = 'doc_cut' AND derivation_version = ?1",
+            [LEX_DERIVATION_VERSION],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    Ok(match row {
+        Some((kind, _)) if kind == "all_docs" => Some(DocBoundary::AllDocs),
+        Some((kind, Some(cut))) if kind == "cut" => Some(DocBoundary::Cut(cut)),
+        _ => None,
+    })
+}
+
+/// Rebuilds `lex_columns` from `lex_values` — one grouped pass for counts and
+/// shape sums, one windowed pass for medians — then re-derives the document
+/// boundary and stamps `lex_values.is_doc` per column.
+///
+/// **Hysteresis.** The boundary *re-derives* on every call (recorded as
+/// `current` in the `doc_cut` receipt) but is *re-adopted* only when adopting
+/// it would change at least one column's document-ness; otherwise the
+/// previously adopted value stands. A cut that drifts with every appended
+/// row must not churn derived state that only cares which side of it each
+/// column is on. When adoption does flip columns, their embed-queue items
+/// and vectors are invalid in a way no content hash can see (the *channel*
+/// changed, not the text), so they are dropped for re-enqueue and the blast
+/// radius is logged.
 pub fn profile_columns(db: &StemmaDb) -> Result<usize> {
     let conn = db.conn();
     // GLOB shapes over value_norm (already lower(trim())). In a GLOB set,
-    // `^` first negates and `-` last is literal.
+    // `^` first negates and `-` last is literal. These are structural
+    // definitions (what it means to parse as a number, look like a uuid,
+    // land in an epoch range), not tunables.
     let numeric = "value_norm GLOB '*[0-9]*' AND value_norm NOT GLOB '*[^0-9.e+-]*'";
     let h = "[0-9a-f]";
     let uuid = format!(
@@ -281,22 +778,21 @@ pub fn profile_columns(db: &StemmaDb) -> Result<usize> {
         .map(|(lo, hi)| format!("CAST(value_norm AS REAL) BETWEEN {lo:e} AND {hi:e}"))
         .collect::<Vec<_>>()
         .join(" OR ");
+    // Counts, not ratios: the Jeffreys bound needs (successes, n).
     let sql = format!(
         "SELECT src_table, src_column, count(*), count(DISTINCT value_norm),
-                avg(value_norm GLOB '*[a-z]*'),
-                avg({numeric}),
-                avg(({numeric} AND ({epoch}))
+                sum(value_norm GLOB '*[a-z]*'),
+                sum({numeric}),
+                sum(({numeric} AND ({epoch}))
                     OR value_norm GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'),
-                avg(value_norm GLOB '{uuid}'
+                sum(value_norm GLOB '{uuid}'
                     OR (length(value_norm) >= 16 AND value_norm NOT GLOB '*[^0-9a-f]*')
                     OR (length(value_norm) >= 6 AND value_norm NOT GLOB '*[^0-9]*')),
-                avg(is_doc),
-                avg(length(value)),
-                avg(value_norm NOT GLOB '* *')
+                avg(length(value))
          FROM lex_values
          GROUP BY src_table, src_column"
     );
-    type Row = (String, String, i64, i64, f64, f64, f64, f64, f64, f64, f64);
+    type Row = (String, String, i64, i64, i64, i64, i64, i64, f64);
     let profiles: Vec<Row> = conn
         .prepare(&sql)?
         .query_map([], |r| {
@@ -310,50 +806,138 @@ pub fn profile_columns(db: &StemmaDb) -> Result<usize> {
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
             ))
         })?
         .collect::<std::result::Result<_, _>>()?;
 
+    // True per-column medians of value length (averaging the middle pair on
+    // even counts), via one windowed pass.
+    let medians: std::collections::HashMap<(String, String), f64> = conn
+        .prepare(
+            "WITH ranked AS (
+                 SELECT src_table AS t, src_column AS c, length(value) AS len,
+                        row_number() OVER (PARTITION BY src_table, src_column
+                                           ORDER BY length(value)) AS rn,
+                        count(*) OVER (PARTITION BY src_table, src_column) AS n
+                 FROM lex_values)
+             SELECT t, c, avg(len) FROM ranked
+             WHERE rn IN ((n + 1) / 2, (n + 2) / 2)
+             GROUP BY t, c",
+        )?
+        .query_map([], |r| {
+            Ok(((r.get::<_, String>(0)?, r.get::<_, String>(1)?), r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let tx = conn.unchecked_transaction()?;
     conn.execute("DELETE FROM lex_columns", [])?;
-    let mut insert = conn.prepare_cached(
-        "INSERT INTO lex_columns (src_table, src_column, n_values, n_distinct,
-             distinct_ratio, alpha_ratio, numeric_ratio, temporal_ratio,
-             idlike_ratio, doc_ratio, avg_len, kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-    )?;
-    let n = profiles.len();
-    for (table, column, n_values, n_distinct, alpha, numeric, temporal, idlike, doc, avg_len, nospace) in
-        profiles
     {
-        let distinct_ratio = n_distinct as f64 / n_values.max(1) as f64;
-        let kind = classify_kind(
-            n_values,
-            distinct_ratio,
-            alpha,
-            numeric,
-            temporal,
-            idlike,
-            doc,
-            nospace,
-        );
-        insert.execute(stemmadb::rusqlite::params![
-            table,
-            column,
-            n_values,
-            n_distinct,
-            distinct_ratio,
-            alpha,
-            numeric,
-            temporal,
-            idlike,
-            doc,
-            avg_len,
-            kind
-        ])?;
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO lex_columns (src_table, src_column, n_values, n_distinct,
+                 distinct_ratio, distinct_lcb, alpha_ratio, alpha_lcb,
+                 numeric_ratio, numeric_lcb, temporal_ratio, temporal_lcb,
+                 idlike_ratio, idlike_lcb, avg_len, median_len)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        )?;
+        for (table, column, n, n_distinct, alpha, numeric, temporal, idlike, avg_len) in &profiles
+        {
+            let ratio = |k: i64| k as f64 / (*n).max(1) as f64;
+            let median = medians
+                .get(&(table.clone(), column.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            insert.execute(stemmadb::rusqlite::params![
+                table,
+                column,
+                n,
+                n_distinct,
+                ratio(*n_distinct),
+                jeffreys_lcb(*n_distinct, *n),
+                ratio(*alpha),
+                jeffreys_lcb(*alpha, *n),
+                ratio(*numeric),
+                jeffreys_lcb(*numeric, *n),
+                ratio(*temporal),
+                jeffreys_lcb(*temporal, *n),
+                ratio(*idlike),
+                jeffreys_lcb(*idlike, *n),
+                avg_len,
+                median
+            ])?;
+        }
     }
-    Ok(n)
+
+    // --- Document boundary: derive, maybe adopt, stamp. ---
+    let all = column_profiles(db)?;
+    let med: Vec<f64> = all.iter().map(|p| p.median_len).collect();
+    let current = derive_doc_boundary(&med);
+    let previous = read_adopted_boundary(conn)?;
+    let adopted = match &previous {
+        None => current.clone(),
+        Some(prev) => {
+            let doc_set = |b: &DocBoundary| -> Vec<bool> {
+                all.iter().map(|p| is_document_column(p, b)).collect()
+            };
+            if doc_set(prev) == doc_set(&current) {
+                prev.clone()
+            } else {
+                current.clone()
+            }
+        }
+    };
+
+    let mut reset_items = 0usize;
+    let mut flipped = 0usize;
+    let vec_tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE name IN ('vec_dense', 'vec_interp')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for p in &all {
+        let target = is_document_column(p, &adopted) as i64;
+        let changed = conn.execute(
+            "UPDATE lex_values SET is_doc = ?3
+             WHERE src_table = ?1 AND src_column = ?2 AND is_doc != ?3",
+            stemmadb::rusqlite::params![p.src_table, p.src_column, target],
+        )?;
+        if changed > 0 {
+            flipped += 1;
+            // The column changed channels (document ↔ value): queue items and
+            // vectors keyed under the old reading are invalid wholesale.
+            // Drop them; the next enqueue pass recreates the right ones.
+            reset_items += conn.execute(
+                "DELETE FROM embed_queue WHERE src_table = ?1 AND src_column = ?2",
+                stemmadb::rusqlite::params![p.src_table, p.src_column],
+            )?;
+            for vt in &vec_tables {
+                conn.execute(
+                    &format!("DELETE FROM {vt} WHERE src_table = ?1 AND src_column = ?2"),
+                    stemmadb::rusqlite::params![p.src_table, p.src_column],
+                )?;
+            }
+        }
+    }
+    if reset_items > 0 {
+        tracing::info!(
+            columns = flipped,
+            items_reset = reset_items,
+            "document boundary adopted: embed items reset for re-enqueue"
+        );
+    }
+
+    let corpus_fp = corpus_fingerprint(conn)?;
+    write_receipt(
+        conn,
+        "doc_cut",
+        &corpus_fp,
+        &format!(
+            "{{\"current\":{},\"adopted\":{}}}",
+            boundary_json(&current),
+            boundary_json(&adopted)
+        ),
+    )?;
+    write_receipt(conn, "profiles", &corpus_fp, "{}")?;
+    tx.commit()?;
+    Ok(profiles.len())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -461,15 +1045,21 @@ const DRAIN_BATCH_SQL: &str = "SELECT id, src_table, src_column, src_rowid, seri
 /// left for inspection rather than retried forever.
 pub const EMBED_MAX_ATTEMPTS: i64 = 3;
 
-/// Finds document cells (`lex_values.is_doc = 1`) with no vector in
-/// `vec_dense` and enqueues them as pending work in `embed_queue`. Documents
-/// only — short values travel through the interpretation-card path instead
+/// Finds document cells (`lex_values.is_doc = 1`) that need embedding work
+/// and enqueues them as pending items. Documents only — short values travel
+/// through the interpretation-card path instead
 /// ([`enqueue_missing_interpretations`]), which serializes column context the
 /// raw value does not carry.
 ///
-/// Idempotent: an item already pending (or failed) is left alone; an item
-/// previously `done` whose vector has since disappeared is reset to pending.
-/// Returns the number of items newly enqueued or reset.
+/// Each item carries a [`content_hash`] of the exact text it was enqueued to
+/// embed. An item is (re)queued when: it has never been enqueued; its stored
+/// hash differs from the current text (the source row changed — its stale
+/// vector is deleted and the item resets to pending, which is the whole of
+/// incremental re-embedding); or it is `done` but its vector has vanished.
+/// Items from before hashes existed (empty hash) adopt the current text as
+/// their baseline without resetting — their provenance is unknowable, and
+/// any change from here on is caught. Idempotent; returns the number of
+/// items newly enqueued or reset.
 pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
     let conn = db.conn();
     let has_dense: i64 = conn.query_row(
@@ -494,24 +1084,105 @@ pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS temp.covered_key ON covered(src_table, src_column, src_rowid);",
     )?;
-    let queued = conn.execute(
-        "INSERT INTO embed_queue (src_table, src_column, src_rowid)
-         SELECT lv.src_table, lv.src_column, lv.src_rowid
-         FROM lex_values lv
-         WHERE lv.is_doc = 1
-           AND NOT EXISTS (
-               SELECT 1 FROM covered c
-               WHERE c.src_table = lv.src_table
-                 AND c.src_column = lv.src_column
-                 AND c.src_rowid = lv.src_rowid)
-         ON CONFLICT (src_table, src_column, src_rowid) DO UPDATE SET
-             status = 'pending', attempts = 0, error = '',
-             updated_at = datetime('now')
-         WHERE embed_queue.status = 'done'",
-        [],
-    )?;
+
+    type Item = (String, String, i64, String, Option<i64>, String, String, bool);
+    let items: Vec<Item> = {
+        let mut stmt = conn.prepare(
+            "SELECT lv.src_table, lv.src_column, lv.src_rowid, lv.value,
+                    q.id, coalesce(q.status, ''), coalesce(q.content_hash, ''),
+                    EXISTS (SELECT 1 FROM covered c
+                            WHERE c.src_table = lv.src_table
+                              AND c.src_column = lv.src_column
+                              AND c.src_rowid = lv.src_rowid)
+             FROM lex_values lv
+             LEFT JOIN embed_queue q
+               ON q.src_table = lv.src_table AND q.src_column = lv.src_column
+              AND q.src_rowid = lv.src_rowid
+             WHERE lv.is_doc = 1",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    let mut queued = 0usize;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO embed_queue (src_table, src_column, src_rowid, content_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let mut reset = conn.prepare_cached(
+            "UPDATE embed_queue SET status = 'pending', attempts = 0, error = '',
+                    serialized = '', content_hash = ?2, updated_at = datetime('now')
+             WHERE id = ?1",
+        )?;
+        let mut adopt = conn.prepare_cached(
+            "UPDATE embed_queue SET content_hash = ?2 WHERE id = ?1",
+        )?;
+        for (table, column, rowid, value, qid, status, stored_hash, covered) in items {
+            let hash = content_hash(&value);
+            match qid {
+                None => {
+                    insert.execute(stemmadb::rusqlite::params![table, column, rowid, hash])?;
+                    queued += 1;
+                }
+                Some(id) if stored_hash.is_empty() => {
+                    // Pre-v5 item: unknown provenance, adopt the baseline.
+                    adopt.execute(stemmadb::rusqlite::params![id, hash])?;
+                }
+                Some(id) if stored_hash != hash => {
+                    // The source row changed: its stored vector (either
+                    // table — the column may have changed channels too) is
+                    // stale, and the item re-embeds.
+                    delete_vectors(conn, &table, &column, rowid)?;
+                    reset.execute(stemmadb::rusqlite::params![id, hash])?;
+                    queued += 1;
+                }
+                Some(id) if status == "done" && !covered => {
+                    reset.execute(stemmadb::rusqlite::params![id, hash])?;
+                    queued += 1;
+                }
+                Some(_) => {} // pending or failed with current content, or done and covered
+            }
+        }
+    }
+    tx.commit()?;
     conn.execute_batch("DROP TABLE covered;")?;
     Ok(queued)
+}
+
+/// Deletes any vector stored under a provenance triple, in whichever vector
+/// table holds it.
+fn delete_vectors(
+    conn: &stemmadb::rusqlite::Connection,
+    table: &str,
+    column: &str,
+    rowid: i64,
+) -> Result<()> {
+    let vec_tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE name IN ('vec_dense', 'vec_interp')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for vt in vec_tables {
+        conn.execute(
+            &format!(
+                "DELETE FROM {vt} WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3"
+            ),
+            stemmadb::rusqlite::params![table, column, rowid],
+        )?;
+    }
+    Ok(())
 }
 
 /// Interpretation cards never exceed this many characters: enough for the
@@ -557,25 +1228,29 @@ fn interpretation_card(
 }
 
 /// Finds distinct value interpretations — one per `(src_table, src_column,
-/// value_norm)` with `is_doc = 0` — that have no vector in `vec_interp`, and
-/// enqueues each as pending work with its serialization card stored in
+/// value_norm)` with `is_doc = 0` — that need embedding work, and enqueues
+/// each as pending with its serialization card stored in
 /// `embed_queue.serialized`. The queue key is the interpretation's
 /// representative cell: `src_rowid = MIN(src_rowid)` over the rows sharing
 /// the value, so the provenance-triple unique key stays exact and enqueue
-/// stays idempotent with the same reset-on-vanished-vector semantics as the
-/// document path. The representative is a CITATION KEY only — it never
+/// stays idempotent, with the same content-hash refresh semantics as the
+/// document path — here the hash covers the *card*, so an item resets when
+/// anything the encoder would see changed (the value, or its context
+/// fragments). The representative is a CITATION KEY only — it never
 /// influences card text, which is a function of the whole interpretation
 /// (see [`interpretation_card`]).
 ///
 /// This is the relational counterpart of the document queue: on value-shaped
-/// corpora nothing crosses `DOC_MIN_LEN`, so a documents-only dense channel
-/// is inert, and a value appearing in two columns needs column context to be
-/// separable at all. The card carries that context.
+/// corpora no column crosses the derived document boundary, so a
+/// documents-only dense channel is inert, and a value appearing in two
+/// columns needs column context to be separable at all. The card carries
+/// that context.
 ///
-/// Candidacy is restricted to columns `lex_columns` classified as `text`:
-/// temporal, numeric, identifier and code columns recur across tables by
-/// construction (denormalization copies them), not because their values are
-/// ambiguous vocabulary, and no paraphrase query can ever retrieve them.
+/// Candidacy is restricted to columns [`is_vocabulary_column`] admits (via
+/// [`vocabulary_columns`]): temporal, numeric and identifier-shaped columns
+/// recur across tables by construction (denormalization copies them), not
+/// because their values are ambiguous vocabulary, and no paraphrase query
+/// can ever retrieve them.
 pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     let conn = db.conn();
     let mut has_interp: i64 = conn.query_row(
@@ -632,6 +1307,22 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
         "CREATE INDEX IF NOT EXISTS temp.covered_interp_key
              ON covered_interp(src_table, src_column, src_rowid);",
     )?;
+    // The vocabulary predicate, materialized for the SQL below to join.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS vocab_cols (
+             src_table TEXT NOT NULL, src_column TEXT NOT NULL,
+             PRIMARY KEY (src_table, src_column)
+         );
+         DELETE FROM vocab_cols;",
+    )?;
+    {
+        let mut ins = conn.prepare_cached(
+            "INSERT OR IGNORE INTO vocab_cols (src_table, src_column) VALUES (?1, ?2)",
+        )?;
+        for (t, c) in vocabulary_columns(db)? {
+            ins.execute(stemmadb::rusqlite::params![t, c])?;
+        }
+    }
 
     // One row per distinct interpretation. The displayed value is the MODAL
     // raw spelling over the rows sharing the value_norm (ties broken
@@ -639,59 +1330,74 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     // insertion order — never the representative row's cell, which is kept
     // only as the citation key.
     //
-    // Candidacy is column-typed. A card is consulted solely when the same
+    // Candidacy is column-purposed. A card is consulted solely when the same
     // value ties across DISTINCT (table, column) readings — but on
     // denormalized schemas cross-column recurrence is dominated by *copied
     // data* (timestamps, join keys, SKUs repeated into fact tables), which is
     // structurally guaranteed to recur and can never be reached by a
     // natural-language paraphrase. So both the outer selection and the
-    // recurrence subquery are restricted to columns lex_columns classified as
-    // `text`, with a per-value letter guard for non-linguistic strays inside
-    // otherwise-texty columns. Expectation: the queue holds the shared
-    // *vocabulary* of the corpus — typically orders of magnitude below the
-    // untyped predicate on warehouse shapes (issue #2: 846,989 cards, 90.4%
-    // epoch floats, against 98 useful documents).
-    let missing: Vec<(String, String, i64, String, String)> = {
+    // recurrence subquery are restricted to vocabulary columns, with a
+    // per-value letter guard for non-linguistic strays inside otherwise-texty
+    // columns. Expectation: the queue holds the shared *vocabulary* of the
+    // corpus — typically orders of magnitude below the untyped predicate on
+    // warehouse shapes (issue #2: 846,989 cards, 90.4% epoch floats, against
+    // 98 useful documents). The card's head value is the MODAL spelling
+    // across the interpretation's rows (issue #6): deterministic, never the
+    // representative row's accident.
+    type Cand = (String, String, i64, String, String, Option<i64>, String, String, bool);
+    let candidates: Vec<Cand> = {
         let mut stmt = conn.prepare(
             "SELECT t.src_table, t.src_column, t.rep, t.value_norm,
                     (SELECT v.value FROM lex_values v
                      WHERE v.src_table = t.src_table AND v.src_column = t.src_column
                        AND v.value_norm = t.value_norm AND v.is_doc = 0
-                     GROUP BY v.value ORDER BY count(*) DESC, v.value LIMIT 1)
+                     GROUP BY v.value ORDER BY count(*) DESC, v.value LIMIT 1),
+                    q.id, coalesce(q.status, ''), coalesce(q.content_hash, ''),
+                    EXISTS (SELECT 1 FROM covered_interp c
+                            WHERE c.src_table = t.src_table
+                              AND c.src_column = t.src_column
+                              AND c.src_rowid = t.rep)
              FROM (
                  SELECT lv.src_table, lv.src_column, MIN(lv.src_rowid) AS rep, lv.value_norm
                  FROM lex_values lv
-                 JOIN lex_columns lc ON lc.src_table = lv.src_table
-                                    AND lc.src_column = lv.src_column
+                 JOIN vocab_cols vc ON vc.src_table = lv.src_table
+                                   AND vc.src_column = lv.src_column
                  WHERE lv.is_doc = 0
-                   AND lc.kind = 'text'
                    AND lv.value_norm GLOB '*[a-z]*'
                    AND lv.value_norm IN (
                        SELECT lv2.value_norm FROM lex_values lv2
-                       JOIN lex_columns lc2 ON lc2.src_table = lv2.src_table
-                                           AND lc2.src_column = lv2.src_column
+                       JOIN vocab_cols vc2 ON vc2.src_table = lv2.src_table
+                                          AND vc2.src_column = lv2.src_column
                        WHERE lv2.is_doc = 0
-                         AND lc2.kind = 'text'
                          AND lv2.value_norm GLOB '*[a-z]*'
                        GROUP BY lv2.value_norm
                        HAVING count(DISTINCT lv2.src_table || '·' || lv2.src_column) >= 2
                    )
                  GROUP BY lv.src_table, lv.src_column, lv.value_norm
              ) t
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM covered_interp c
-                 WHERE c.src_table = t.src_table
-                   AND c.src_column = t.src_column
-                   AND c.src_rowid = t.rep)
+             LEFT JOIN embed_queue q
+               ON q.src_table = t.src_table AND q.src_column = t.src_column
+              AND q.src_rowid = t.rep
              ORDER BY t.src_table, t.src_column, t.rep",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
         })?;
         rows.collect::<std::result::Result<_, _>>()?
     };
 
     let mut queued = 0usize;
+    let tx = conn.unchecked_transaction()?;
     {
         // Set-level fragments: for each OTHER paraphrasable (`text`-kind,
         // non-doc) column of the same table, the modal value across ALL rows
@@ -712,25 +1418,28 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
                  FROM lex_values me
                  JOIN lex_values o
                    ON o.src_table = me.src_table AND o.src_rowid = me.src_rowid
-                 JOIN lex_columns oc
+                 JOIN vocab_cols oc
                    ON oc.src_table = o.src_table AND oc.src_column = o.src_column
                  WHERE me.src_table = ?1 AND me.src_column = ?2
                    AND me.value_norm = ?3 AND me.is_doc = 0
                    AND o.src_column != ?2 AND o.is_doc = 0
-                   AND oc.kind = 'text'
                  GROUP BY o.src_column, o.value)
              WHERE 2 * n > total
              ORDER BY src_column",
         )?;
         let mut insert = conn.prepare_cached(
-            "INSERT INTO embed_queue (src_table, src_column, src_rowid, serialized)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (src_table, src_column, src_rowid) DO UPDATE SET
-                 status = 'pending', attempts = 0, error = '', serialized = ?4,
-                 updated_at = datetime('now')
-             WHERE embed_queue.status = 'done'",
+            "INSERT INTO embed_queue (src_table, src_column, src_rowid, serialized, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        for (table, column, rep, value_norm, value) in missing {
+        let mut reset = conn.prepare_cached(
+            "UPDATE embed_queue SET status = 'pending', attempts = 0, error = '',
+                    serialized = ?2, content_hash = ?3, updated_at = datetime('now')
+             WHERE id = ?1",
+        )?;
+        let mut adopt = conn.prepare_cached(
+            "UPDATE embed_queue SET serialized = ?2, content_hash = ?3 WHERE id = ?1",
+        )?;
+        for (table, column, rep, value_norm, value, qid, status, stored_hash, covered) in candidates {
             let fragments: Vec<(String, String)> = frag_stmt
                 .query_map(
                     stemmadb::rusqlite::params![table, column, value_norm],
@@ -738,10 +1447,31 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
                 )?
                 .collect::<std::result::Result<_, _>>()?;
             let card = interpretation_card(&table, &column, &value, &fragments);
-            queued += insert.execute(stemmadb::rusqlite::params![table, column, rep, card])?;
+            let hash = content_hash(&card);
+            match qid {
+                None => {
+                    insert.execute(stemmadb::rusqlite::params![table, column, rep, card, hash])?;
+                    queued += 1;
+                }
+                Some(id) if stored_hash.is_empty() => {
+                    // Pre-v5 item: unknown provenance, adopt the baseline.
+                    adopt.execute(stemmadb::rusqlite::params![id, card, hash])?;
+                }
+                Some(id) if stored_hash != hash => {
+                    delete_vectors(conn, &table, &column, rep)?;
+                    reset.execute(stemmadb::rusqlite::params![id, card, hash])?;
+                    queued += 1;
+                }
+                Some(id) if status == "done" && !covered => {
+                    reset.execute(stemmadb::rusqlite::params![id, card, hash])?;
+                    queued += 1;
+                }
+                Some(_) => {}
+            }
         }
     }
-    conn.execute_batch("DROP TABLE covered_interp;")?;
+    tx.commit()?;
+    conn.execute_batch("DROP TABLE covered_interp; DROP TABLE vocab_cols;")?;
     Ok(queued)
 }
 
@@ -1010,13 +1740,6 @@ pub fn drain_embed_queue(
     })
 }
 
-fn count_tables(cols: &[TextColumn]) -> usize {
-    let mut t: Vec<&str> = cols.iter().map(|c| c.table.as_str()).collect();
-    t.sort_unstable();
-    t.dedup();
-    t.len()
-}
-
 /// TEXT-typed columns of every user table.
 fn text_columns(db: &StemmaDb) -> Result<Vec<TextColumn>> {
     let mut out = Vec::new();
@@ -1095,10 +1818,10 @@ mod tests {
         assert_eq!(fuzzy, 2); // 'Seattle' and 'Seattle - Northgate'
     }
 
-    /// One column of each kind, 24 rows per table so the cardinality-gated
-    /// rules (identifier-by-distinctness, code) are live. All columns are
-    /// TEXT-typed — the CSV-import shape where epoch floats, dates and keys
-    /// arrive as strings, which is exactly when typology matters.
+    /// One column of each shape, 24 rows per table so the confidence bounds
+    /// have data to be confident about. All columns are TEXT-typed — the
+    /// CSV-import shape where epoch floats, dates and keys arrive as
+    /// strings, which is exactly when the measurements matter.
     fn typology_db() -> StemmaDb {
         let db = StemmaDb::open_in_memory().unwrap();
         let conn = db.conn();
@@ -1151,42 +1874,186 @@ mod tests {
     }
 
     #[test]
-    fn column_kinds_classify_the_typology_fixture() {
+    fn purpose_predicates_read_the_typology_fixture() {
         let db = typology_db();
-        let kind = |t: &str, c: &str| -> String {
-            db.conn()
-                .query_row(
-                    "SELECT kind FROM lex_columns WHERE src_table = ?1 AND src_column = ?2",
-                    [t, c],
-                    |r| r.get(0),
-                )
+        let profiles = column_profiles(&db).unwrap();
+        let profile = |t: &str, c: &str| -> &ColumnProfile {
+            profiles
+                .iter()
+                .find(|p| p.src_table == t && p.src_column == c)
                 .unwrap()
         };
-        assert_eq!(kind("events", "occurred_at"), "temporal", "epoch floats");
-        assert_eq!(kind("events", "day"), "temporal", "ISO dates");
-        assert_eq!(kind("events", "amount"), "numeric", "plain decimals");
-        assert_eq!(kind("assets", "uid"), "identifier", "uuids");
-        assert_eq!(kind("assets", "sku"), "code", "SKU-shaped tokens");
-        assert_eq!(kind("assets", "name"), "text", "recurring names");
-        assert_eq!(kind("assets", "body"), "document", "long bodies");
-        // Digit keys are numeric-shaped before anything else; both sides of
-        // the copied-key pair classify away from 'text' identically.
-        assert_eq!(kind("parents", "pid"), "numeric", "digit keys");
-        assert_eq!(kind("children", "parent_id"), "numeric", "copied digit keys");
+        let paraphrasable = |t: &str, c: &str| is_paraphrasable_column(profile(t, c));
+        // Confidently shape-structural columns are denied vocabulary status.
+        assert!(!paraphrasable("events", "occurred_at"), "epoch floats");
+        assert!(!paraphrasable("events", "day"), "ISO dates");
+        assert!(!paraphrasable("events", "amount"), "plain decimals");
+        assert!(!paraphrasable("assets", "uid"), "uuids");
+        assert!(!paraphrasable("parents", "pid"), "digit keys");
+        assert!(!paraphrasable("children", "parent_id"), "copied digit keys");
+        // Letter-bearing prose is admitted; so, honestly, is a letter-bearing
+        // code scheme — with the kind ladder's distinctness threshold gone,
+        // 'SKU-0001-Q3' is not confidently numeric/temporal/idlike and the
+        // downstream recurrence requirement is what keeps it harmless.
+        assert!(paraphrasable("assets", "name"), "recurring names");
+        assert!(paraphrasable("assets", "sku"), "letter-bearing codes");
+        // Vocabulary is the same predicate under its consumer's name.
+        assert!(is_vocabulary_column(profile("assets", "name")));
 
-        // Ratio spot checks: the profile stores what the kinds derive from.
-        let (n, distinct, temporal): (i64, f64, f64) = db
+        // The document boundary is a corpus derivation, not a length gate:
+        // only the long-body column sits beyond the natural break.
+        let boundary = read_adopted_boundary(db.conn()).unwrap().unwrap();
+        for p in &profiles {
+            let expect = p.src_table == "assets" && p.src_column == "body";
+            assert_eq!(
+                is_document_column(p, &boundary),
+                expect,
+                "document-ness of {}.{} (median {})",
+                p.src_table,
+                p.src_column,
+                p.median_len
+            );
+        }
+        // And vocabulary_columns excludes the document column.
+        let vocab = vocabulary_columns(&db).unwrap();
+        assert!(!vocab.contains(&("assets".into(), "body".into())));
+        assert!(vocab.contains(&("assets".into(), "name".into())));
+
+        // Measurement spot checks: LCBs live beside their point ratios and
+        // are strictly tempered by sample size.
+        let p = profile("events", "occurred_at");
+        assert_eq!(p.n_values, 24);
+        assert_eq!(p.distinct_ratio, 1.0);
+        assert_eq!(p.temporal_ratio, 1.0);
+        assert!(p.temporal_lcb > 0.5 && p.temporal_lcb < 1.0);
+        // is_doc is stamped column-wide from the same boundary.
+        let stamped: i64 = db
             .conn()
             .query_row(
-                "SELECT n_values, distinct_ratio, temporal_ratio FROM lex_columns
-                 WHERE src_table = 'events' AND src_column = 'occurred_at'",
+                "SELECT count(DISTINCT src_column) FROM lex_values WHERE is_doc = 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 24);
-        assert_eq!(distinct, 1.0);
-        assert_eq!(temporal, 1.0);
+        assert_eq!(stamped, 1, "exactly the body column is stamped is_doc");
+    }
+
+    #[test]
+    fn jeffreys_lcb_makes_small_samples_humble() {
+        // Certainty must be earned: a perfect ratio bounds very differently
+        // at n = 5 and n = 80.
+        // Reference values from the Beta(k+1/2, n-k+1/2) 5% quantile.
+        let small = jeffreys_lcb(5, 5);
+        let large = jeffreys_lcb(80, 80);
+        assert!((small - 0.69425).abs() < 1e-4, "5/5: {small}");
+        assert!((large - 0.97635).abs() < 1e-4, "80/80: {large}");
+        assert!(small < 0.75, "5/5 stays weak evidence: {small}");
+        assert!(large > 0.95, "80/80 is strong evidence: {large}");
+        assert!(jeffreys_lcb(0, 0) == 0.0);
+        assert!(jeffreys_lcb(0, 10) < 0.02);
+        // Monotone in evidence.
+        assert!(jeffreys_lcb(10, 10) > jeffreys_lcb(5, 5));
+        assert!(jeffreys_lcb(8, 10) > jeffreys_lcb(5, 10));
+        // And the bound is a lower bound.
+        for (k, n) in [(3i64, 7i64), (7, 7), (1, 30), (29, 30)] {
+            assert!(jeffreys_lcb(k, n) <= k as f64 / n as f64);
+        }
+    }
+
+    /// The scenario KIND_CARDINALITY_MIN_VALUES existed to protect, now
+    /// protected by arithmetic: five rows, all distinct, all letter-bearing.
+    /// A point ratio would read distinct_ratio = 1.0 and idlike-style rules
+    /// could condemn the column; the Jeffreys bounds stay too weak for any
+    /// structural denial, so the column keeps its vocabulary status.
+    #[test]
+    fn five_distinct_rows_cannot_be_condemned() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.towns(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO src.towns VALUES
+                    (1, 'Arcata'), (2, 'Bodega'), (3, 'Cambria'),
+                    (4, 'Dunsmuir'), (5, 'Eureka');",
+            )
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        let profiles = column_profiles(&db).unwrap();
+        let p = profiles
+            .iter()
+            .find(|p| p.src_column == "name")
+            .unwrap();
+        assert_eq!(p.distinct_ratio, 1.0);
+        assert!(
+            p.distinct_lcb < 0.7,
+            "all-distinct at n=5 is a weak claim: {}",
+            p.distinct_lcb
+        );
+        assert!(is_paraphrasable_column(p));
+        assert!(is_vocabulary_column(p));
+    }
+
+    #[test]
+    fn otsu_finds_the_natural_break_and_declines_degenerate_input() {
+        // Bimodal: the cut lands in the wide gap.
+        let cut = otsu_cut(&[3.4, 3.5, 3.4, 8.0, 8.1]).unwrap();
+        assert!((3.5..=8.0).contains(&cut), "got {cut}");
+        // Point mass and singletons have no break.
+        assert_eq!(otsu_cut(&[2.0, 2.0, 2.0]), None);
+        assert_eq!(otsu_cut(&[2.0]), None);
+        assert_eq!(otsu_cut(&[]), None);
+    }
+
+    #[test]
+    fn doc_boundary_derivation_covers_the_corpus_shapes() {
+        let prose = ((EXACT_MAX_LEN + 1) as f64).ln();
+        // Legal-shaped: short metadata columns, kilochar bodies. The break
+        // separates them and only the bodies are documents.
+        let b = derive_doc_boundary(&[9.0, 36.0, 57.0, 2660.0, 16151.0]);
+        let doc = |median: f64, b: &DocBoundary| {
+            is_document_column(
+                &ColumnProfile {
+                    src_table: String::new(),
+                    src_column: String::new(),
+                    n_values: 0,
+                    n_distinct: 0,
+                    distinct_ratio: 0.0,
+                    distinct_lcb: 0.0,
+                    alpha_ratio: 0.0,
+                    alpha_lcb: 0.0,
+                    numeric_ratio: 0.0,
+                    numeric_lcb: 0.0,
+                    temporal_ratio: 0.0,
+                    temporal_lcb: 0.0,
+                    idlike_ratio: 0.0,
+                    idlike_lcb: 0.0,
+                    avg_len: 0.0,
+                    median_len: median,
+                },
+                b,
+            )
+        };
+        assert!(doc(2660.0, &b) && doc(16151.0, &b));
+        assert!(!doc(9.0, &b) && !doc(36.0, &b) && !doc(57.0, &b));
+        // The break is corpus-relative: 150-char medians cluster with the
+        // values when the documents run to thousands, where any fixed
+        // threshold near 120 would have called them documents.
+        let b = derive_doc_boundary(&[30.0, 90.0, 150.0, 3000.0]);
+        assert!(!doc(150.0, &b), "150 clusters with values in this corpus");
+        assert!(doc(3000.0, &b));
+        // BIRD-shaped: everything value-scale. The Otsu break sits among
+        // short medians, the value-scale floor prevails, no documents.
+        let b = derive_doc_boundary(&[3.0, 7.0, 11.0, 19.0, 36.0]);
+        match &b {
+            DocBoundary::Cut(c) => assert!((*c - prose).abs() < 1e-12),
+            other => panic!("expected value-scale cut, got {other:?}"),
+        }
+        assert!(!doc(36.0, &b));
+        // Uniformly prose: a pure document corpus, however it clusters.
+        assert_eq!(derive_doc_boundary(&[500.0, 4000.0]), DocBoundary::AllDocs);
+        assert_eq!(derive_doc_boundary(&[1000.0]), DocBoundary::AllDocs);
+        // Degenerate single short column: no documents.
+        let b = derive_doc_boundary(&[12.0]);
+        assert!(!doc(12.0, &b));
     }
 
     /// Issue #2 in miniature: a denormalized warehouse whose fact table
@@ -1312,6 +2179,96 @@ mod tests {
         assert!(forced.rebuilt);
     }
 
+    #[test]
+    fn refresh_reingests_only_changed_tables() {
+        let db = mini_db();
+        let first = build_lexical_index(&db, false).unwrap();
+        assert_eq!((first.rebuilt, first.reingested_tables), (true, 2));
+        let receipt_fp = |artifact: &str| -> String {
+            db.conn()
+                .query_row(
+                    "SELECT input_fingerprint FROM derivations WHERE artifact = ?1",
+                    [artifact],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let offices_fp = receipt_fp("lex:offices");
+        let notes_fp = receipt_fp("lex:notes");
+        let profiles_fp = receipt_fp("profiles");
+
+        // The user database grows a row (writable src: in-memory fixture).
+        db.conn()
+            .execute(
+                "INSERT INTO src.notes VALUES (2, 'harbor throughput improving', 9)",
+                [],
+            )
+            .unwrap();
+        let second = build_lexical_index(&db, false).unwrap();
+        assert!(second.rebuilt);
+        assert_eq!(second.reingested_tables, 1, "only notes changed");
+        assert_eq!(second.values, 6, "the new cell is indexed");
+        // The FTS mirrors follow the changed table.
+        let hits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM lex_fts WHERE lex_fts MATCH 'harbor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+        // Receipts: the changed table and the corpus-level profiles moved,
+        // the untouched table's receipt did not.
+        assert_eq!(receipt_fp("lex:offices"), offices_fp);
+        assert_ne!(receipt_fp("lex:notes"), notes_fp);
+        assert_ne!(receipt_fp("profiles"), profiles_fp);
+
+        // Steady state: nothing to do.
+        let third = build_lexical_index(&db, false).unwrap();
+        assert_eq!((third.rebuilt, third.reingested_tables), (false, 0));
+    }
+
+    #[test]
+    fn refresh_follows_in_place_edits_and_dropped_tables() {
+        let db = mini_db();
+        build_lexical_index(&db, false).unwrap();
+        // An in-place edit that changes the rowid sum is caught. (An edit
+        // preserving count/max/sum is the documented blind spot of the
+        // fingerprint; `force` covers it.)
+        db.conn()
+            .execute_batch(
+                "DELETE FROM src.notes WHERE id = 1;
+                 INSERT INTO src.notes VALUES (3, 'margins compressed sharply', 7);",
+            )
+            .unwrap();
+        let stats = build_lexical_index(&db, false).unwrap();
+        assert_eq!(stats.reingested_tables, 1);
+        let old: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM lex_values WHERE value LIKE '%back on track%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0, "replaced rows leave the index");
+        // Dropping a table sweeps its rows and receipt.
+        db.conn().execute_batch("DROP TABLE src.notes;").unwrap();
+        let stats = build_lexical_index(&db, false).unwrap();
+        assert!(stats.rebuilt);
+        let (rows, receipts): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM lex_values WHERE src_table = 'notes'),
+                        (SELECT count(*) FROM derivations WHERE artifact = 'lex:notes')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, receipts), (0, 0));
+    }
+
     /// Deterministic embedder: each text maps to a unit vector on a small
     /// hypersphere, seeded by its bytes, so identical texts embed identically
     /// and different texts land apart.
@@ -1371,8 +2328,9 @@ mod tests {
         }
     }
 
-    /// A corpus with actual documents: three long bodies (>= DOC_MIN_LEN)
-    /// and short values that must stay out of the queue.
+    /// A corpus with actual documents: three long bodies whose column sits
+    /// beyond the derived boundary, and short values that must stay out of
+    /// the document queue.
     fn doc_db() -> StemmaDb {
         let db = StemmaDb::open_in_memory().unwrap();
         let body = |topic: &str| {
@@ -1960,6 +2918,225 @@ mod tests {
             note.contains("some-other-model") && note.contains("vec_interp"),
             "error note names table and model: {note}"
         );
+    }
+
+    #[test]
+    fn changed_document_resets_only_its_own_item() {
+        let db = doc_db();
+        let embedder = FakeEmbedder::new(8);
+        enqueue_missing_embeddings(&db).unwrap();
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!(queue_counts(&db), (0, 3, 0));
+
+        // One document is edited in the user database.
+        let revised = format!(
+            "Amended article on insurance filings. {}",
+            "The amended body still repeats itself with modest dignity until \
+             it is unmistakably prose rather than a value. "
+                .repeat(3)
+        );
+        db.conn()
+            .execute(
+                "UPDATE src.articles SET body = ?1 WHERE id = 2",
+                [&revised],
+            )
+            .unwrap();
+        // An in-place UPDATE preserves count:max:sum — the fingerprint's
+        // documented blind spot — so this is the `force` path. The point of
+        // the content hash is that even a full re-ingest re-embeds only what
+        // actually changed.
+        build_lexical_index(&db, true).unwrap();
+
+        // The content hash catches exactly the changed row: its stale vector
+        // is dropped and the item re-pends; the other two stay done.
+        let queued = enqueue_missing_embeddings(&db).unwrap();
+        assert_eq!(queued, 1, "only the edited document re-embeds");
+        assert_eq!(queue_counts(&db), (1, 2, 0));
+        let vectors: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors, 2, "the stale vector is gone");
+
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!(queue_counts(&db), (0, 3, 0));
+        let stored: Vec<u8> = db
+            .conn()
+            .query_row(
+                "SELECT embedding FROM vec_dense WHERE src_rowid = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected: Vec<u8> = embedder
+            .vector(&revised)
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert_eq!(stored, expected, "the new text is what got embedded");
+        // Steady state after the re-embed.
+        assert_eq!(enqueue_missing_embeddings(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn changed_context_resets_interpretation_cards() {
+        let db = value_db();
+        let embedder = FakeEmbedder::new(8);
+        enqueue_missing_interpretations(&db).unwrap();
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!(queue_counts(&db), (0, 6, 0));
+
+        // The 'Seattle' city interpretation's context fragment comes from
+        // offices.name of the representative row; renaming the office
+        // changes the card without changing the value itself.
+        db.conn()
+            .execute(
+                "UPDATE src.offices SET name = 'Seattle - Ballard' WHERE id = 17",
+                [],
+            )
+            .unwrap();
+        // In-place UPDATE: outside the fingerprint's reach, so force the
+        // re-ingest; the hashes keep everything else `done`.
+        build_lexical_index(&db, true).unwrap();
+        let queued = enqueue_missing_interpretations(&db).unwrap();
+        assert_eq!(queued, 1, "only the card whose text changed resets");
+        let card: String = db
+            .conn()
+            .query_row(
+                "SELECT serialized FROM embed_queue
+                 WHERE src_table = 'offices' AND src_column = 'city' AND src_rowid = 17",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(card, "offices · city · Seattle · name: Seattle - Ballard");
+        let vectors: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_interp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors, 5, "the stale card vector is gone");
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!(queue_counts(&db), (0, 6, 0));
+        assert_eq!(enqueue_missing_interpretations(&db).unwrap(), 0);
+    }
+
+    /// The hysteresis discipline on the document cut: `current` re-derives
+    /// on every profile pass, `adopted` moves only when adopting would
+    /// change some column's document-ness, and an adoption that flips a
+    /// column resets that column's embed items.
+    #[test]
+    fn doc_cut_hysteresis_governs_adoption() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let body = "Substantive regulatory prose, repeated until the column is \
+                    unambiguously a document column in any derivation. "
+            .repeat(6); // ~700 chars
+        let summary = "A mid-length abstract of the article, long enough to sit \
+                       between value scale and the document bodies, repeated once \
+                       more for measure and then again for length and balance."
+            .to_string(); // ~180 chars
+        db.conn()
+            .execute_batch(&format!(
+                "CREATE TABLE src.papers(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+                 CREATE TABLE src.notes(id INTEGER PRIMARY KEY, summary TEXT);
+                 INSERT INTO src.papers VALUES
+                    (1, 'tidal power', '{body}'),
+                    (2, 'grid balancing', '{body}'),
+                    (3, 'peak shaving', '{body}');
+                 INSERT INTO src.notes VALUES (1, '{summary}'), (2, '{summary}');"
+            ))
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        let cuts = |db: &StemmaDb| -> (f64, f64) {
+            db.conn()
+                .query_row(
+                    "SELECT json_extract(value_json, '$.current.cut'),
+                            json_extract(value_json, '$.adopted.cut')
+                     FROM derivations WHERE artifact = 'doc_cut'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let (current, adopted) = cuts(&db);
+        assert_eq!(current, adopted, "first derivation adopts itself");
+        // In this corpus the natural break falls between titles and the
+        // prose columns: summaries and bodies are both documents.
+        let doc_cols: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(DISTINCT src_table || '.' || src_column)
+                 FROM lex_values WHERE is_doc = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(doc_cols, 2, "summary and body are the prose class");
+
+        // A previously adopted cut sitting elsewhere in the same gap (no
+        // column between the two cuts): re-deriving must NOT re-adopt.
+        let jitter = current - 0.05;
+        db.conn()
+            .execute(
+                "UPDATE derivations SET value_json =
+                     json_set(value_json, '$.adopted.cut', ?1)
+                 WHERE artifact = 'doc_cut'",
+                [jitter],
+            )
+            .unwrap();
+        profile_columns(&db).unwrap();
+        let (current2, adopted2) = cuts(&db);
+        assert_eq!(current2, current, "the cut re-derives freely");
+        assert_eq!(adopted2, jitter, "same document-ness: adoption is skipped");
+
+        // A previously adopted cut ABOVE the summary column's median: under
+        // it summaries are values, under the fresh cut they are documents —
+        // document-ness changes, so the fresh cut IS adopted, and the
+        // flipped column's embed items are reset for re-enqueue.
+        let summary_log = {
+            let m: f64 = db
+                .conn()
+                .query_row(
+                    "SELECT median_len FROM lex_columns WHERE src_column = 'summary'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (1.0 + m).ln()
+        };
+        assert!(summary_log > current, "fixture: summaries sit above the cut");
+        db.conn()
+            .execute(
+                "UPDATE derivations SET value_json =
+                     json_set(value_json, '$.adopted.cut', ?1)
+                 WHERE artifact = 'doc_cut'",
+                [summary_log + 0.1],
+            )
+            .unwrap();
+        // Make the store consistent with that pretended past: summaries
+        // stamped as values, with a (card) queue item and its vector state.
+        db.conn()
+            .execute_batch(
+                "UPDATE lex_values SET is_doc = 0 WHERE src_column = 'summary';
+                 INSERT INTO embed_queue (src_table, src_column, src_rowid, serialized, status)
+                 VALUES ('notes', 'summary', 1, 'notes · summary · …', 'done');",
+            )
+            .unwrap();
+        profile_columns(&db).unwrap();
+        let (current3, adopted3) = cuts(&db);
+        assert_eq!(current3, current);
+        assert_eq!(adopted3, current, "document-ness changed: adoption happens");
+        let (stamped, leftover): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM lex_values
+                         WHERE src_column = 'summary' AND is_doc = 0),
+                        (SELECT count(*) FROM embed_queue WHERE src_column = 'summary')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stamped, 0, "summaries re-stamped as documents");
+        assert_eq!(leftover, 0, "the flipped column's items were reset");
     }
 
     #[test]

@@ -450,30 +450,34 @@ content the term recurs in:
 ```sql
 SELECT v.src_table, v.src_column, count(*) AS n
 FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
-JOIN lex_columns lc ON lc.src_table = v.src_table
-                   AND lc.src_column = v.src_column
-WHERE lex_fts MATCH '"<term>"' AND v.is_doc = 0 AND lc.kind = 'text'
+JOIN kg_vocab_cols vc ON vc.src_table = v.src_table
+                     AND vc.src_column = v.src_column
+WHERE lex_fts MATCH '"<term>"' AND v.is_doc = 0
 GROUP BY v.src_table, v.src_column
 HAVING n >= 2                 -- MIN_AFFINITY_MATCHES
 ORDER BY n DESC LIMIT 4       -- TOP_AFFINITY_COLUMNS
 ```
 
+`kg_vocab_cols` is a temp table holding the columns
+`stemma_ingest::vocabulary_columns` admits — the vocabulary predicate over
+the [column measurements](02-data-model.md#lex_columns--column-measurements),
+evaluated in the crate that owns it and materialized for the probe to join.
 The survivors become `col_affinity` edges from the term node to the
 already-existing `column:{table}.{column}` nodes, labelled `×{n}` with
 `{"method": "profiled", "count": n}`.
 
 Two deliberate choices:
 
-- **Only value cells in `text`-kind columns count** (`is_doc = 0`, plus the
-  [column typology](02-data-model.md#lex_columns--column-typology)). A term
+- **Only value cells in vocabulary columns count** (`is_doc = 0`, plus the
+  predicate). A term
   trivially "co-occurs" with the document column it was mined from, and the
   consumer of these edges — resolution's context-coherence stage
   ([03-resolution.md](03-resolution.md#stage-6a--context-coherence-over-termcolumn-affinity)),
   which disambiguates *value* interpretations — could never use a
   document-column edge. Letting the mined-from column fill the top-4 slots
-  would spend the whole budget on edges nothing consumes. The typology
+  would spend the whole budget on edges nothing consumes. The vocabulary
   restriction is the same argument one level up: no mention of a term ever
-  resolves to a timestamp, key or code value, so affinity into those
+  resolves to a timestamp, key or id-shaped value, so affinity into those
   columns is budget spent on edges nothing can use.
 - **The floor is recurrence, not a score** — `MIN_AFFINITY_MATCHES = 2`,
   the same discipline as `MIN_VALUE_COUNT`: one co-occurrence is
@@ -518,13 +522,16 @@ maintenance model is fingerprint-driven dirty tracking.
 ### The fingerprint
 
 ```rust
-SELECT count(*), coalesce(max(rowid),0), coalesce(sum(rowid),0) FROM src."{table}"
-// → "kg3:{n}:{mx}:{sum}"
+db.src_table_fingerprint(table)?   // "{count}:{max_rowid}:{sum_rowid}"
+// kg wraps it: "kg4:{n}:{mx}:{sum}"
 ```
 
 Three aggregates over the rowid column, no text hashing: O(n) with a tiny
 constant, and computable by index scan. It catches inserts, deletes, and
-rowid churn — every structural change to a table's row set.
+rowid churn — every structural change to a table's row set. The triple is
+computed by `StemmaDb::src_table_fingerprint`, shared with the lexical
+index's [refresh receipts](02-data-model.md#the-refresh-discipline), so both
+derivers agree on what "changed" means.
 
 **What it misses**, stated in the code and worth repeating: an in-place
 `UPDATE` that changes text while preserving count, max rowid and rowid sum is
@@ -533,14 +540,16 @@ escape hatch. A content hash would close the gap at the cost of reading every
 byte of every table on every startup, which for the 789 MB legal corpus is
 the difference between a fast start and a slow one.
 
-**The `kg3:` prefix versions the compiler, not the data.** Bump it and every
+**The `kg4:` prefix versions the compiler, not the data.** Bump it and every
 stored fingerprint mismatches, so every table recompiles on the next run —
 which is exactly what an improvement to term selection or join mining
-requires — the bump from `kg2` to `kg3` when the term→column affinity pass
-landed is exactly this mechanism in action: every existing store gains the
-new edges on its next compile. Algorithm upgrades therefore need no
-migration, no store version bump, and no user action. This is the mechanism that keeps the knowledge
-graph safe to keep changing.
+requires. The bump from `kg2` to `kg3` when the term→column affinity pass
+landed, and from `kg3` to `kg4` when affinity candidacy moved from the kind
+ladder to the vocabulary predicate, are exactly this mechanism in action:
+every existing store gains the corrected edges on its next compile.
+Algorithm upgrades therefore need no migration, no store version bump, and
+no user action. This is the mechanism that keeps the knowledge graph safe to
+keep changing.
 
 ### The recompilation unit
 

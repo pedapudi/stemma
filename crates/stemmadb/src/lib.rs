@@ -16,7 +16,7 @@ use rusqlite::Connection;
 pub use rusqlite;
 
 /// Schema version of the .stemmadb store, kept in `PRAGMA user_version`.
-pub const STORE_SCHEMA_VERSION: i32 = 4;
+pub const STORE_SCHEMA_VERSION: i32 = 5;
 
 /// Name under which the user database is attached.
 pub const SRC_SCHEMA: &str = "src";
@@ -134,6 +134,25 @@ impl StemmaDb {
                      ALTER TABLE query_log ADD COLUMN session TEXT NOT NULL DEFAULT '';",
                 )?;
             }
+            // v5: per-item content hashes so a changed source row re-embeds
+            // without a rebuild. Additive, so it follows the guarded-ALTER
+            // pattern: SCHEMA_SQL creates the column on fresh stores, the
+            // ALTER runs exactly when a v4-shaped queue exists without it.
+            let missing_hash: i64 = self
+                .conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM sqlite_master WHERE name = 'embed_queue')
+                            AND NOT (SELECT count(*) FROM pragma_table_info('embed_queue')
+                                     WHERE name = 'content_hash')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if missing_hash != 0 {
+                self.conn.execute_batch(
+                    "ALTER TABLE embed_queue ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
             self.conn
                 .pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
         }
@@ -210,6 +229,26 @@ impl StemmaDb {
         Ok(n > 0)
     }
 
+    /// Content fingerprint of one user table: `"{count}:{max_rowid}:{sum_rowid}"`.
+    /// Cheap to compute (no text hashing, one aggregate scan), catches
+    /// inserts, deletes and rowid churn; in-place updates that preserve all
+    /// three are missed — acceptable for derived state a forced rebuild can
+    /// always repair. Every deriver of per-table state (lexical index,
+    /// knowledge compiler) compares against this same triple, prefixed with
+    /// its own algorithm-version tag so an algorithm upgrade invalidates its
+    /// receipts without touching anyone else's.
+    pub fn src_table_fingerprint(&self, table: &str) -> Result<String> {
+        let (n, mx, sum): (i64, i64, i64) = self.conn.query_row(
+            &format!(
+                "SELECT count(*), coalesce(max(rowid),0), coalesce(sum(rowid),0) \
+                 FROM {SRC_SCHEMA}.\"{table}\""
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(format!("{n}:{mx}:{sum}"))
+    }
+
     /// Tables of the attached user database (excluding SQLite internals).
     pub fn src_tables(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -254,12 +293,17 @@ CREATE TABLE IF NOT EXISTS model_registry (
 -- already stored once). Status is pending → done | failed, with `attempts`
 -- bounding retries and `error` recording why a failed item failed; counts
 -- per status are one GROUP BY away.
+-- `content_hash` (v5) fingerprints the exact text the item was enqueued to
+-- embed; the enqueue passes compare it to detect a changed source row and
+-- reset the item to pending, which is how re-embedding on data change works
+-- without any rebuild.
 CREATE TABLE IF NOT EXISTS embed_queue (
     id           INTEGER PRIMARY KEY,
     src_table    TEXT NOT NULL,
     src_column   TEXT NOT NULL,
     src_rowid    INTEGER NOT NULL,
     serialized   TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
     status       TEXT NOT NULL DEFAULT 'pending',
     attempts     INTEGER NOT NULL DEFAULT 0,
     error        TEXT NOT NULL DEFAULT '',
@@ -473,7 +517,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, STORE_SCHEMA_VERSION);
-        for col in ["src_column", "status", "attempts", "error"] {
+        for col in ["src_column", "status", "attempts", "error", "content_hash"] {
             let n: i64 = db
                 .conn()
                 .query_row(
@@ -485,6 +529,80 @@ mod tests {
             assert_eq!(n, 1, "missing embed_queue column {col}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_v4_queue_by_adding_content_hash() {
+        let dir = std::env::temp_dir().join(format!("stemmadb-migrate5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        Connection::open(&user).unwrap();
+        {
+            // A v4 store: the queue has status tracking but no content_hash,
+            // and holds a done item whose row must survive the upgrade.
+            let c = Connection::open(&store).unwrap();
+            c.execute_batch(
+                "CREATE TABLE embed_queue (
+                     id INTEGER PRIMARY KEY,
+                     src_table TEXT NOT NULL,
+                     src_column TEXT NOT NULL,
+                     src_rowid INTEGER NOT NULL,
+                     serialized TEXT NOT NULL DEFAULT '',
+                     status TEXT NOT NULL DEFAULT 'pending',
+                     attempts INTEGER NOT NULL DEFAULT 0,
+                     error TEXT NOT NULL DEFAULT '',
+                     enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     UNIQUE (src_table, src_column, src_rowid)
+                 ) STRICT;
+                 INSERT INTO embed_queue (src_table, src_column, src_rowid, status)
+                 VALUES ('articles', 'body', 1, 'done');
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        let (status, hash): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, content_hash FROM embed_queue WHERE src_rowid = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done", "additive migration keeps queue state");
+        assert_eq!(hash, "", "pre-v5 items carry the unknown-content default");
+        let v: i32 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, STORE_SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn src_table_fingerprint_tracks_content_changes() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.t(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO src.t VALUES (1, 'a'), (2, 'b');",
+            )
+            .unwrap();
+        let a = db.src_table_fingerprint("t").unwrap();
+        assert_eq!(a, "2:2:3");
+        db.conn()
+            .execute("INSERT INTO src.t VALUES (3, 'c')", [])
+            .unwrap();
+        let b = db.src_table_fingerprint("t").unwrap();
+        assert_ne!(a, b, "inserts move the fingerprint");
+        db.conn()
+            .execute("DELETE FROM src.t WHERE id = 3", [])
+            .unwrap();
+        assert_eq!(db.src_table_fingerprint("t").unwrap(), a);
     }
 
     #[test]

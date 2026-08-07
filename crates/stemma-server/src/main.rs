@@ -235,32 +235,95 @@ impl ResolveService for Resolver {
     }
 }
 
-/// Enqueues missing embeddings for one database and drains them on its own
-/// store connection, documents strictly before interpretation cards:
-/// enqueue docs → drain to empty → enqueue interps → drain to empty. The
-/// document sweep is small (the corpus's long cells) while the card sweep
-/// can be large, so this ordering lights the dense document channel in
-/// seconds instead of after the full interpretation pass. The drain routes
-/// each item by kind: documents into vec_dense, cards into vec_interp.
-fn drain_task(
+
+/// Cadence of the cheap change probe: every this-many seconds the
+/// background task reads `PRAGMA src.data_version` — a counter SQLite bumps
+/// when *another* connection commits to the user database — and only a
+/// changed counter triggers the (fingerprint-guarded) refresh. An
+/// operational polling interval, not a data-derived quantity: it trades
+/// staleness for probe cost, and the probe is one pragma read.
+const REFRESH_POLL_SECS: u64 = 60;
+
+/// The steady-state background task for one database: run the embed pass
+/// once at startup (when an embedder is configured), then watch the user
+/// database for change. `PRAGMA src.data_version` is the cheap global
+/// signal; when it moves, the registration path re-runs — the lexical
+/// index's receipts re-ingest exactly the changed tables, the knowledge
+/// compiler's fingerprints recompile exactly the changed tables, and the
+/// embed queue's content hashes re-embed exactly the changed rows. No
+/// filesystem watcher, no restart.
+fn background_task(
     name: &str,
     user_db: &std::path::Path,
-    endpoint: &str,
-    model: &str,
-    query_template: Option<String>,
+    embed: Option<(String, String, Option<String>)>,
 ) {
     let store = user_db.with_extension("stemmadb");
     let db = match StemmaDb::open(&store, user_db) {
         Ok(db) => db,
         Err(e) => {
-            tracing::warn!(name, error = %e, "embed drain: opening store failed");
+            tracing::warn!(name, error = %e, "background task: opening store failed");
             return;
         }
     };
-    let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model, query_template);
+    let embedder = embed
+        .as_ref()
+        .map(|(ep, model, template)| {
+            stemma_embed::OpenAiEmbedder::new(ep, model, template.clone())
+        });
+    if let Some(embedder) = &embedder {
+        embed_pass(name, &db, embedder);
+    }
 
+    let data_version = |db: &StemmaDb| -> i64 {
+        db.conn()
+            .query_row("PRAGMA src.data_version", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let mut last = data_version(&db);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(REFRESH_POLL_SECS));
+        let seen = data_version(&db);
+        if seen == last {
+            continue;
+        }
+        last = seen;
+        tracing::info!(name, "user database changed; refreshing derived state");
+        match stemma_ingest::build_lexical_index(&db, false) {
+            Ok(stats) => tracing::info!(
+                name,
+                reingested_tables = stats.reingested_tables,
+                values = stats.values,
+                "refresh: lexical index"
+            ),
+            Err(e) => {
+                tracing::warn!(name, error = %e, "refresh: lexical index failed");
+                continue;
+            }
+        }
+        match stemma_kg::compile(&db, false) {
+            Ok(kg) => tracing::info!(
+                name,
+                recompiled_tables = kg.recompiled_tables,
+                "refresh: knowledge graph"
+            ),
+            Err(e) => tracing::warn!(name, error = %e, "refresh: kg compile failed"),
+        }
+        if let Some(embedder) = &embedder {
+            embed_pass(name, &db, embedder);
+        }
+    }
+}
+
+/// Enqueues embedding work for one database and drains it, documents
+/// strictly before interpretation cards: enqueue docs → drain to empty →
+/// enqueue interps → drain to empty. The document sweep is small (the
+/// corpus's long cells) while the card sweep can be large, so this ordering
+/// lights the dense document channel in seconds instead of after the full
+/// interpretation pass. The drain routes each item by kind: documents into
+/// vec_dense, cards into vec_interp.
+fn embed_pass(name: &str, db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) {
     let start = std::time::Instant::now();
-    let queued_docs = match stemma_ingest::enqueue_missing_embeddings(&db) {
+    let queued_docs = match stemma_ingest::enqueue_missing_embeddings(db) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(name, error = %e, "embed drain: document enqueue failed");
@@ -273,13 +336,13 @@ fn drain_task(
         elapsed_ms = start.elapsed().as_millis() as u64,
         "embed drain: documents enqueued"
     );
-    log_dense_building(name, &db);
-    if !drain_to_empty(name, &db, &embedder, "documents") {
+    log_dense_building(name, db);
+    if !drain_to_empty(name, db, embedder, "documents") {
         return;
     }
 
     let start = std::time::Instant::now();
-    let queued_interps = match stemma_ingest::enqueue_missing_interpretations(&db) {
+    let queued_interps = match stemma_ingest::enqueue_missing_interpretations(db) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(name, error = %e, "embed drain: interpretation enqueue failed");
@@ -292,8 +355,8 @@ fn drain_task(
         elapsed_ms = start.elapsed().as_millis() as u64,
         "embed drain: interpretations enqueued"
     );
-    log_dense_building(name, &db);
-    drain_to_empty(name, &db, &embedder, "interpretations");
+    log_dense_building(name, db);
+    drain_to_empty(name, db, embedder, "interpretations");
 }
 
 /// One line distinguishing "dense index still building" from "no
@@ -426,18 +489,19 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    // Index-time embedding: with an embedder configured, each database gets a
-    // background task that enqueues its unembedded documents and drains the
-    // queue until empty, then exits — no polling loop. The store is WAL, so
-    // the task opens its own connection and serving is never blocked; a
-    // drain failure degrades the dense channel, never the server.
-    if let (Some(ep), Some(model)) = (&args.embed_endpoint, &args.embed_model) {
-        for (name, user_db) in &args.dbs {
-            let (name, user_db) = (name.clone(), user_db.clone());
-            let (ep, model) = (ep.clone(), model.clone());
-            let template = embed_template.clone();
-            tokio::task::spawn_blocking(move || drain_task(&name, &user_db, &ep, &model, template));
-        }
+
+    // Each database gets a background task on its own store connection: an
+    // initial embed pass (when an embedder is configured), then the
+    // data_version watch that keeps derived state fresh without a restart.
+    // The store is WAL, so serving is never blocked; a background failure
+    // degrades the dense channel or freshness, never the server.
+    let embed = match (&args.embed_endpoint, &args.embed_model) {
+        (Some(ep), Some(model)) => Some((ep.clone(), model.clone(), embed_template.clone())),
+        _ => None,
+    };
+    for (name, user_db) in &args.dbs {
+        let (name, user_db, embed) = (name.clone(), user_db.clone(), embed.clone());
+        tokio::task::spawn_blocking(move || background_task(&name, &user_db, embed));
     }
 
     tracing::info!(listen = %listen, "stemma-server starting");
