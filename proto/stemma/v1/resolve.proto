@@ -92,6 +92,10 @@ message TraceSpan {
   // The span's text matches a knowledge-graph phrase/term entity — mention
   // detection used the KG, and selection favored this span.
   bool kg_alias = 7;
+  // The escalation (context coherence, encoder affinity, adjudication)
+  // ended with distinct readings still tied: the honest resolution is a
+  // question, and consumers should ask rather than pick.
+  bool ambiguous = 8;
 }
 
 message ResolveRequest {
@@ -139,6 +143,23 @@ message Mention {
   // True when the pipeline affirmatively concluded no record matches
   // (distinct from "no candidates found").
   bool nil = 5;
+  // Distinct readings remain tied after every disambiguation stage; the
+  // caller should present `readings` and ask, not guess.
+  bool ambiguous = 6;
+  // The tied readings, one per interpretation, when `ambiguous` is set.
+  repeated Reading readings = 7;
+}
+
+// One reading of an ambiguous mention: an interpretation, summarized for
+// asking the user which they meant.
+message Reading {
+  string table = 1;
+  string column = 2;
+  string value = 3;
+  // How many rows share this reading ("40 brands named Ellis").
+  uint32 row_count = 4;
+  // Representative rowid for citation.
+  int64 rowid = 5;
 }
 
 // One concrete record (or schema element) a mention may resolve to.

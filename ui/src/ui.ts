@@ -33,6 +33,9 @@ interface TraceCandidate {
   /* verified join path to a co-mention's candidate, e.g.
      "people #2 ←lead_id— teams #43" */
   coherence?: string;
+  /* rows sharing this interpretation ("40 brands named Ellis") */
+  row_count?: number;
+  sample_rowids?: (number | string)[];
 }
 
 interface TraceSpan {
@@ -43,6 +46,8 @@ interface TraceSpan {
   status: string;
   candidates: TraceCandidate[];
   kg_alias: boolean;
+  /* distinct readings tied after every disambiguation stage: ask, don't guess */
+  ambiguous?: boolean;
 }
 
 interface Trace {
@@ -847,7 +852,38 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
     emitPlain(cursor, sp.start);
     const top = sp.candidates.find((c) => c.selected);
     let chip: HTMLElement;
-    if (top) {
+    if (sp.ambiguous) {
+      // the fork: distinct readings tied — show them stacked, ask which
+      const readings = sp.candidates.filter((c) => c.selected);
+      const seen = new Set<string>();
+      const distinct = readings.filter((c) => {
+        const k = `${c.table}.${c.column}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      }).slice(0, 3);
+      chip = el("span", { class: "sub-fork" },
+        el("span", { class: "sub-fork-q", title: "distinct readings tie — which did you mean?" }, "?"),
+        el("span", { class: "sub-fork-set" },
+          distinct.map((c) => {
+            const b = el("button", {
+              class: "sub-chip sub-fork-chip",
+              title: `${c.table}.${c.column} #${c.rowid}`,
+              onclick: (e: Event) => {
+                e.stopPropagation();
+                showCard(sp, c);
+              },
+            },
+              tablesSeen.length > 1
+                ? el("i", { class: "chip-dot", style: `background:${hueOf(c.table)}` })
+                : null,
+              `${c.table}.${c.column}`,
+              c.row_count && Number(c.row_count) > 1
+                ? el("i", { class: "fork-count" }, ` ×${c.row_count}`) : null);
+            hov(b, hovCandidate(c));
+            return b;
+          })));
+    } else if (top) {
       const label = top.is_doc
         ? `${top.table} #${top.rowid}`
         : `\u201c${top.value.length > 28 ? top.value.slice(0, 28) + "\u2026" : top.value}\u201d`;
@@ -1159,6 +1195,31 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
   function verdict(sp: TraceSpan): HTMLElement {
     const w = sp.candidates.find((c) => c.selected) ?? sp.candidates[0];
     const box = el("div", { class: "why" });
+    if (sp.ambiguous) {
+      const readings = sp.candidates.filter((c) => c.selected).slice(0, 4);
+      box.append(el("div", { class: "why-head" },
+        el("span", { class: "sf-mention" }, sp.text),
+        el("span", { class: "why-arrow" }, "→"),
+        el("span", { class: "pill caution" }, "ambiguous")));
+      box.append(el("div", { class: "why-line" },
+        el("span", { class: "why-k" }, "undecided"),
+        el("span", null,
+          "distinct readings tie — context, cards and the adjudicator could not separate them; ask which is meant")));
+      for (const c of readings) {
+        const row = el("div", { class: "why-line" },
+          el("span", { class: "why-k" }, "reading"),
+          el("button", {
+            class: "why-ref mono", style: `color:${hueOf(c.table)}`,
+            onclick: () => showCard(sp, c),
+          }, `${c.table}.${c.column} #${c.rowid}`),
+          el("span", { class: "why-soft mono" },
+            ` “${c.value.slice(0, 40)}”` +
+            (c.row_count && Number(c.row_count) > 1 ? ` · ×${c.row_count}` : "")));
+        hov(row, hovCandidate(c));
+        box.append(row);
+      }
+      return box;
+    }
     if (!w) {
       box.append(el("div", { class: "why-head" },
         el("span", { class: "sf-mention" }, sp.text),

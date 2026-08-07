@@ -985,3 +985,15 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .gnode.path-hood .gdot, .kg-tablebox.path-hood { stroke: var(--accent); border-color: var(--accent); }
 
 .brand-dot { color: var(--brand-accent); }
+
+/* ---- the ambiguity fork: readings tie, ask which ---- */
+.sub-fork { display: inline-flex; align-items: center; gap: 5px; vertical-align: middle; }
+.sub-fork-q {
+  font-family: var(--mono); font-weight: 700; font-size: calc(11px * var(--fs));
+  color: var(--caution); border: 1px dashed var(--caution); border-radius: 50%;
+  width: 17px; height: 17px; display: inline-flex; align-items: center; justify-content: center;
+}
+.sub-fork-set { display: inline-flex; flex-direction: column; gap: 2px; }
+.sub-fork-chip { margin: 0; }
+.fork-count { font-style: normal; opacity: .65; }
+.pill.caution { color: var(--caution); border-color: var(--caution); background: color-mix(in srgb, var(--caution) 10%, transparent); }

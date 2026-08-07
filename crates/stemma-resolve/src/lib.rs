@@ -176,6 +176,10 @@ pub struct Span {
     /// The span matches a knowledge-graph phrase/term entity: the KG
     /// participated in mention detection, and selection favors this span.
     pub kg_alias: bool,
+    /// Distinct readings remained tied after every disambiguation stage —
+    /// context coherence, encoder affinity, adjudication. The honest
+    /// resolution is a question; consumers should ask, not guess.
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +250,7 @@ pub fn resolve_full(
             status: "selected".into(),
             candidates: Vec::new(),
             kg_alias: false,
+            ambiguous: false,
         });
     }
 
@@ -360,7 +365,37 @@ pub fn resolve_full(
         adjudicate(&mut trace, lm);
         trace.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
+    mark_ambiguous(&mut trace);
     Ok(trace)
+}
+
+/// The end of the escalation: after context coherence, encoder affinity and
+/// (when permitted) adjudication have all had their turn, a mention whose
+/// top readings are still tied across DISTINCT interpretations is marked
+/// `ambiguous` — the resolution's honest answer is a question. A span the
+/// adjudicator settled (top candidate `adjudicated`) or already marked is
+/// left alone; same-interpretation ties (two rows of one reading) are not
+/// ambiguity, they are the same answer.
+fn mark_ambiguous(trace: &mut Trace) {
+    for &sid in &trace.mentions {
+        let span = &mut trace.spans[sid];
+        if span.ambiguous {
+            continue;
+        }
+        if !is_ambiguous(span) {
+            continue;
+        }
+        let mut selected = span.candidates.iter().filter(|c| c.selected);
+        let (Some(top), Some(second)) = (selected.next(), selected.next()) else {
+            continue;
+        };
+        if top.adjudicated {
+            continue;
+        }
+        if top.table != second.table || top.column != second.column {
+            span.ambiguous = true;
+        }
+    }
 }
 
 /// The constrained-adjudication band: for each mention whose top candidates
@@ -404,6 +439,7 @@ fn adjudicate(trace: &mut Trace, lm: &dyn stemma_lm::LmBackend) {
                 span.candidates.insert(0, chosen);
             }
             Some(Verdict::Nil) => span.status = "weak".into(),
+            Some(Verdict::Ambiguous) => span.ambiguous = true,
             None => {
                 tracing::warn!(span = %span.text, "adjudication reply unusable; ignored");
             }
@@ -416,9 +452,12 @@ fn adjudicate(trace: &mut Trace, lm: &dyn stemma_lm::LmBackend) {
     );
 }
 
-/// The ambiguous band: two or more selected candidates, the top two within
-/// [`ADJUDICATION_MARGIN`], and no exact-channel winner — an exact match is
-/// definitionally right about the value and does not need a model's opinion.
+/// The ambiguous band: two or more selected candidates with the top two
+/// within [`ADJUDICATION_MARGIN`]. An exact-channel winner normally exits
+/// the band — an exact match is definitionally right about the value — with
+/// one exception: when BOTH top candidates are exact matches of DISTINCT
+/// interpretations (the same string in two columns), exactness settles
+/// nothing and the tie is the canonical ambiguity (issue #1's Ellis case).
 fn is_ambiguous(span: &Span) -> bool {
     if span.status != "selected" {
         return false;
@@ -427,13 +466,20 @@ fn is_ambiguous(span: &Span) -> bool {
     let (Some(top), Some(second)) = (selected.next(), selected.next()) else {
         return false;
     };
-    top.score - second.score < ADJUDICATION_MARGIN
-        && !top.channels.iter().any(|ch| ch.channel == "exact")
+    if top.score - second.score >= ADJUDICATION_MARGIN {
+        return false;
+    }
+    let exact = |c: &Candidate| c.channels.iter().any(|ch| ch.channel == "exact");
+    let distinct = top.table != second.table || top.column != second.column;
+    !exact(top) || (exact(second) && distinct)
 }
 
 enum Verdict {
     Choice(usize),
     Nil,
+    /// More than one presented reading genuinely fits the query — distinct
+    /// from Nil (none fit). Routes to the ask-back path.
+    Ambiguous,
 }
 
 /// Terse, deterministic prompt: the mention in its query, each presented
@@ -450,8 +496,15 @@ fn adjudication_prompt(
         let c = &span.candidates[ci];
         let shown = c.snippet.as_deref().unwrap_or(&c.value);
         let channels: Vec<&str> = c.channels.iter().map(|ch| ch.channel.as_str()).collect();
+        let mut extras = String::new();
+        if c.row_count > 1 {
+            extras.push_str(&format!(" · {} rows share this value", c.row_count));
+        }
+        if let Some(path) = &c.coherence {
+            extras.push_str(&format!(" · verified path: {path}"));
+        }
         listing.push_str(&format!(
-            "{i}. {}.{} #{} — {:?} (channels: {})\n",
+            "{i}. {}.{} #{} — {:?} (channels: {}{extras})\n",
             c.table,
             c.column,
             c.rowid,
@@ -461,6 +514,7 @@ fn adjudication_prompt(
     }
     let mut options: Vec<String> = (0..presented.len()).map(|i| i.to_string()).collect();
     options.push("nil".into());
+    options.push("ambiguous".into());
     let schema = serde_json::json!({
         "type": "object",
         "properties": { "choice": { "enum": options } },
@@ -470,7 +524,8 @@ fn adjudication_prompt(
     let messages = vec![
         stemma_lm::ChatMessage::system(
             "You disambiguate references to database records. Pick the candidate \
-             record the mention refers to in this query, or nil if none fits.",
+             record the mention refers to in this query; answer nil if none \
+             fits, or ambiguous if the query genuinely supports more than one.",
         ),
         stemma_lm::ChatMessage::user(format!(
             "Query: {query}\nMention: {:?}\nCandidates:\n{listing}",
@@ -487,6 +542,9 @@ fn parse_verdict(reply: &str, presented: usize) -> Option<Verdict> {
     let choice = v.get("choice")?;
     if choice.as_str() == Some("nil") {
         return Some(Verdict::Nil);
+    }
+    if choice.as_str() == Some("ambiguous") {
+        return Some(Verdict::Ambiguous);
     }
     let i = match choice {
         serde_json::Value::String(s) => s.parse::<usize>().ok()?,
@@ -548,6 +606,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
                 status: status.into(),
                 candidates: Vec::new(),
                 kg_alias: false,
+                ambiguous: false,
             });
         }
     }
@@ -1625,6 +1684,29 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                 // can only mean the adjudication band answered NIL — the
                 // affirmative no-record-matches conclusion.
                 nil: s.status == "weak",
+                ambiguous: s.ambiguous,
+                readings: if s.ambiguous {
+                    let top_score = s
+                        .candidates
+                        .iter()
+                        .find(|c| c.selected)
+                        .map(|c| c.score)
+                        .unwrap_or(0.0);
+                    s.candidates
+                        .iter()
+                        .filter(|c| c.selected && top_score - c.score < ADJUDICATION_MARGIN)
+                        .take(4)
+                        .map(|c| pb::Reading {
+                            table: c.table.clone(),
+                            column: c.column.clone(),
+                            value: c.value.clone(),
+                            row_count: c.row_count,
+                            rowid: c.rowid,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 candidates: s
                     .candidates
                     .iter()
@@ -1683,6 +1765,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
             .iter()
             .map(|s| pb::TraceSpan {
                 kg_alias: s.kg_alias,
+                ambiguous: s.ambiguous,
                 id: s.id as u32,
                 text: s.text.clone(),
                 start: s.start as u32,
@@ -2330,10 +2413,90 @@ mod tests {
                     cand(2, "beta", 0.55, &["trigram"]),
                 ],
                 kg_alias: false,
+                ambiguous: false,
             }],
             mentions: vec![0],
             elapsed_ms: 0.0,
         }
+    }
+
+    fn cand_at(table: &str, column: &str, rowid: i64, score: f64) -> Candidate {
+        let mut c = cand(rowid, "Ellis", score, &["bm25", "trigram"]);
+        c.table = table.into();
+        c.column = column.into();
+        c
+    }
+
+    /// Cross-interpretation tie, escalation exhausted: the span is marked
+    /// ambiguous — the resolution's honest answer is a question.
+    #[test]
+    fn unresolved_cross_interpretation_ties_are_marked_ambiguous() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].candidates = vec![
+            cand_at("brands", "name", 1, 0.60),
+            cand_at("people", "surname", 2, 0.58),
+        ];
+        mark_ambiguous(&mut trace);
+        assert!(trace.spans[0].ambiguous);
+    }
+
+    /// Two rows of ONE reading are the same answer, not ambiguity.
+    #[test]
+    fn same_interpretation_ties_are_not_ambiguous() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].candidates = vec![
+            cand_at("brands", "name", 1, 0.60),
+            cand_at("brands", "name", 2, 0.58),
+        ];
+        mark_ambiguous(&mut trace);
+        assert!(!trace.spans[0].ambiguous);
+    }
+
+    /// A settled adjudication is a decision; ambiguity marking respects it.
+    #[test]
+    fn adjudicated_choice_suppresses_ambiguity() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].candidates = vec![
+            cand_at("brands", "name", 1, 0.60),
+            cand_at("people", "surname", 2, 0.58),
+        ];
+        let lm = FakeLm::replying(r#"{"choice": "1"}"#);
+        adjudicate(&mut trace, &lm);
+        mark_ambiguous(&mut trace);
+        assert!(!trace.spans[0].ambiguous);
+        assert!(trace.spans[0].candidates[0].adjudicated);
+    }
+
+    /// The third verdict: the LM may answer "ambiguous", which routes to the
+    /// ask-back path without reordering anything.
+    #[test]
+    fn lm_ambiguous_verdict_marks_the_span() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].candidates = vec![
+            cand_at("brands", "name", 1, 0.60),
+            cand_at("people", "surname", 2, 0.58),
+        ];
+        let lm = FakeLm::replying(r#"{"choice": "ambiguous"}"#);
+        adjudicate(&mut trace, &lm);
+        assert!(trace.spans[0].ambiguous);
+        assert_eq!(trace.spans[0].candidates[0].rowid, 1, "order untouched");
+        mark_ambiguous(&mut trace);
+        assert!(trace.spans[0].ambiguous);
+    }
+
+    /// Issue #1's flagship: two EXACT readings of the same string. Exactness
+    /// settles nothing here — the tie routes and, unresolved, is ambiguous.
+    #[test]
+    fn exact_cross_interpretation_ties_route_and_mark() {
+        let mut trace = ambiguous_trace();
+        let mut a = cand_at("brands", "name", 1, 1.0);
+        a.channels.push(ChannelScore { channel: "exact".into(), rank: 0, raw: 1.0 });
+        let mut b = cand_at("people", "surname", 2, 1.0);
+        b.channels.push(ChannelScore { channel: "exact".into(), rank: 0, raw: 1.0 });
+        trace.spans[0].candidates = vec![a, b];
+        assert!(is_ambiguous(&trace.spans[0]), "exact-vs-exact distinct readings route");
+        mark_ambiguous(&mut trace);
+        assert!(trace.spans[0].ambiguous);
     }
 
     #[test]
@@ -2503,6 +2666,7 @@ mod tests {
             start: 0,
             end: 7,
             status: "selected".into(),
+            ambiguous: false,
             candidates: vec![
                 interp_cand("offices", "city", 1, 0.60),
                 interp_cand("products", "name", 1, 0.58),

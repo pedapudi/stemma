@@ -47,17 +47,32 @@ def _compact(trace: dict[str, Any]) -> dict[str, Any]:
     mentions = []
     for i in trace.get("mentions", []):
         s = trace["spans"][i]
-        mentions.append({
+        entry = {
             "mention": s["text"],
             "candidates": [
                 {
                     "ref": f"{c['table']}.{c['column']} #{c['rowid']}",
                     "value": (c.get("snippet") or c["value"])[:200],
                     "score": round(c["score"], 3),
+                    **({"rows_sharing_value": c["row_count"]}
+                       if c.get("row_count", 0) > 1 else {}),
                 }
                 for c in s["candidates"] if c["selected"]
             ],
-        })
+        }
+        # ambiguous: distinct readings tied after every disambiguation
+        # stage — ask the user which they meant; do not pick.
+        if s.get("ambiguous"):
+            entry["ambiguous"] = True
+            entry["readings"] = [
+                {
+                    "ref": f"{c['table']}.{c['column']} #{c['rowid']}",
+                    "value": c["value"][:80],
+                    "rows": c.get("row_count", 1),
+                }
+                for c in s["candidates"] if c["selected"]
+            ][:4]
+        mentions.append(entry)
     return {
         "mentions": mentions,
         "near_misses_considered": [

@@ -105,6 +105,11 @@ pub struct TraceSpan {
     /// detection used the KG, and selection favored this span.
     #[prost(bool, tag = "7")]
     pub kg_alias: bool,
+    /// The escalation (context coherence, encoder affinity, adjudication)
+    /// ended with distinct readings still tied: the honest resolution is a
+    /// question, and consumers should ask rather than pick.
+    #[prost(bool, tag = "8")]
+    pub ambiguous: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveRequest {
@@ -167,6 +172,30 @@ pub struct Mention {
     /// (distinct from "no candidates found").
     #[prost(bool, tag = "5")]
     pub nil: bool,
+    /// Distinct readings remain tied after every disambiguation stage; the
+    /// caller should present `readings` and ask, not guess.
+    #[prost(bool, tag = "6")]
+    pub ambiguous: bool,
+    /// The tied readings, one per interpretation, when `ambiguous` is set.
+    #[prost(message, repeated, tag = "7")]
+    pub readings: ::prost::alloc::vec::Vec<Reading>,
+}
+/// One reading of an ambiguous mention: an interpretation, summarized for
+/// asking the user which they meant.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Reading {
+    #[prost(string, tag = "1")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub column: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub value: ::prost::alloc::string::String,
+    /// How many rows share this reading ("40 brands named Ellis").
+    #[prost(uint32, tag = "4")]
+    pub row_count: u32,
+    /// Representative rowid for citation.
+    #[prost(int64, tag = "5")]
+    pub rowid: i64,
 }
 /// One concrete record (or schema element) a mention may resolve to.
 #[derive(Clone, PartialEq, ::prost::Message)]

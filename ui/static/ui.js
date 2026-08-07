@@ -974,7 +974,40 @@ function renderTrace(out, trace) {
     emitPlain(cursor, sp.start);
     const top = sp.candidates.find((c) => c.selected);
     let chip;
-    if (top) {
+    if (sp.ambiguous) {
+      const readings = sp.candidates.filter((c) => c.selected);
+      const seen = /* @__PURE__ */ new Set();
+      const distinct = readings.filter((c) => {
+        const k = `${c.table}.${c.column}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      }).slice(0, 3);
+      chip = el("span", {
+        class: "sub-fork"
+      }, el("span", {
+        class: "sub-fork-q",
+        title: "distinct readings tie \u2014 which did you mean?"
+      }, "?"), el("span", {
+        class: "sub-fork-set"
+      }, distinct.map((c) => {
+        const b = el("button", {
+          class: "sub-chip sub-fork-chip",
+          title: `${c.table}.${c.column} #${c.rowid}`,
+          onclick: (e) => {
+            e.stopPropagation();
+            showCard(sp, c);
+          }
+        }, tablesSeen.length > 1 ? el("i", {
+          class: "chip-dot",
+          style: `background:${hueOf(c.table)}`
+        }) : null, `${c.table}.${c.column}`, c.row_count && Number(c.row_count) > 1 ? el("i", {
+          class: "fork-count"
+        }, ` \xD7${c.row_count}`) : null);
+        hov(b, hovCandidate(c));
+        return b;
+      })));
+    } else if (top) {
       const label = top.is_doc ? `${top.table} #${top.rowid}` : `\u201C${top.value.length > 28 ? top.value.slice(0, 28) + "\u2026" : top.value}\u201D`;
       chip = el("button", {
         class: "sub-chip",
@@ -1349,6 +1382,39 @@ function renderTrace(out, trace) {
     const box = el("div", {
       class: "why"
     });
+    if (sp.ambiguous) {
+      const readings = sp.candidates.filter((c) => c.selected).slice(0, 4);
+      box.append(el("div", {
+        class: "why-head"
+      }, el("span", {
+        class: "sf-mention"
+      }, sp.text), el("span", {
+        class: "why-arrow"
+      }, "\u2192"), el("span", {
+        class: "pill caution"
+      }, "ambiguous")));
+      box.append(el("div", {
+        class: "why-line"
+      }, el("span", {
+        class: "why-k"
+      }, "undecided"), el("span", null, "distinct readings tie \u2014 context, cards and the adjudicator could not separate them; ask which is meant")));
+      for (const c of readings) {
+        const row = el("div", {
+          class: "why-line"
+        }, el("span", {
+          class: "why-k"
+        }, "reading"), el("button", {
+          class: "why-ref mono",
+          style: `color:${hueOf(c.table)}`,
+          onclick: () => showCard(sp, c)
+        }, `${c.table}.${c.column} #${c.rowid}`), el("span", {
+          class: "why-soft mono"
+        }, ` \u201C${c.value.slice(0, 40)}\u201D` + (c.row_count && Number(c.row_count) > 1 ? ` \xB7 \xD7${c.row_count}` : "")));
+        hov(row, hovCandidate(c));
+        box.append(row);
+      }
+      return box;
+    }
     if (!w) {
       box.append(el("div", {
         class: "why-head"
