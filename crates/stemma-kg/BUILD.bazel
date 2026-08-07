@@ -6,6 +6,7 @@ rust_library(
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/stemma-ingest",
         "//crates/stemmadb",
         "@crates//:thiserror",
         "@crates//:tracing",
@@ -16,5 +17,4 @@ rust_test(
     name = "stemma-kg_test",
     crate = ":stemma-kg",
     compile_data = ["//eval/testdata:mini.sql"],
-    deps = ["//crates/stemma-ingest"],
 )

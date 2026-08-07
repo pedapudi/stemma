@@ -15,9 +15,11 @@ mechanics of the built parts are specified in
 [02-data-model.md](02-data-model.md#vec_staging-and-vec_dense) and
 [03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted);
 this document gives the *why*, and everything it describes beyond those
-mechanics — online blue-green swaps, re-embedding on data change,
+mechanics — online blue-green swaps,
 cross-encoder reranking, mention expansion, and the `Adjudication` evidence
-record — is **designed, not built**.
+record — is **designed, not built**. (Re-embedding on data change *is*
+built: the content-hashed queue plus the server's refresh watch,
+[02-data-model.md](02-data-model.md#the-refresh-discipline).)
 
 The design rests on one division of labour, and this document argues it,
 specifies both halves, and then addresses the failure mode that decides
@@ -165,9 +167,9 @@ semantic similarity, and it is invisible unless the identity is recorded.
 **As built: documents plus interpretation cards.** The queue path embeds two
 kinds of item, and keeps them in two vector tables.
 
-*Documents, raw, one vector per document cell.* The cells the lexical index
-classified `is_doc` — long text that mentions resolve *into* — embedded
-verbatim, with no instruction prefix, into `vec_dense`. That is the
+*Documents, raw, one vector per document cell.* The cells of columns the
+derived document boundary classified `is_doc` — prose that mentions resolve
+*into* — embedded verbatim, with no instruction prefix, into `vec_dense`. That is the
 asymmetric convention of instruction-tuned retrieval encoders:
 `format_query()` decorates the query-time mention, documents stay raw, and
 applying the instruction on the document side would desert the space the
@@ -185,13 +187,15 @@ ever retrieve. Issue #2 measured the failure: 846,989 cards on one 6-table
 warehouse, 90.4% of them epoch floats, queued ahead of the corpus's 98
 useful documents. The fix is semantic, not per-value regex: candidacy —
 both the outer selection and the recurrence subquery — is restricted to
-columns whose [`lex_columns.kind`](02-data-model.md#lex_columns--column-typology)
-is `text`, plus a per-value guard that the normalized value contains a
-letter. Timestamps, keys and codes are excluded because of what their
-*columns* are, and the expectation is honest again: the queue holds the
-corpus's shared vocabulary, typically a few hundred cards. (The letter
-guard means purely non-Latin values rely on the column-level classifier
-alone — `alpha_ratio` shares the same `[a-z]` definition.)
+columns the [`is_paraphrasable_column` predicate](02-data-model.md#lex_columns--column-measurements)
+admits (letter-bearing by majority, and not *confidently* shape-structural
+at the Jeffreys bound), plus a per-value guard that the normalized value
+contains a letter. Timestamps, keys and id-shaped strings are excluded
+because of what their *columns* measurably are, and the expectation is
+honest again: the queue holds the corpus's shared vocabulary, typically a
+few hundred cards. (The letter guard means purely non-Latin values rely on
+the column-level measurements alone — `alpha_ratio` shares the same `[a-z]`
+definition.)
 
 For every qualifying distinct `(src_table, src_column, value_norm)` with
 `is_doc = 0`, the ingest pass serializes a card —
@@ -210,9 +214,9 @@ same one-model-per-table invariant.
 The earlier documents-only policy should be named for what it was: **an
 over-fit to the first corpus.** On the legal corpus every interesting cell is
 a 2,600-character regulation body, so "embed the documents, skip the values"
-looked like a principle. On relational corpora (BIRD-shaped schemas) nothing
-crosses `DOC_MIN_LEN`, the queue enqueued nothing, and the dense channel was
-inert — while the case that most needs semantic help there, the same value
+looked like a principle. On relational corpora (BIRD-shaped schemas) no
+column crosses the document boundary, the queue enqueued nothing, and the
+dense channel was inert — while the case that most needs semantic help there, the same value
 living in two columns, is unresolvable by any channel that only sees the
 value's own characters. The card is the smallest serialization that fixes
 both: the `table · column` prefix gives the encoder the interpretation, and
@@ -242,17 +246,20 @@ configured, each database gets a background task on its own store connection
 (the store is WAL, so serving never blocks on it):
 
 1. `stemma_ingest::enqueue_missing_embeddings` inserts a pending
-   `embed_queue` item for every document cell with no `vec_dense` vector,
+   `embed_queue` item for every document cell needing work,
    and the queue is drained **to empty** before
    `stemma_ingest::enqueue_missing_interpretations` runs — one item per
-   qualifying distinct value interpretation (`text` columns only, see
-   above) with no `vec_interp` vector, keyed by the interpretation's
+   qualifying distinct value interpretation (paraphrasable columns only,
+   see above) needing work, keyed by the interpretation's
    representative `MIN(src_rowid)`, with the card in `serialized` —
    followed by a second drain. Documents strictly first: the document sweep
    is small and is what makes the dense channel useful, so it must not sit
    behind the (potentially much larger) card sweep. Both enqueues are
    idempotent via the unique provenance key, log their count and duration,
-   and a `done` item is only reset if its vector has since disappeared.
+   and a `done` item is reset only when its vector has disappeared or its
+   `content_hash` no longer matches the text the encoder would see — the
+   raw document, or the card — in which case the stale vector is deleted
+   and the changed row re-embeds through the ordinary drain.
    While items are pending and a vector table has yet to materialize, the
    task logs `dense channel building: N docs, M interps pending` — the line
    that distinguishes "index still building" from "no dense-channel
@@ -282,14 +289,19 @@ degrades to lexical-plus-KG. Resolution still works, the next server start
 picks the queue back up, and the queue's status column keeps the whole
 story queryable in plain SQL.
 
-Honest limits of what is built: the drain runs at startup and exits — no
-watcher notices data changes afterward, and re-embedding after an edit means
-restarting the server; there is no online re-embed and no blue-green
-generation swap (the next section is still designed, not built); and the
-column typology gating candidacy is threshold-based on fixed constants —
-adequate for the corpora measured so far, but not calibrated per corpus, and
-a column that straddles a threshold flips kind wholesale rather than
-degrading gracefully.
+Honest limits of what is built: re-embedding on data change is now online —
+the server's background task watches `PRAGMA src.data_version`, re-runs the
+registration path when it moves, and the content-hashed queue re-embeds
+exactly the changed rows
+([02-data-model.md](02-data-model.md#the-refresh-discipline)) — but the
+change probe is a poll (up to `REFRESH_POLL_SECS` of staleness) and the
+fingerprint misses in-place edits that preserve count/max/sum of rowids;
+there is still no blue-green generation swap (the next section is designed,
+not built); and candidacy, while now derived per corpus (measured bounds,
+Otsu boundary) rather than thresholded, still flips a column wholesale when
+the evidence crosses a confident-majority line — the hysteresis on the
+document cut damps that for document-ness, the shape predicates have no
+equivalent damping.
 
 ### Query-time requirements
 

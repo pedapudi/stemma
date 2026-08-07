@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS embed_queue (
     src_column   TEXT NOT NULL,
     src_rowid    INTEGER NOT NULL,
     serialized   TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',           -- v5: hash of the embedded text
     status       TEXT NOT NULL DEFAULT 'pending',   -- pending | done | failed
     attempts     INTEGER NOT NULL DEFAULT 0,
     error        TEXT NOT NULL DEFAULT '',
@@ -259,9 +260,10 @@ interpretation with no vector in `vec_interp`, keyed by the representative
 batches through the `Embedder` backend, routing each item's vector to its
 table by kind. The unique key over the provenance triple makes both
 enqueues idempotent: an item already pending is a no-op, and an item once
-`done` is only reset to pending if its vector has since disappeared. (The
-two kinds cannot collide on the key: a cell is either a document or a short
-value, never both.)
+`done` is reset to pending only if its vector has since disappeared or its
+`content_hash` no longer matches the current text. (The two kinds cannot
+collide on the key: a cell is either a document or a short value, never
+both.)
 
 `serialized` is the text the embedder will see, and it is also the kind
 discriminator. It is empty for document items — the drain fetches the
@@ -269,6 +271,15 @@ stored value from `lex_values` at embed time rather than duplicating
 megabyte documents into the queue — and holds the interpretation card
 (≤ 300 chars) for interpretation items, which therefore survive even a
 lexical-index rebuild: the card travels with the queue item.
+
+`content_hash` (v5) is the refresh discipline applied to vectors: an FNV-1a
+hash of the exact text the item was enqueued to embed — the raw document
+for document items, the card for interpretation items. The enqueue passes
+recompute it from current data; a mismatch deletes the stale vector and
+resets the item to pending, so a changed source row re-embeds through the
+ordinary drain with no rebuild and no restart (see
+[the refresh discipline](#the-refresh-discipline)). Items from before v5
+(empty hash) adopt the current text as their baseline instead of resetting.
 
 The item lifecycle is `pending → done | failed`, and every transition keeps
 the table honestly queryable — `SELECT status, count(*) FROM embed_queue
@@ -374,7 +385,7 @@ store deletes the history with the rest of the derived state.
 ## Migration discipline
 
 The store schema version lives in `PRAGMA user_version`, exposed as
-`stemmadb::STORE_SCHEMA_VERSION` (currently **4**). `init_store_schema()`
+`stemmadb::STORE_SCHEMA_VERSION` (currently **5**). `init_store_schema()`
 implements the whole policy in a few lines:
 
 ```rust
@@ -387,7 +398,10 @@ if found < STORE_SCHEMA_VERSION {
         conn.execute_batch("DROP TABLE embed_queue;")?;   // v4, guarded by shape
     }
     conn.execute_batch(SCHEMA_SQL)?;        // idempotent, whole schema
-    if found == 2 { /* guarded ALTERs */ }
+    if found == 2 { /* guarded ALTERs (v3: query_log attribution) */ }
+    if /* embed_queue exists without content_hash */ {
+        /* guarded ALTER (v5: content_hash, additive) */
+    }
     conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
 }
 ```
@@ -402,13 +416,17 @@ The rules:
    the entire current schema to a store at any older version is correct and
    cheap. There is no per-version migration script to get wrong, and no
    ordering to maintain.
-3. **`ALTER` is the exception, and is guarded by version.** `ALTER TABLE …
+3. **`ALTER` is the exception, and is guarded.** `ALTER TABLE …
    ADD COLUMN` is not idempotent, so it cannot live in `SCHEMA_SQL`. v3's
    addition of `query_log.source` and `query_log.session` is guarded by
    `found == 2` — precisely the case where `query_log` exists without them.
    A v0 or v1 store never had `query_log` at all, so `SCHEMA_SQL` creates it
-   already carrying the new columns and the `ALTER` must not run. The guard
-   is exact, not approximate.
+   already carrying the new columns and the `ALTER` must not run. v5's
+   addition of `embed_queue.content_hash` follows the same pattern guarded
+   by *shape* (the queue exists without the column), which is exact across
+   every upgrade path — a fresh store gets the column from `SCHEMA_SQL`, a
+   v4 store gets the `ALTER`, a pre-v4 store gets the v4 drop-and-recreate
+   which already carries it.
 4. **Additive only.** No column is ever dropped or retyped, and no table is
    renamed. This is affordable precisely because the store is derived: if a
    change ever genuinely needs to be destructive, the answer is to bump the
@@ -429,7 +447,10 @@ their own staleness and repair by dropping and rebuilding:
 
 - **Lexical index** (`build_lexical_index`): if `lex_values` exists but
   `pragma_table_info('lex_values')` has no `is_doc` column, drop
-  `lex_values`, `lex_fts`, `lex_trigram` and force a rebuild.
+  `lex_values`, `lex_fts`, `lex_trigram`, `lex_columns` and rebuild; if
+  `lex_columns` exists without `median_len` (the kind-ladder shape), drop
+  just the profile table — it re-derives from `lex_values` without a
+  reindex.
 - **Knowledge store** (`SqliteKnowledgeStore::new`): if `kg_edges` exists
   without a `props` column, drop `kg_edges`, `kg_nodes`, `kg_meta` and let
   the next `compile` rebuild.
@@ -444,15 +465,98 @@ The knowledge compiler carries a third kind of version, orthogonal to both.
 compiler tag:
 
 ```rust
-Ok(format!("kg3:{n}:{mx}:{sum}"))   // count, max(rowid), sum(rowid)
+Ok(format!("kg4:{}", db.src_table_fingerprint(table)?))   // "kg4:{count}:{max}:{sum}"
 ```
 
-The `kg3:` prefix versions the *algorithm*, not the data. Bumping it
+The `kg4:` prefix versions the *algorithm*, not the data. Bumping it
 invalidates every stored fingerprint at once, so an improvement to term
 selection or join mining recompiles every table on the next run without any
 migration machinery and without touching `PRAGMA user_version`. This is the
 mechanism that makes the knowledge graph safe to keep improving. See
 [04-knowledge-graph.md](04-knowledge-graph.md#incremental-maintenance).
+
+## The refresh discipline
+
+Every derived artifact in the store answers the same three questions: *what
+inputs produced you, under which algorithm, and when?* One law covers the
+lexical index, the column profiles, the derived document boundary, the
+knowledge graph, and the vectors — stated once here, enforced in four
+mechanisms.
+
+### Receipts: the `derivations` table
+
+```sql
+CREATE TABLE IF NOT EXISTS derivations (
+    artifact           TEXT PRIMARY KEY,   -- 'lex:{table}' | 'profiles' | 'doc_cut'
+    input_fingerprint  TEXT NOT NULL,
+    derivation_version INTEGER NOT NULL,   -- stemma_ingest::LEX_DERIVATION_VERSION
+    derived_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    value_json         TEXT NOT NULL DEFAULT '{}'
+) STRICT;
+```
+
+Created by ingest alongside the lex tables. A receipt is valid only when
+*both* the fingerprint and the version match: the fingerprint tracks the
+data, the version tracks the algorithm, and either moving re-derives the
+artifact. Scalar derivations put the derived value itself in `value_json` —
+the `doc_cut` receipt holds the Otsu boundary in both its `current` and
+`adopted` readings (see hysteresis below) — so the store carries not just
+*that* something was derived but *what was concluded*, inspectable with
+plain `json_extract`.
+
+The knowledge graph's `kg_meta` is this same discipline, older: its
+fingerprint folds the algorithm version into a tag prefix (`kg4:{triple}`)
+instead of a separate column, and its `value_json` is the graph itself. It
+is deliberately **not** migrated into `derivations` — two tables, one law.
+
+### Change detection: the shared fingerprint
+
+`StemmaDb::src_table_fingerprint(table)` returns `"{count}:{max_rowid}:
+{sum_rowid}"` — three aggregates, no text hashing, computable by index scan.
+Both derivers compare against it: the knowledge compiler per `kg_meta` row,
+and `build_lexical_index` per `lex:{table}` receipt. At every registration
+(server startup, and every refresh wake) changed tables re-ingest — their
+lex rows and FTS entries replaced table-wise, their receipts restamped —
+and the corpus-level artifacts (profiles, document cut) re-derive whenever
+any table moved. Unchanged corpora cost one aggregate scan per table and no
+writes. The blind spot is documented in
+[04-knowledge-graph.md](04-knowledge-graph.md#the-fingerprint): an in-place
+`UPDATE` preserving all three aggregates is invisible, and `force` is the
+escape hatch.
+
+The cheap *global* signal is `PRAGMA src.data_version`, a counter SQLite
+bumps when another connection commits to the attached user database. Each
+served database gets one background thread that polls it on a modest
+interval (`REFRESH_POLL_SECS = 60` in stemma-server — an operational
+cadence, not a data-derived quantity) and, only when the counter moved, runs
+the registration path again: lexical receipts, KG fingerprints, embed pass.
+No filesystem watcher, no restart, and the poll itself is one pragma read.
+
+### Re-embedding on change: content hashes
+
+Embed-queue items carry `content_hash` (v5, additive column) — an FNV-1a
+hash of the exact text the item was enqueued to embed: the raw document for
+document items, the serialization card for interpretation items. The
+enqueue passes recompute the hash from current data; a mismatch means the
+encoder's input changed, so the stale vector is deleted and the item resets
+to pending, where the ordinary drain picks it up. Nothing else re-embeds:
+a table re-ingest touches every row of that table, but only the rows whose
+*text* actually changed get new vectors. Items predating v5 (empty hash)
+adopt the current text as baseline rather than resetting — their provenance
+is unknowable, and every change from then on is caught.
+
+### Hysteresis: derived boundaries move deliberately
+
+The document cut re-derives on every profile pass and is recorded as
+`current` in the `doc_cut` receipt — but the stamped `is_doc` bits follow
+the `adopted` value, which is replaced only when adopting the fresh cut
+would change at least one column's document-ness. A boundary that drifts a
+few percent with every appended row must not churn state that only cares
+which side of it each column lands on. When adoption *does* flip a column,
+the flip changes the column's channel (document ↔ interpretation card), so
+its queue items and vectors are invalid in a way no content hash can see;
+they are dropped for re-enqueue and the blast radius — columns flipped,
+items reset — is logged at info.
 
 ## The lexical index
 
@@ -501,21 +605,38 @@ word tokenization cannot — `Northgate` inside `Seattle - Northgate`. Both
 FTS5 tables are **external-content** (`content='lex_values'`), so the text
 is stored once and the FTS tables hold only their inverted indexes.
 
-**`is_doc` is a classification, computed at index time:**
+**`is_doc` is a per-column derivation, stamped at profile time.** A
+document is text a mention resolves **into** (BM25/snippet semantics) rather
+than **equals**, and that is a fact about a *column's role in the corpus*,
+not about any one cell's character count. `profile_columns` computes each
+column's median value length, takes Otsu's 2-class natural break over the
+median log-lengths, and stamps every cell of the columns in the prose class
+`is_doc = 1` — consumers read the same bit they always did, but it now means
+"this cell belongs to a document column of this corpus" rather than "this
+cell crossed 200 characters".
 
-```sql
-length("col") >= 200            -- stemma_ingest::DOC_MIN_LEN
-```
+Three cases, one expression (`stemma_ingest::derive_doc_boundary`):
 
-A value at or beyond `DOC_MIN_LEN` is a *document*: mentions resolve **into**
-it (BM25/snippet semantics) rather than **equal** it. This single bit changes
-the scoring branch a candidate takes, and getting it wrong in either
-direction breaks retrieval on one corpus class or the other. The complementary
-constant `EXACT_MAX_LEN = 120` bounds the exact-match channel from the other
-side: a 3,000-character regulation body is never a value a mention equals, so
-the exact channel simply excludes anything longer than 120 characters. The
-gap between 120 and 200 is intentional slack — values in it are neither
-exact-matchable nor length-penalty-exempt.
+- medians uniformly beyond value scale → every column is a document column
+  (a pure prose corpus, however its lengths cluster);
+- otherwise, the boundary is the Otsu cut, never lowered below value scale —
+  on value-shaped corpora (BIRD and its kin) the break falls among short
+  medians, the floor prevails, and no column is a document;
+- fewer than two distinct medians → no break exists, and the same floor
+  decides.
+
+"Value scale" is anchored by the one length constant that survives:
+`EXACT_MAX_LEN = 120` bounds the exact-match channel — a 3,000-character
+regulation body is never a value a mention equals — and it stays because it
+is a transport/UX bound on that channel, not a guess about the corpus: it
+defines where *being a value* operationally ends (what a mention can
+literally equal, what evidence can display unabridged), which is exactly
+the anchor the derivation needs. The break being corpus-relative is the
+point: a 150-char-median column clusters with the values in a corpus whose
+documents run to thousands of characters, where any fixed length threshold
+would have guessed. The boundary's receipt — current and adopted values —
+lives in `derivations` under the
+[hysteresis rule](#hysteresis-derived-boundaries-move-deliberately).
 
 **Column selection.** `text_columns()` walks `src.sqlite_master` for tables,
 then `pragma_table_info(?, 'src')` for each, keeping columns whose declared
@@ -524,14 +645,18 @@ test, not a value test: an untyped or `BLOB` column holding text is not
 indexed, and a `TEXT` column holding uuids is. See the honest note on
 identifier columns below.
 
-**Rebuild policy.** `build_lexical_index(db, force)` skips the work when
-`lex_values` already has rows and `force` is false; the server passes
-`false`, so restarting is cheap. A rebuild is `DELETE FROM lex_values` plus
-FTS5's `'delete-all'` command, then one `INSERT … SELECT` per text column
-and two bulk `INSERT … SELECT` statements to populate the FTS indexes from
-the fully-populated base table. Populating the FTS tables *after* all values
-are inserted, rather than per column, is what keeps ingest to a small number
-of large statements.
+**Refresh policy.** `build_lexical_index(db, force)` is receipt-driven (see
+[the refresh discipline](#the-refresh-discipline)): each table's content
+fingerprint is compared against its `lex:{table}` receipt, and only changed,
+new, or receipt-less tables re-ingest — their FTS rows removed with the
+external-content `'delete'` command (which needs the text, so it runs while
+the base rows still exist), their `lex_values` rows replaced by one `INSERT
+… SELECT` per text column, their FTS entries re-inserted table-wise, their
+receipt restamped. `force` treats every table as changed; an unchanged
+corpus costs one aggregate scan per table and performs no writes, so both a
+server restart and a refresh wake are cheap. Profiles and the document
+boundary re-derive whenever any table moved. Dropped tables are swept —
+rows, FTS entries, and receipt.
 
 ### What the index actually looks like
 
@@ -554,14 +679,15 @@ database, two tables) produces:
 Two honest observations from that table. First, **three quarters of the
 index is not worth indexing**: `uuid` is all-distinct and never mentioned in
 prose, `license` and `category` are single-valued constants. The column
-typology below now *classifies* such columns (both `uuid` columns profile as
-`identifier`) so downstream passes can skip them; the indexing itself still
-pays for them. Second, the maximum `regulations.text` length is 870 KB — a
+measurements below expose such columns (both `uuid` columns carry an
+`idlike_lcb` near 1, so no purpose predicate admits them) and downstream
+passes skip them; the indexing itself still pays for them. Second, the
+maximum `regulations.text` length is 870 KB — a
 single cell nearly a megabyte long, which the trigram index must tokenize
 into hundreds of thousands of trigrams. Document-shaped corpora stress the
 index in ways value-shaped corpora do not.
 
-### `lex_columns` — column typology
+### `lex_columns` — column measurements
 
 ```sql
 CREATE TABLE IF NOT EXISTS lex_columns (
@@ -569,53 +695,65 @@ CREATE TABLE IF NOT EXISTS lex_columns (
     src_column     TEXT NOT NULL,
     n_values       INTEGER NOT NULL,
     n_distinct     INTEGER NOT NULL,   -- over value_norm
-    distinct_ratio REAL NOT NULL,
+    distinct_ratio REAL NOT NULL,      -- each ratio is paired with its
+    distinct_lcb   REAL NOT NULL,      -- Jeffreys lower confidence bound
     alpha_ratio    REAL NOT NULL,      -- values containing any [a-z]
+    alpha_lcb      REAL NOT NULL,
     numeric_ratio  REAL NOT NULL,      -- digits and . e + - only
+    numeric_lcb    REAL NOT NULL,
     temporal_ratio REAL NOT NULL,      -- epoch-ranged numbers or ISO dates
+    temporal_lcb   REAL NOT NULL,
     idlike_ratio   REAL NOT NULL,      -- uuid / long hex / long digit runs
-    doc_ratio      REAL NOT NULL,      -- fraction past DOC_MIN_LEN
+    idlike_lcb     REAL NOT NULL,
     avg_len        REAL NOT NULL,
-    kind           TEXT NOT NULL,
+    median_len     REAL NOT NULL,      -- input to the document boundary
     PRIMARY KEY (src_table, src_column)
 ) STRICT;
 ```
 
-`lex_values` records what values exist; `lex_columns` records what **kind**
-of thing each column holds. `stemma_ingest::profile_columns` fills it in one
-grouped pass over `lex_values` at the end of every index (re)build — it is
-derived state with the same lifecycle as the FTS tables: dropped and rebuilt
-with the index, never migrated, no store schema version involved. A store
-built before the table existed gets profiled on the next
-`build_lexical_index` call without reindexing.
+`lex_values` records what values exist; `lex_columns` records **measurements
+about each column** — and nothing else. There is no stored classification:
+what used to be a six-kind `kind` column assigned by a priority ladder of
+fixed thresholds (0.5 / 0.8 / 0.95, plus a 20-row minimum-sample gate) is
+now three **purpose predicates**, documented functions over the
+measurements, evaluated where they are consumed:
 
-`kind` is assigned by the first matching rule, thresholds in
-[`stemma-ingest`](../../crates/stemma-ingest/src/lib.rs) as `KIND_*`
-constants:
+| predicate | definition | consumer |
+|---|---|---|
+| `is_document_column` | median log-length beyond the [derived boundary](#the-lexical-index) | `is_doc` stamping; both enqueue passes |
+| `is_paraphrasable_column` | letter-bearing by majority (`alpha_ratio > 1/2`) and not confidently shape-structural (`numeric_lcb`, `temporal_lcb`, `idlike_lcb` all ≤ 1/2) | interpretation-card candidacy ([05](05-encoders-decoders.md#what-gets-embedded)) |
+| `is_vocabulary_column` | ≡ `is_paraphrasable_column` today — a term recurs meaningfully exactly where a paraphrase can reach; a separate name so the consumers state their purpose and can diverge without a hunt | KG term→column affinity ([04](04-knowledge-graph.md#step-6--termcolumn-affinity)) |
 
-| kind | rule |
-|---|---|
-| `document` | `doc_ratio` > 0.5 |
-| `temporal` | `temporal_ratio` > 0.8 |
-| `numeric` | `numeric_ratio` > 0.8 |
-| `identifier` | `idlike_ratio` > 0.8, or `distinct_ratio` > 0.95 with `alpha_ratio` < 0.5 |
-| `code` | `distinct_ratio` > 0.95 and most values space-free (SKU-shaped) |
-| `text` | everything else |
+Every `*_ratio` is paired with its **Jeffreys lower confidence bound** at
+the one conventional level (`CONFIDENCE_LEVEL = 0.95` — the only
+probability constant in the crate): the 5% quantile of
+Beta(k + ½, n − k + ½). Structural *denial* requires a confident majority —
+LCB > ½ — while admission is the default, which is how the old
+minimum-sample gate's job gets done without a gate: 5/5 numeric values
+bound the proportion at only ~0.69 against arithmetic, not against a
+hand-picked N. A five-row all-distinct column of names keeps its
+vocabulary status because nothing about it can be confidently condemned
+(`five_distinct_rows_cannot_be_condemned` asserts exactly this).
 
-Priority matters: a copied epoch column is numeric too, but `temporal` is
-the more specific truth, and near-distinct digit keys read as `numeric`
-before anything cardinality-based fires. The two cardinality-gated rules
-(`identifier`-by-distinctness, `code`) additionally require
-`n_values >= 20` (`KIND_CARDINALITY_MIN_VALUES`) — below that every column
-is trivially near-distinct and small columns default honestly to `text`.
+The structural shape tests themselves — parses as a number, uuid/hex
+shapes, epoch ranges (`TEMPORAL_EPOCH_RANGES`), ISO dates — are
+*definitions*, not tunables, and remain fixed GLOB/CAST expressions.
 
-Two consumers exist today: interpretation-card candidacy admits only
-`text` columns (see
-[05-encoders-decoders.md](05-encoders-decoders.md#what-gets-embedded)), and
-the knowledge compiler's term→column affinity pass only points affinity at
-`text` columns. Plausible future consumers — inclusion-dependency mining
-seeded by `identifier`/`numeric` key candidates, per-corpus threshold
-calibration — are noted, not promised.
+What the predicates deliberately no longer test: **cardinality**. The old
+`identifier`-by-distinctness and `code` rules died with the ladder — keys
+are caught by their shape, near-unique prose (names, titles) is legitimate
+vocabulary, and a letter-bearing code scheme (`SKU-0001-Q3`) is admitted,
+kept harmless by the recurrence requirement downstream. `distinct_ratio`
+and `distinct_lcb` stay as measurements for anyone (the console, future
+passes) to read.
+
+`stemma_ingest::profile_columns` fills the table in one grouped pass plus
+one windowed median pass over `lex_values`, then derives and stamps the
+document boundary; it re-runs whenever any table's receipt moved. The table
+is derived state with the same lifecycle as the FTS tables: dropped and
+rebuilt with the index, never migrated, no store schema version involved —
+a store with the old (`kind`-bearing) shape is detected by the missing
+`median_len` column and rebuilt in place.
 
 ### `lex_vocab`
 

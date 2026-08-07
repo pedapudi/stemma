@@ -49,8 +49,8 @@ Every tunable in the pipeline, with its source and its job:
 | `DENSE_MAX_SPANS` | 4 | stemma-resolve | Spans per query that get a dense KNN probe |
 | `DENSE_OVERFETCH` | 4 | stemma-resolve | KNN over-fetch factor; hits are collapsed per interpretation, then truncated |
 | `RRF_K` | 4.0 | stemma-resolve (`fuse`) | Reciprocal-rank-fusion damping constant |
-| `EXACT_MAX_LEN` | 120 | stemma-ingest | Values longer than this are excluded from the exact channel |
-| `DOC_MIN_LEN` | 200 | stemma-ingest | Values at least this long are classified `is_doc` |
+| `EXACT_MAX_LEN` | 120 | stemma-ingest | Values longer than this are excluded from the exact channel; also anchors "value scale" for the derived document boundary |
+| `CONFIDENCE_LEVEL` | 0.95 | stemma-ingest | Jeffreys lower-bound level for every column shape judgment |
 | KG bonus | 0.04 / matched co-term | stemma-resolve | Coherence increment, capped at 0.9 |
 | `CONTEXT_TERM_BONUS` | 0.05 / supporting term | stemma-resolve | Context-coherence increment for value candidates, capped at 0.9 |
 | `CONTEXT_TERM_MAX` | 2 | stemma-resolve | Distinct context terms that may support one candidate |
@@ -1143,7 +1143,11 @@ re-staging and restarting, not querying both — which is safe (spaces are
 never mixed) but is not the side-by-side A/B the registry design allows for.
 
 **Dense promotion happens only at server startup**, and staging must be
-written while the server is stopped. There is no online re-embed.
+written while the server is stopped. (Queue-fed vectors are different:
+changed rows re-embed online through the content-hashed queue and the
+server's refresh watch — see
+[02-data-model.md](02-data-model.md#the-refresh-discipline) — but a staged
+generation swap still means a restart.)
 
 ## References
 

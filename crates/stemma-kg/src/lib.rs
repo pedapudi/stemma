@@ -35,6 +35,14 @@ pub enum Error {
     Sqlite(#[from] stemmadb::rusqlite::Error),
     #[error(transparent)]
     Db(#[from] stemmadb::Error),
+    #[error(transparent)]
+    Ingest(#[from] Box<stemma_ingest::Error>),
+}
+
+impl From<stemma_ingest::Error> for Error {
+    fn from(e: stemma_ingest::Error) -> Self {
+        Error::Ingest(Box::new(e))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -364,23 +372,15 @@ const TOP_AFFINITY_COLUMNS: usize = 4;
 /// MIN_VALUE_COUNT: one co-occurrence is coincidence, two is a pattern.
 const MIN_AFFINITY_MATCHES: i64 = 2;
 
-/// Content fingerprint of one user table: cheap to compute, catches inserts,
-/// deletes, and rowid churn. In-place updates that preserve count, max rowid
-/// and rowid sum are missed — acceptable for derived state that `force`
-/// rebuilds. O(n) per table, no text hashing.
+/// Content fingerprint of one user table: the shared count:max:sum helper
+/// ([`StemmaDb::src_table_fingerprint`] — the same triple the lexical
+/// index's `derivations` receipts compare against), prefixed with a tag
+/// that versions the COMPILER, not the data: bumping it invalidates every
+/// stored fingerprint so algorithm upgrades recompile.
+/// kg3: added the term→column affinity pass; kg4: affinity candidacy moved
+/// from the kind ladder to the vocabulary predicate.
 fn fingerprint(db: &StemmaDb, table: &str) -> Result<String> {
-    let (n, mx, sum): (i64, i64, i64) = db.conn().query_row(
-        &format!(
-            "SELECT count(*), coalesce(max(rowid),0), coalesce(sum(rowid),0) FROM {}.\"{table}\"",
-            stemmadb::SRC_SCHEMA
-        ),
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    // The leading tag versions the COMPILER, not the data: bumping it
-    // invalidates every stored fingerprint so algorithm upgrades recompile.
-    // kg3: added the term→column affinity pass.
-    Ok(format!("kg3:{n}:{mx}:{sum}"))
+    Ok(format!("kg4:{}", db.src_table_fingerprint(table)?))
 }
 
 /// Compiles (or incrementally refreshes) the schema, discovered-relation and
@@ -914,15 +914,15 @@ fn compile_phrase_entities(
 /// at least MIN_AFFINITY_MATCHES matching cells, as `col_affinity` edges
 /// from the term node to the existing `column:{table}.{column}` nodes.
 ///
-/// Only value cells (`is_doc = 0`) in columns whose `lex_columns.kind` is
-/// `text` count. A term trivially "co-occurs" with the document column it was
-/// mined from, and the consumer of these edges — resolution's
-/// context-coherence stage — disambiguates *value* interpretations; letting
-/// document columns fill the slots would spend the budget on edges nothing
-/// can use. The column-typology restriction is the same argument one level
-/// up: term affinity into a timestamp, key or code column is meaningless —
-/// no mention of the term ever resolves to those values — so only `text`
-/// columns may hold affinity.
+/// Only value cells (`is_doc = 0`) in columns the vocabulary predicate
+/// admits (`stemma_ingest::vocabulary_columns`) count. A term trivially
+/// "co-occurs" with the document column it was mined from, and the consumer
+/// of these edges — resolution's context-coherence stage — disambiguates
+/// *value* interpretations; letting document columns fill the slots would
+/// spend the budget on edges nothing can use. The vocabulary restriction is
+/// the same argument one level up: term affinity into a timestamp, key or
+/// id column is meaningless — no mention of the term ever resolves to those
+/// values — so only vocabulary columns may hold affinity.
 ///
 /// Runs globally (all served tables) whenever any table recompiled, like the
 /// other cross-table passes: recompiling table u removes u's column nodes
@@ -940,12 +940,29 @@ fn compile_term_column_affinity(
     if terms.is_empty() {
         return Ok(());
     }
+    // The vocabulary predicate is a function over measurements, evaluated in
+    // stemma-ingest and materialized here for the probe to join against.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS kg_vocab_cols (
+             src_table TEXT NOT NULL, src_column TEXT NOT NULL,
+             PRIMARY KEY (src_table, src_column)
+         );
+         DELETE FROM kg_vocab_cols;",
+    )?;
+    {
+        let mut ins = conn.prepare_cached(
+            "INSERT OR IGNORE INTO kg_vocab_cols (src_table, src_column) VALUES (?1, ?2)",
+        )?;
+        for (t, c) in stemma_ingest::vocabulary_columns(db)? {
+            ins.execute(stemmadb::rusqlite::params![t, c])?;
+        }
+    }
     let mut probe = conn.prepare_cached(
         "SELECT v.src_table, v.src_column, count(*) AS n
          FROM lex_fts f JOIN lex_values v ON v.id = f.rowid
-         JOIN lex_columns lc ON lc.src_table = v.src_table
-                            AND lc.src_column = v.src_column
-         WHERE lex_fts MATCH ?1 AND v.is_doc = 0 AND lc.kind = 'text'
+         JOIN kg_vocab_cols vc ON vc.src_table = v.src_table
+                              AND vc.src_column = v.src_column
+         WHERE lex_fts MATCH ?1 AND v.is_doc = 0
          GROUP BY v.src_table, v.src_column
          HAVING n >= ?2
          ORDER BY n DESC, v.src_table, v.src_column
@@ -980,6 +997,7 @@ fn compile_term_column_affinity(
             })?;
         }
     }
+    conn.execute_batch("DROP TABLE kg_vocab_cols;")?;
     Ok(())
 }
 
