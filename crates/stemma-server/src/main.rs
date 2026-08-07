@@ -151,10 +151,11 @@ impl Resolver {
             Some(true) => self.lm.as_deref(),
             _ => None,
         };
-        let trace = stemma_resolve::resolve_full(&db, &req.query, embedder, lm).map_err(|e| match e {
-            stemma_resolve::Error::IndexMissing => Status::failed_precondition(e.to_string()),
-            other => Status::internal(other.to_string()),
-        })?;
+        let trace =
+            stemma_resolve::resolve_full(&db, &req.query, embedder, lm).map_err(|e| match e {
+                stemma_resolve::Error::IndexMissing => Status::failed_precondition(e.to_string()),
+                other => Status::internal(other.to_string()),
+            })?;
         // Query history is store working memory; a failed write must never
         // fail the resolution.
         if !req.query.trim().is_empty() {
@@ -209,8 +210,10 @@ impl ResolveService for Resolver {
     }
 }
 
-/// Enqueues missing document embeddings for one database and drains the
-/// queue to empty, batch by batch, on its own store connection.
+/// Enqueues missing embeddings for one database — document cells and value
+/// interpretations, into the same queue — and drains it to empty, batch by
+/// batch, on its own store connection. The drain routes each item by kind:
+/// documents into vec_dense, interpretation cards into vec_interp.
 fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str) {
     let store = user_db.with_extension("stemmadb");
     let db = match StemmaDb::open(&store, user_db) {
@@ -221,20 +224,33 @@ fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str
         }
     };
     let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model);
-    let queued = match stemma_ingest::enqueue_missing_embeddings(&db) {
+    let queued_docs = match stemma_ingest::enqueue_missing_embeddings(&db) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(name, error = %e, "embed drain: enqueue failed");
             return;
         }
     };
-    tracing::info!(name, queued, "embed drain: queue filled");
+    let queued_interps = match stemma_ingest::enqueue_missing_interpretations(&db) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(name, error = %e, "embed drain: interpretation enqueue failed");
+            return;
+        }
+    };
+    tracing::info!(
+        name,
+        queued_docs,
+        queued_interps,
+        "embed drain: queue filled"
+    );
     loop {
         match stemma_ingest::drain_embed_queue(&db, &embedder, stemma_ingest::EMBED_BATCH) {
             Ok(stats) => {
                 tracing::info!(
                     name,
-                    queued,
+                    queued_docs,
+                    queued_interps,
                     drained = stats.drained,
                     failed = stats.failed,
                     remaining = stats.remaining,
