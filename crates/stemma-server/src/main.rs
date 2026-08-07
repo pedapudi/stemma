@@ -155,7 +155,7 @@ struct Resolver {
     // resolution is read-mostly. Revisit with a connection pool when the
     // pipeline lands.
     dbs: HashMap<String, Mutex<StemmaDb>>,
-    embedder: Option<stemma_embed::CooldownEmbedder<stemma_embed::OpenAiEmbedder>>,
+    embedder: Option<std::sync::Arc<stemma_embed::CooldownEmbedder<stemma_embed::OpenAiEmbedder>>>,
     lm: Option<Box<dyn stemma_lm::LmBackend>>,
 }
 
@@ -169,7 +169,7 @@ impl Resolver {
         let embedder = self
             .embedder
             .as_ref()
-            .map(|e| e as &dyn stemma_embed::Embedder);
+            .map(|e| e.as_ref() as &dyn stemma_embed::Embedder);
         // options.allow_lm gates the adjudication band per request: off, the
         // resolution is purely lexical/dense/KG and fully local.
         let lm = match req.options.as_ref().map(|o| o.allow_lm) {
@@ -255,7 +255,7 @@ const REFRESH_POLL_SECS: u64 = 60;
 fn background_task(
     name: &str,
     user_db: &std::path::Path,
-    embed: Option<(String, String, Option<String>)>,
+    embedder: Option<std::sync::Arc<stemma_embed::CooldownEmbedder<stemma_embed::OpenAiEmbedder>>>,
 ) {
     let store = user_db.with_extension("stemmadb");
     let db = match StemmaDb::open(&store, user_db) {
@@ -265,13 +265,8 @@ fn background_task(
             return;
         }
     };
-    let embedder = embed
-        .as_ref()
-        .map(|(ep, model, template)| {
-            stemma_embed::OpenAiEmbedder::new(ep, model, template.clone())
-        });
     if let Some(embedder) = &embedder {
-        embed_pass(name, &db, embedder);
+        embed_pass(name, &db, embedder.as_ref());
     }
 
     let data_version = |db: &StemmaDb| -> i64 {
@@ -282,6 +277,12 @@ fn background_task(
     let mut last = data_version(&db);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(REFRESH_POLL_SECS));
+        if let Some(embedder) = &embedder {
+            if embedder.is_down() && embedder.probe().is_ok() {
+                tracing::info!(name, "embedding endpoint recovered; resuming drain");
+                embed_pass(name, &db, embedder.as_ref());
+            }
+        }
         let seen = data_version(&db);
         if seen == last {
             continue;
@@ -309,7 +310,7 @@ fn background_task(
             Err(e) => tracing::warn!(name, error = %e, "refresh: kg compile failed"),
         }
         if let Some(embedder) = &embedder {
-            embed_pass(name, &db, embedder);
+            embed_pass(name, &db, embedder.as_ref());
         }
     }
 }
@@ -472,12 +473,12 @@ async fn main() -> anyhow::Result<()> {
                 query_template = embed_template.as_deref().unwrap_or("(bare)"),
                 "dense channel enabled"
             );
-            Some(stemma_embed::CooldownEmbedder::new(
+            Some(std::sync::Arc::new(stemma_embed::CooldownEmbedder::new(
                 stemma_embed::OpenAiEmbedder::new(ep, m, embed_template.clone()),
-                // One failed probe per window, not one DNS timeout per
-                // query, while the endpoint is down. Operational cadence.
+                // Down-marker refresh window; the background task owns the
+                // recovery probe, so user queries always short-circuit.
                 std::time::Duration::from_secs(60),
-            ))
+            )))
         }
         _ => None,
     };
@@ -496,13 +497,9 @@ async fn main() -> anyhow::Result<()> {
     // data_version watch that keeps derived state fresh without a restart.
     // The store is WAL, so serving is never blocked; a background failure
     // degrades the dense channel or freshness, never the server.
-    let embed = match (&args.embed_endpoint, &args.embed_model) {
-        (Some(ep), Some(model)) => Some((ep.clone(), model.clone(), embed_template.clone())),
-        _ => None,
-    };
     for (name, user_db) in &args.dbs {
-        let (name, user_db, embed) = (name.clone(), user_db.clone(), embed.clone());
-        tokio::task::spawn_blocking(move || background_task(&name, &user_db, embed));
+        let (name, user_db, embedder) = (name.clone(), user_db.clone(), embedder.clone());
+        tokio::task::spawn_blocking(move || background_task(&name, &user_db, embedder));
     }
 
     tracing::info!(listen = %listen, "stemma-server starting");

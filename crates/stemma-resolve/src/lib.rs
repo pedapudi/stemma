@@ -62,6 +62,13 @@ const DENSE_OVERFETCH: usize = 4;
 const SELECT_THRESHOLD: f64 = 0.35;
 /// Max selected candidates per mention.
 const TOP_K: usize = 5;
+/// Interpretation aggregation in the FTS channels runs over this many
+/// best-ranked matches, not the entire match set: a common token can match
+/// hundreds of thousands of document rows, and a reading whose best match
+/// sits below thousands of better-ranked rows cannot reach the channel's
+/// top slots anyway. Bounded work per span; large duplicate runs (the
+/// issue-#1 2,100-copy column) still collapse inside the window.
+const FTS_AGGREGATION_WINDOW: usize = 512;
 /// Dense KNN is a full scan of the vector table per probe; spend it only on
 /// spans the lexical channels left uncertain, at most this many per query.
 const DENSE_MAX_SPANS: usize = 4;
@@ -733,14 +740,20 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
             // MATERIALIZED: the CTE is read by both UNION arms, and FTS5
             // auxiliary functions (bm25, snippet) are only usable inside
             // the MATCH query itself — materialization keeps them there.
-            "WITH matched AS MATERIALIZED (
+            "WITH hits AS MATERIALIZED (
+                SELECT rowid AS id, bm25({fts}) AS b,
+                       snippet({fts}, 0, '⟨', '⟩', '…', 10) AS snip
+                FROM {fts}
+                WHERE {fts} MATCH ?1
+                ORDER BY rank
+                LIMIT {window}
+             ),
+             matched AS MATERIALIZED (
                 SELECT v.src_table AS t, v.src_column AS c, v.src_rowid AS r,
                        v.value AS value, v.value_norm AS vn, v.is_doc AS is_doc,
-                       bm25({fts}) AS b,
-                       CASE WHEN v.is_doc = 1
-                            THEN snippet({fts}, 0, '⟨', '⟩', '…', 10) END AS snip
-                FROM {fts} f JOIN lex_values v ON v.id = f.rowid
-                WHERE {fts} MATCH ?1
+                       h.b AS b,
+                       CASE WHEN v.is_doc = 1 THEN h.snip END AS snip
+                FROM hits h JOIN lex_values v ON v.id = h.id
              )
              SELECT t, c, rep, value, vn, b, is_doc, n, snip FROM (
                 SELECT t, c, min(r) AS rep, min(value) AS value, vn,
@@ -755,7 +768,8 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
                 WHERE rn <= ?3
              )
              ORDER BY b, t, c LIMIT ?2",
-            fts = fts_table
+            window = FTS_AGGREGATION_WINDOW,
+            fts = fts_table,
         );
         let mut stmt = conn.prepare_cached(&sql)?;
         // Quote as an FTS5 string so query punctuation isn't FTS syntax.

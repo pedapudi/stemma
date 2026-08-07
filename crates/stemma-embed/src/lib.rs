@@ -224,18 +224,53 @@ impl<E> CooldownEmbedder<E> {
     }
 }
 
+impl<E> CooldownEmbedder<E> {
+    /// True while the endpoint is marked down.
+    pub fn is_down(&self) -> bool {
+        self.failed_at.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+}
+
+impl<E: Embedder> CooldownEmbedder<E> {
+    /// One live attempt that BYPASSES the short-circuit — the recovery
+    /// probe. Query paths never call this; a background owner does, so no
+    /// user query ever pays a DNS or connect wait on a dead endpoint
+    /// (getaddrinfo is not bounded by connect timeouts). Success clears
+    /// the down marker; failure re-stamps it.
+    pub fn probe(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        match self.inner.embed(&["probe".to_string()]) {
+            Ok(_) => {
+                self.failed_at.store(0, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.failed_at.store(Self::now_ms(), Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+}
+
 impl<E: Embedder> Embedder for CooldownEmbedder<E> {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         use std::sync::atomic::Ordering;
+        // Marked down: short-circuit unconditionally; recovery belongs to
+        // the background probe, never to a user query. The cooldown window
+        // only bounds how often the first failure can be rediscovered when
+        // no prober is attached.
         let failed = self.failed_at.load(Ordering::Relaxed);
-        if failed != 0 && Self::now_ms().saturating_sub(failed) < self.cooldown.as_millis() as u64 {
-            return Err(Error::Http("endpoint cooling down after failure".into()));
+        if failed != 0 {
+            if Self::now_ms().saturating_sub(failed) < self.cooldown.as_millis() as u64 {
+                return Err(Error::Http("endpoint marked down".into()));
+            }
+            return match self.probe() {
+                Ok(()) => self.inner.embed(texts),
+                Err(e) => Err(e),
+            };
         }
         match self.inner.embed(texts) {
-            Ok(v) => {
-                self.failed_at.store(0, Ordering::Relaxed);
-                Ok(v)
-            }
+            Ok(v) => Ok(v),
             Err(e) => {
                 self.failed_at.store(Self::now_ms(), Ordering::Relaxed);
                 Err(e)
