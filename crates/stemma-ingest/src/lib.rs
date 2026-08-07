@@ -379,12 +379,23 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     // One row per distinct interpretation; the bare `value` column resolves
     // to the row that achieved MIN(src_rowid) (SQLite's documented bare-
     // column-with-min semantics), which is exactly the representative cell.
+    //
+    // Only the ambiguous vocabulary is embedded: a card is consulted solely
+    // when the same value ties across DISTINCT (table, column) readings, so
+    // values living in a single column — every uuid, every near-unique
+    // identifier — can never be looked up and would be pure drain cost
+    // (legal: 448k cards without this filter, a few hundred with it).
     let missing: Vec<(String, String, i64, String)> = {
         let mut stmt = conn.prepare(
             "SELECT t.src_table, t.src_column, t.rep, t.value FROM (
                  SELECT src_table, src_column, MIN(src_rowid) AS rep, value
                  FROM lex_values
                  WHERE is_doc = 0
+                   AND value_norm IN (
+                       SELECT value_norm FROM lex_values WHERE is_doc = 0
+                       GROUP BY value_norm
+                       HAVING count(DISTINCT src_table || '·' || src_column) >= 2
+                   )
                  GROUP BY src_table, src_column, value_norm
              ) t
              WHERE NOT EXISTS (
@@ -839,6 +850,9 @@ mod tests {
         db.conn()
             .execute_batch(&format!(
                 "CREATE TABLE src.articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+                 CREATE TABLE src.tags(id INTEGER PRIMARY KEY, label TEXT);
+                 INSERT INTO src.tags VALUES
+                    (1, 'Coastal permits'), (2, 'Insurance filings'), (3, 'Water rights');
                  INSERT INTO src.articles VALUES
                     (1, 'Coastal permits', '{a}'),
                     (2, 'Insurance filings', '{b}'),
@@ -977,7 +991,12 @@ mod tests {
                  INSERT INTO src.offices VALUES
                     (17, 'Seattle - Northgate', 'Seattle'),
                     (18, 'Portland Downtown', 'Portland'),
-                    (19, 'Portland Airport', 'Portland');",
+                    (19, 'Portland Airport', 'Portland');
+                 -- landmarks shares values with offices so the fixture has an
+                 -- ambiguous vocabulary: only cross-column values get cards
+                 CREATE TABLE src.landmarks(id INTEGER PRIMARY KEY, title TEXT);
+                 INSERT INTO src.landmarks VALUES
+                    (1, 'Seattle'), (2, 'Portland'), (3, 'Portland Downtown');",
             )
             .unwrap();
         build_lexical_index(&db, false).unwrap();
@@ -1031,10 +1050,14 @@ mod tests {
     fn enqueue_finds_interpretations_exactly_once() {
         let db = value_db();
         let queued = enqueue_missing_interpretations(&db).unwrap();
-        // 3 distinct names + 2 distinct cities; the repeated 'Portland' is
-        // one interpretation, keyed by its representative MIN rowid.
-        assert_eq!(queued, 5);
-        assert_eq!(queue_counts(&db), (5, 0, 0));
+        // Only the ambiguous vocabulary is card-worthy: 'seattle',
+        // 'portland' and 'portland downtown' each live in two columns
+        // (offices + landmarks), so 3 norms x 2 readings = 6 items; the
+        // single-column names ('Seattle - Northgate', 'Portland Airport')
+        // are excluded. Repeated 'Portland' cities stay one interpretation,
+        // keyed by the representative MIN rowid.
+        assert_eq!(queued, 6);
+        assert_eq!(queue_counts(&db), (6, 0, 0));
         let portland: Vec<i64> = db
             .conn()
             .prepare(
@@ -1058,13 +1081,13 @@ mod tests {
         let embedder = FakeEmbedder::new(8);
         enqueue_missing_interpretations(&db).unwrap();
         let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
-        assert_eq!((stats.drained, stats.failed, stats.remaining), (5, 0, 0));
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (6, 0, 0));
 
         let vectors: i64 = db
             .conn()
             .query_row("SELECT count(*) FROM vec_interp", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(vectors, 5);
+        assert_eq!(vectors, 6);
         let (backend, model, dim): (String, String, i64) = db
             .conn()
             .query_row(
@@ -1098,7 +1121,7 @@ mod tests {
             .conn()
             .query_row("SELECT count(*) FROM vec_interp", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(vectors_again, 5, "idempotent: no duplicate vectors");
+        assert_eq!(vectors_again, 6, "idempotent: no duplicate vectors");
     }
 
     #[test]
@@ -1109,15 +1132,16 @@ mod tests {
         let embedder = FakeEmbedder::new(8);
         let docs = enqueue_missing_embeddings(&db).unwrap();
         let interps = enqueue_missing_interpretations(&db).unwrap();
-        assert_eq!((docs, interps), (3, 3));
+        // titles are shared with src.tags, so each title yields two readings
+        assert_eq!((docs, interps), (3, 6));
         let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
-        assert_eq!((stats.drained, stats.failed, stats.remaining), (6, 0, 0));
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (9, 0, 0));
         let count = |table: &str| -> i64 {
             db.conn()
                 .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!((count("vec_dense"), count("vec_interp")), (3, 3));
+        assert_eq!((count("vec_dense"), count("vec_interp")), (3, 6));
         let registered: i64 = db
             .conn()
             .query_row(
@@ -1174,7 +1198,7 @@ mod tests {
             other => panic!("expected ModelMismatch, got {other}"),
         }
         let (pending, done, failed) = queue_counts(&db);
-        assert_eq!((pending, done, failed), (0, 0, 5));
+        assert_eq!((pending, done, failed), (0, 0, 6));
         let note: String = db
             .conn()
             .query_row("SELECT error FROM embed_queue LIMIT 1", [], |r| r.get(0))
