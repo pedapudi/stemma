@@ -90,6 +90,13 @@ pub struct ServerSection {
 pub struct EndpointSection {
     pub endpoint: String,
     pub model: String,
+    /// Query-side template ("{query}" placeholder); embedder only, ignored
+    /// for the LM. Absent, the default is looked up by model family
+    /// (`stemma_embed::default_query_template`) — the same resolution the
+    /// server applies, so an eval run embeds queries the way the deployment
+    /// would.
+    #[serde(default)]
+    pub query_template: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -429,11 +436,19 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     );
 
     let embed_cfg = match (args.embed_endpoint, args.embed_model) {
-        (Some(endpoint), Some(model)) => Some(EndpointSection { endpoint, model }),
+        (Some(endpoint), Some(model)) => Some(EndpointSection {
+            endpoint,
+            model,
+            query_template: None,
+        }),
         _ => cfg.server.embedder.clone(),
     };
     let lm_cfg = match (args.lm_endpoint, args.lm_model) {
-        (Some(endpoint), Some(model)) => Some(EndpointSection { endpoint, model }),
+        (Some(endpoint), Some(model)) => Some(EndpointSection {
+            endpoint,
+            model,
+            query_template: None,
+        }),
         _ => cfg.server.lm.clone(),
     };
 
@@ -481,6 +496,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
             (Some(e), true) => Some(MeteredEmbedder::new(stemma_embed::OpenAiEmbedder::new(
                 &e.endpoint,
                 &e.model,
+                e.query_template
+                    .clone()
+                    .or_else(|| stemma_embed::default_query_template(&e.model)),
             ))),
             (None, true) => {
                 notes.push(format!(

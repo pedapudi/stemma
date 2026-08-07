@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "stemma-embed",
@@ -11,4 +11,9 @@ rust_library(
         "@crates//:thiserror",
         "@crates//:ureq",
     ],
+)
+
+rust_test(
+    name = "stemma-embed_test",
+    crate = ":stemma-embed",
 )

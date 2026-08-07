@@ -445,6 +445,18 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
 /// Items per embedding call when draining the queue.
 pub const EMBED_BATCH: usize = 32;
 
+/// The drain's batch selection. Deliberately join-free: it reads only
+/// embed_queue, and the `(status, attempts, id)` index satisfies both the
+/// predicate and the ORDER BY, so SQLite walks the index in output order and
+/// stops at the LIMIT — no temp B-tree, no per-pending-row work (issue #4
+/// measured the joined-and-sorted version at 71% of drain wall-clock on a
+/// 844K-item queue). A test asserts the plan stays index-only.
+const DRAIN_BATCH_SQL: &str = "SELECT id, src_table, src_column, src_rowid, serialized
+     FROM embed_queue
+     WHERE status = 'pending'
+     ORDER BY attempts, id
+     LIMIT ?1";
+
 /// A queue item failing this many embedding attempts is marked `failed` and
 /// left for inspection rather than retried forever.
 pub const EMBED_MAX_ATTEMPTS: i64 = 3;
@@ -507,11 +519,24 @@ pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
 /// one embedding call's worth of text on any encoder.
 pub const INTERP_CARD_MAX_CHARS: usize = 300;
 
+/// Names the card serialization in force. Recorded in the `vec_interp`
+/// `model_registry` row at drain time; [`enqueue_missing_interpretations`]
+/// treats a store whose recorded format differs as holding stale vectors —
+/// they embed card TEXT, so a text-format change strands them silently — and
+/// drops + requeues, loudly. Bump this string whenever card text changes.
+pub const INTERP_CARD_FORMAT: &str = "set-majority-v1";
+
 /// Renders the interpretation card for one distinct value interpretation:
 /// `"{table} · {column} · {value}"` plus up to two `col: value` context
-/// fragments from the representative row's other short text columns.
-/// Deterministic — fragments arrive in column-name order and are appended
-/// only while the card stays within [`INTERP_CARD_MAX_CHARS`].
+/// fragments. Fragments are SET-LEVEL statistics of the rows sharing the
+/// interpretation, never a sampled row's cells: issue #6 measured cards
+/// perturbed by their `MIN(src_rowid)` representative drifting 5× further
+/// (within-value spread 0.29) than the gap between different values (0.06),
+/// and bare fragment-free cards BEATING fragmented ones on between-value
+/// separation — a card that describes one arbitrary member is worse than a
+/// card that describes nothing. Deterministic — fragments arrive in
+/// column-name order and are appended only while the card stays within
+/// [`INTERP_CARD_MAX_CHARS`].
 fn interpretation_card(
     table: &str,
     column: &str,
@@ -538,7 +563,9 @@ fn interpretation_card(
 /// representative cell: `src_rowid = MIN(src_rowid)` over the rows sharing
 /// the value, so the provenance-triple unique key stays exact and enqueue
 /// stays idempotent with the same reset-on-vanished-vector semantics as the
-/// document path.
+/// document path. The representative is a CITATION KEY only — it never
+/// influences card text, which is a function of the whole interpretation
+/// (see [`interpretation_card`]).
 ///
 /// This is the relational counterpart of the document queue: on value-shaped
 /// corpora nothing crosses `DOC_MIN_LEN`, so a documents-only dense channel
@@ -551,11 +578,41 @@ fn interpretation_card(
 /// ambiguous vocabulary, and no paraphrase query can ever retrieve them.
 pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     let conn = db.conn();
-    let has_interp: i64 = conn.query_row(
+    let mut has_interp: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE name = 'vec_interp'",
         [],
         |r| r.get(0),
     )?;
+
+    // Card format discipline: vec_interp holds embeddings of card TEXT, so a
+    // serialization change strands every existing vector in a space no new
+    // card will be written in. If the registry's recorded format differs
+    // from [`INTERP_CARD_FORMAT`] (including the '' a pre-format store
+    // reports), the honest move is wholesale: drop the vector table, retire
+    // its registry row, and delete the queued interpretation items so this
+    // pass rebuilds every card in the current format. Loud by design.
+    if has_interp > 0 {
+        let recorded: String = conn
+            .query_row(
+                "SELECT card_format FROM model_registry WHERE vector_table = 'vec_interp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        if recorded != INTERP_CARD_FORMAT {
+            tracing::warn!(
+                recorded = %recorded,
+                current = INTERP_CARD_FORMAT,
+                "interpretation card format changed: dropping vec_interp and requeueing all cards"
+            );
+            conn.execute_batch(
+                "DROP TABLE vec_interp;
+                 DELETE FROM model_registry WHERE vector_table = 'vec_interp';
+                 DELETE FROM embed_queue WHERE serialized != '';",
+            )?;
+            has_interp = 0;
+        }
+    }
     // Same materialization trick as the document path: vec0 metadata columns
     // are not probe-friendly, so the covered keys are copied out once.
     conn.execute_batch(
@@ -576,9 +633,11 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
              ON covered_interp(src_table, src_column, src_rowid);",
     )?;
 
-    // One row per distinct interpretation; the bare `value` column resolves
-    // to the row that achieved MIN(src_rowid) (SQLite's documented bare-
-    // column-with-min semantics), which is exactly the representative cell.
+    // One row per distinct interpretation. The displayed value is the MODAL
+    // raw spelling over the rows sharing the value_norm (ties broken
+    // lexicographically) — a property of the set, deterministic under any
+    // insertion order — never the representative row's cell, which is kept
+    // only as the citation key.
     //
     // Candidacy is column-typed. A card is consulted solely when the same
     // value ties across DISTINCT (table, column) readings — but on
@@ -592,10 +651,15 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     // *vocabulary* of the corpus — typically orders of magnitude below the
     // untyped predicate on warehouse shapes (issue #2: 846,989 cards, 90.4%
     // epoch floats, against 98 useful documents).
-    let missing: Vec<(String, String, i64, String)> = {
+    let missing: Vec<(String, String, i64, String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT t.src_table, t.src_column, t.rep, t.value FROM (
-                 SELECT lv.src_table, lv.src_column, MIN(lv.src_rowid) AS rep, lv.value
+            "SELECT t.src_table, t.src_column, t.rep, t.value_norm,
+                    (SELECT v.value FROM lex_values v
+                     WHERE v.src_table = t.src_table AND v.src_column = t.src_column
+                       AND v.value_norm = t.value_norm AND v.is_doc = 0
+                     GROUP BY v.value ORDER BY count(*) DESC, v.value LIMIT 1)
+             FROM (
+                 SELECT lv.src_table, lv.src_column, MIN(lv.src_rowid) AS rep, lv.value_norm
                  FROM lex_values lv
                  JOIN lex_columns lc ON lc.src_table = lv.src_table
                                     AND lc.src_column = lv.src_column
@@ -621,17 +685,42 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
                    AND c.src_rowid = t.rep)
              ORDER BY t.src_table, t.src_column, t.rep",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
         rows.collect::<std::result::Result<_, _>>()?
     };
 
     let mut queued = 0usize;
     {
+        // Set-level fragments: for each OTHER paraphrasable (`text`-kind,
+        // non-doc) column of the same table, the modal value across ALL rows
+        // sharing the interpretation — included only when that mode is a
+        // strict majority (> 50% of the column's non-null values in the set;
+        // a definition, not a tunable — and one that makes the winner unique,
+        // so no tie-break is ever exercised). A column with no majority
+        // contributes nothing, and an interpretation with no majorities gets
+        // a bare `table · column · value` card: issue #6 measured bare cards
+        // beating single-row-fragment cards on between-value separation, so
+        // omission is strictly better than sampled noise. The whole
+        // computation is a GROUP BY — deterministic, insertion-order-free.
         let mut frag_stmt = conn.prepare_cached(
-            "SELECT src_column, value FROM lex_values
-             WHERE src_table = ?1 AND src_rowid = ?2 AND is_doc = 0
-               AND src_column != ?3
-             ORDER BY src_column LIMIT 2",
+            "SELECT src_column, value FROM (
+                 SELECT o.src_column AS src_column, o.value AS value,
+                        count(*) AS n,
+                        sum(count(*)) OVER (PARTITION BY o.src_column) AS total
+                 FROM lex_values me
+                 JOIN lex_values o
+                   ON o.src_table = me.src_table AND o.src_rowid = me.src_rowid
+                 JOIN lex_columns oc
+                   ON oc.src_table = o.src_table AND oc.src_column = o.src_column
+                 WHERE me.src_table = ?1 AND me.src_column = ?2
+                   AND me.value_norm = ?3 AND me.is_doc = 0
+                   AND o.src_column != ?2 AND o.is_doc = 0
+                   AND oc.kind = 'text'
+                 GROUP BY o.src_column, o.value)
+             WHERE 2 * n > total
+             ORDER BY src_column",
         )?;
         let mut insert = conn.prepare_cached(
             "INSERT INTO embed_queue (src_table, src_column, src_rowid, serialized)
@@ -641,11 +730,12 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
                  updated_at = datetime('now')
              WHERE embed_queue.status = 'done'",
         )?;
-        for (table, column, rep, value) in missing {
+        for (table, column, rep, value_norm, value) in missing {
             let fragments: Vec<(String, String)> = frag_stmt
-                .query_map(stemmadb::rusqlite::params![table, rep, column], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?
+                .query_map(
+                    stemmadb::rusqlite::params![table, column, value_norm],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?
                 .collect::<std::result::Result<_, _>>()?;
             let card = interpretation_card(&table, &column, &value, &fragments);
             queued += insert.execute(stemmadb::rusqlite::params![table, column, rep, card])?;
@@ -672,10 +762,10 @@ pub struct DrainStats {
 /// Either vec0 table is created (at the embedder's reported dimension) with
 /// its own `model_registry` row on first use.
 ///
-/// Documents and cards are embedded RAW — the asymmetric Qwen3-style
-/// convention puts the instruction on the query side only
-/// (`stemma_embed::format_query`); applying it here would desert the vector
-/// space the queries live in.
+/// Documents and cards are embedded RAW — the asymmetric convention of
+/// instruction-tuned retrieval encoders puts the template on the query side
+/// only ([`Embedder::format_query`]); applying it here would desert the
+/// vector space the queries live in.
 ///
 /// Failure semantics: an embedding-call failure bumps `attempts` on the batch
 /// and returns the error (the caller decides whether to keep going); an item
@@ -751,44 +841,45 @@ pub fn drain_embed_queue(
         [EMBED_MAX_ATTEMPTS],
     )?;
 
-    // One batch of pending work, least-retried first. `serialized` is the
-    // text to embed when set — the interpretation card, which also routes the
-    // vector to vec_interp; documents leave it empty and are fetched from
-    // lex_values so the store holds each document once.
-    let mut items: Vec<(i64, String, String, i64, String, Option<String>)> = Vec::new();
+    // One batch of pending work, least-retried first. Selection touches
+    // embed_queue alone: the composite (status, attempts, id) index yields
+    // the ORDER BY directly, so the scan stops at `batch` rows instead of
+    // sorting — and joining — every pending row per batch (issue #4). The
+    // payload lookup joins AFTER selection, for just the chosen rows.
+    let mut items: Vec<(i64, String, String, i64, String)> = Vec::new();
     {
-        let mut stmt = conn.prepare_cached(
-            "SELECT q.id, q.src_table, q.src_column, q.src_rowid, q.serialized,
-                    coalesce(nullif(q.serialized, ''), lv.value)
-             FROM embed_queue q
-             LEFT JOIN lex_values lv
-               ON lv.src_table = q.src_table AND lv.src_column = q.src_column
-              AND lv.src_rowid = q.src_rowid
-             WHERE q.status = 'pending'
-             ORDER BY q.attempts, q.id
-             LIMIT ?1",
-        )?;
+        let mut stmt = conn.prepare_cached(DRAIN_BATCH_SQL)?;
         let rows = stmt.query_map([batch as i64], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?;
         for row in rows {
             items.push(row?);
         }
     }
 
-    // Items whose source text is gone (index rebuilt out from under the
-    // queue) cannot be embedded, now or later. Interpretation items carry
-    // their card in the queue, so only document items can go missing.
+    // `serialized` is the text to embed when set — the interpretation card,
+    // which also routes the vector to vec_interp; documents leave it empty
+    // and their text is fetched from lex_values here (per selected item, not
+    // per pending item) so the store holds each document once. Items whose
+    // source text is gone (index rebuilt out from under the queue) cannot be
+    // embedded, now or later; interpretation items carry their card in the
+    // queue, so only document items can go missing.
     let mut texts = Vec::new();
     let mut work: Vec<(i64, String, String, i64, &'static str)> = Vec::new();
-    for (id, table, column, rowid, serialized, text) in items {
+    let mut doc_text = conn.prepare_cached(
+        "SELECT value FROM lex_values
+         WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3",
+    )?;
+    for (id, table, column, rowid, serialized) in items {
+        let text = if serialized.is_empty() {
+            doc_text
+                .query_row(stemmadb::rusqlite::params![table, column, rowid], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+        } else {
+            Some(serialized.clone())
+        };
         match text {
             Some(t) => {
                 let target = if serialized.is_empty() {
@@ -848,11 +939,28 @@ pub fn drain_embed_queue(
                      );"
                 ))?;
             }
+            // The registry row records the whole identity of the space:
+            // model, dimension, the query-side template the embedder pairs
+            // with its vectors, and — for vec_interp — the card format its
+            // vectors were serialized under (enqueue invalidates on
+            // mismatch).
             conn.execute(
-                "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
-                 VALUES (?1, ?2, ?3, ?4, 'f32')
+                "INSERT INTO model_registry (vector_table, backend, model, dimension,
+                                             quantization, query_template, card_format)
+                 VALUES (?1, ?2, ?3, ?4, 'f32', ?5, ?6)
                  ON CONFLICT(vector_table) DO NOTHING",
-                stemmadb::rusqlite::params![target, identity.backend, identity.model, dim as i64],
+                stemmadb::rusqlite::params![
+                    target,
+                    identity.backend,
+                    identity.model,
+                    dim as i64,
+                    identity.query_template,
+                    if target == "vec_interp" {
+                        INTERP_CARD_FORMAT
+                    } else {
+                        ""
+                    },
+                ],
             )?;
         }
 
@@ -1210,11 +1318,16 @@ mod tests {
     struct FakeEmbedder {
         dim: usize,
         fail: bool,
+        template: String,
     }
 
     impl FakeEmbedder {
         fn new(dim: usize) -> Self {
-            Self { dim, fail: false }
+            Self {
+                dim,
+                fail: false,
+                template: String::new(),
+            }
         }
         fn vector(&self, text: &str) -> Vec<f32> {
             let mut state: u64 = 0xcbf29ce484222325;
@@ -1253,6 +1366,7 @@ mod tests {
                 backend: "fake".into(),
                 model: "fake-embedder".into(),
                 dimension: self.dim,
+                query_template: self.template.clone(),
             }
         }
     }
@@ -1392,7 +1506,11 @@ mod tests {
     fn embed_failures_respect_the_retry_budget() {
         let db = doc_db();
         enqueue_missing_embeddings(&db).unwrap();
-        let broken = FakeEmbedder { dim: 8, fail: true };
+        let broken = FakeEmbedder {
+            dim: 8,
+            fail: true,
+            template: String::new(),
+        };
         for attempt in 1..=EMBED_MAX_ATTEMPTS {
             let err = drain_embed_queue(&db, &broken, EMBED_BATCH).unwrap_err();
             assert!(matches!(err, Error::Embed(_)), "attempt {attempt}: {err}");
@@ -1467,6 +1585,218 @@ mod tests {
         assert!(card.chars().count() <= INTERP_CARD_MAX_CHARS);
         assert!(card.starts_with("t · c · x"));
         assert!(!card.contains("other"), "oversized fragment is dropped");
+    }
+
+    /// Issue #4's regression guard: the drain's batch selection must be
+    /// answered by walking the (status, attempts, id) index in output order —
+    /// any temp B-tree in the plan means SQLite is re-sorting the whole
+    /// pending queue per batch.
+    #[test]
+    fn drain_batch_selection_plan_has_no_temp_btree() {
+        let db = value_db();
+        enqueue_missing_interpretations(&db).unwrap();
+        let plan: Vec<String> = db
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {DRAIN_BATCH_SQL}"))
+            .unwrap()
+            .query_map([EMBED_BATCH as i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            !plan.to_uppercase().contains("TEMP B-TREE"),
+            "batch selection must not materialize a sort:\n{plan}"
+        );
+        assert!(
+            plan.contains("embed_queue_status_attempts_id"),
+            "batch selection walks the composite index:\n{plan}"
+        );
+    }
+
+    /// A corpus for the set-level card semantics: two tables sharing a
+    /// category vocabulary, a brand column with one clear majority
+    /// ('Carhartt' on 3 of 4 Outerwear rows) and one exact 50/50 split (the
+    /// Dresses rows), plus a constant epoch column that no card may quote.
+    /// `rows` controls both insertion order and which row wins MIN(rowid).
+    fn card_fixture(rows: &[(i64, &str, &str)]) -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.items(id INTEGER PRIMARY KEY,
+                     category TEXT, brand TEXT, created_at TEXT);
+                 CREATE TABLE src.tags(id INTEGER PRIMARY KEY, label TEXT);
+                 INSERT INTO src.tags VALUES (1, 'Outerwear & Coats'), (2, 'Dresses');",
+            )
+            .unwrap();
+        for (id, category, brand) in rows {
+            db.conn()
+                .execute(
+                    "INSERT INTO src.items VALUES (?1, ?2, ?3, '1700000000.0')",
+                    stemmadb::rusqlite::params![id, category, brand],
+                )
+                .unwrap();
+        }
+        build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    fn cards_of(db: &StemmaDb) -> Vec<(String, String, String)> {
+        enqueue_missing_interpretations(db).unwrap();
+        db.conn()
+            .prepare(
+                "SELECT src_table, src_column, serialized FROM embed_queue
+                 WHERE serialized != ''
+                 ORDER BY src_table, src_column, serialized",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Issue #6's core complaint: card text depended on which row happened to
+    /// win MIN(src_rowid). The same logical corpus, built in two insertion
+    /// orders with the primary keys permuted so a DIFFERENT row is the
+    /// representative each time, must produce byte-identical cards.
+    #[test]
+    fn cards_are_identical_across_insertion_orders() {
+        // Forward: the Carhartt rows lead; MIN-rowid Outerwear row is Carhartt,
+        // MIN-rowid Dresses row is Levi's.
+        let forward = card_fixture(&[
+            (1, "Outerwear & Coats", "Carhartt"),
+            (2, "Outerwear & Coats", "Carhartt"),
+            (3, "Outerwear & Coats", "Carhartt"),
+            (4, "Outerwear & Coats", "Columbia"),
+            (5, "Dresses", "Levi's"),
+            (6, "Dresses", "Oakley"),
+        ]);
+        // Permuted: inserted in reverse, ids reassigned so the representative
+        // Outerwear row is now Columbia and the representative Dresses row is
+        // Oakley — the exact perturbation that used to rewrite the card.
+        let permuted = card_fixture(&[
+            (6, "Dresses", "Levi's"),
+            (5, "Dresses", "Oakley"),
+            (4, "Outerwear & Coats", "Carhartt"),
+            (3, "Outerwear & Coats", "Carhartt"),
+            (2, "Outerwear & Coats", "Carhartt"),
+            (1, "Outerwear & Coats", "Columbia"),
+        ]);
+        let (a, b) = (cards_of(&forward), cards_of(&permuted));
+        assert_eq!(a, b, "cards are a function of the set, not of row order");
+
+        let card = |table: &str, column: &str, needle: &str| -> String {
+            a.iter()
+                .map(|(t, c, s)| (t.as_str(), c.as_str(), s.as_str()))
+                .find(|(t, c, s)| *t == table && *c == column && s.contains(needle))
+                .map(|(_, _, s)| s.to_string())
+                .unwrap_or_else(|| panic!("no {table}.{column} card containing {needle:?}"))
+        };
+        // Strict majority (3/4): the modal brand is included.
+        assert_eq!(
+            card("items", "category", "Outerwear"),
+            "items · category · Outerwear & Coats · brand: Carhartt"
+        );
+        // Exact half is not a majority: the fragment is omitted and the card
+        // falls back to bare — which issue #6 measured beating a sampled
+        // fragment on between-value separation.
+        assert_eq!(
+            card("items", "category", "Dresses"),
+            "items · category · Dresses"
+        );
+        // The constant epoch column is temporal-kind, not paraphrasable: even
+        // a 100% mode never becomes a fragment.
+        for (_, _, s) in &a {
+            assert!(!s.contains("created_at"), "no temporal fragments: {s}");
+        }
+        // Single-column tables have nothing set-level to say: bare cards.
+        assert_eq!(card("tags", "label", "Dresses"), "tags · label · Dresses");
+    }
+
+    /// Cards embed card TEXT, so changing the serialization strands existing
+    /// vec_interp vectors. Enqueue must notice a foreign recorded format,
+    /// drop the table, retire its registry row and requeue every card.
+    #[test]
+    fn card_format_change_invalidates_vec_interp_and_requeues() {
+        let db = value_db();
+        let embedder = FakeEmbedder::new(8);
+        enqueue_missing_interpretations(&db).unwrap();
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        let fmt: String = db
+            .conn()
+            .query_row(
+                "SELECT card_format FROM model_registry WHERE vector_table = 'vec_interp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fmt, INTERP_CARD_FORMAT,
+            "drain records the format it embedded"
+        );
+
+        // Simulate a store written under an older card serialization.
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET card_format = 'row-sample-v0'
+                 WHERE vector_table = 'vec_interp'",
+                [],
+            )
+            .unwrap();
+        let requeued = enqueue_missing_interpretations(&db).unwrap();
+        assert_eq!(requeued, 6, "every interpretation is requeued");
+        assert_eq!(queue_counts(&db), (6, 0, 0));
+        let gone: i64 = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM sqlite_master WHERE name = 'vec_interp')
+                        + (SELECT count(*) FROM model_registry WHERE vector_table = 'vec_interp')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "stale vectors and their registry row are gone");
+
+        // The next drain rebuilds the table under the current format.
+        let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (6, 0, 0));
+        let (n, fmt): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM vec_interp), card_format
+                 FROM model_registry WHERE vector_table = 'vec_interp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((n, fmt.as_str()), (6, INTERP_CARD_FORMAT));
+    }
+
+    /// Issue #5: the query template travels with the model identity — the
+    /// backend renders queries through it, and the drain records it in the
+    /// registry beside the model it must agree with.
+    #[test]
+    fn drain_records_the_query_template_in_the_registry() {
+        let db = value_db();
+        let embedder = FakeEmbedder {
+            dim: 8,
+            fail: false,
+            template: "Find rows for: {query}".into(),
+        };
+        assert_eq!(embedder.format_query("socks"), "Find rows for: socks");
+        assert_eq!(FakeEmbedder::new(8).format_query("socks"), "socks");
+        enqueue_missing_interpretations(&db).unwrap();
+        drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        let template: String = db
+            .conn()
+            .query_row(
+                "SELECT query_template FROM model_registry WHERE vector_table = 'vec_interp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(template, "Find rows for: {query}");
     }
 
     #[test]

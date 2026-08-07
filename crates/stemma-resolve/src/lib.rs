@@ -317,7 +317,7 @@ pub fn resolve_full(
             targets.truncate(DENSE_MAX_SPANS);
             let texts: Vec<String> = targets
                 .iter()
-                .map(|s| stemma_embed::format_query(&s.text))
+                .map(|s| embedder.format_query(&s.text))
                 .collect();
             let ids: Vec<usize> = targets.iter().map(|s| s.id).collect();
             match embedder.embed(&texts) {
@@ -1415,8 +1415,9 @@ fn render_kg_path(
 // context, so conditioning on the FULL query separates the tie.
 //
 // Mechanics: for a span whose top two candidates are tied value
-// interpretations, the query is embedded once (format_query — the query side
-// of the asymmetric scheme) and the two cards' vectors are fetched directly
+// interpretations, the query is embedded once (Embedder::format_query — the
+// query side of the asymmetric scheme, rendered through the backend's own
+// template) and the two cards' vectors are fetched directly
 // from vec_interp by their provenance key — a plain filtered read, no KNN —
 // with the cosine computed in-process, which is exact. Both candidates gain
 // a "context" ChannelScore (rank by cosine order, raw = cosine), and the
@@ -1503,7 +1504,7 @@ fn apply_context_affinity(
             continue;
         };
         if query_vec.is_none() {
-            match embedder.embed(&[stemma_embed::format_query(query)]) {
+            match embedder.embed(&[embedder.format_query(query)]) {
                 Ok(mut v) if !v.is_empty() => query_vec = Some(v.remove(0)),
                 _ => return, // embedder down: the whole pass degrades
             }
@@ -2254,6 +2255,7 @@ mod tests {
                 backend: "fake".into(),
                 model: "hash-embedder".into(),
                 dimension: Self::DIM,
+                query_template: String::new(),
             }
         }
     }
@@ -2818,6 +2820,7 @@ mod tests {
                 backend: "fake".into(),
                 model: "marker-embedder".into(),
                 dimension: MARKERS.len() + 1,
+                query_template: String::new(),
             }
         }
     }

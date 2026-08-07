@@ -43,6 +43,16 @@ struct Args {
     #[arg(long)]
     embed_model: Option<String>,
 
+    /// Query-side template for the embedder, with a "{query}" placeholder
+    /// (e.g. "Instruct: ...\nQuery: {query}"). Endpoint, model and template
+    /// must agree, so all three are configurable together; overrides
+    /// server.embedder.query_template in the config file. Unset, the
+    /// template is chosen by model family (Qwen3-Embedding models get their
+    /// published retrieval instruction, anything else embeds queries bare);
+    /// pass "{query}" to force bare on any model.
+    #[arg(long)]
+    embed_query_template: Option<String>,
+
     /// OpenAI-compatible /v1/chat/completions base URL enabling the LM
     /// adjudication band (e.g. http://host:8080/v1). Absent = no LM;
     /// resolution is fully local.
@@ -68,7 +78,7 @@ struct ConfigFile {
 #[derive(serde::Deserialize, Default)]
 struct ServerSection {
     listen: Option<SocketAddr>,
-    embedder: Option<EndpointSection>,
+    embedder: Option<EmbedderSection>,
     lm: Option<EndpointSection>,
 }
 
@@ -76,6 +86,18 @@ struct ServerSection {
 struct EndpointSection {
     endpoint: String,
     model: String,
+}
+
+/// The embedder carries one more knob than a plain endpoint: the query-side
+/// template ("{query}" placeholder) that must agree with the model. Absent,
+/// the default is looked up by model family
+/// (`stemma_embed::default_query_template`).
+#[derive(serde::Deserialize)]
+struct EmbedderSection {
+    endpoint: String,
+    model: String,
+    #[serde(default)]
+    query_template: Option<String>,
 }
 
 /// Flags override the file; relative database paths in the file resolve
@@ -107,6 +129,9 @@ fn merge_config(args: &mut Args) -> anyhow::Result<()> {
     if let Some(e) = cfg.server.embedder {
         args.embed_endpoint.get_or_insert(e.endpoint);
         args.embed_model.get_or_insert(e.model);
+        if let Some(t) = e.query_template {
+            args.embed_query_template.get_or_insert(t);
+        }
     }
     if let Some(l) = cfg.server.lm {
         args.lm_endpoint.get_or_insert(l.endpoint);
@@ -217,7 +242,13 @@ impl ResolveService for Resolver {
 /// can be large, so this ordering lights the dense document channel in
 /// seconds instead of after the full interpretation pass. The drain routes
 /// each item by kind: documents into vec_dense, cards into vec_interp.
-fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str) {
+fn drain_task(
+    name: &str,
+    user_db: &std::path::Path,
+    endpoint: &str,
+    model: &str,
+    query_template: Option<String>,
+) {
     let store = user_db.with_extension("stemmadb");
     let db = match StemmaDb::open(&store, user_db) {
         Ok(db) => db,
@@ -226,7 +257,7 @@ fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str
             return;
         }
     };
-    let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model);
+    let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model, query_template);
 
     let start = std::time::Instant::now();
     let queued_docs = match stemma_ingest::enqueue_missing_embeddings(&db) {
@@ -361,10 +392,28 @@ async fn main() -> anyhow::Result<()> {
         dbs.insert(name.clone(), Mutex::new(db));
     }
 
+    // The query template is part of the model identity: explicit config
+    // (flag over file) wins, otherwise it is looked up by model family —
+    // Qwen3-Embedding gets its published instruction, anything else embeds
+    // queries bare.
+    let embed_template = args.embed_query_template.clone().or_else(|| {
+        args.embed_model
+            .as_deref()
+            .and_then(stemma_embed::default_query_template)
+    });
     let embedder = match (&args.embed_endpoint, &args.embed_model) {
         (Some(ep), Some(m)) => {
-            tracing::info!(endpoint = %ep, model = %m, "dense channel enabled");
-            Some(stemma_embed::OpenAiEmbedder::new(ep, m))
+            tracing::info!(
+                endpoint = %ep,
+                model = %m,
+                query_template = embed_template.as_deref().unwrap_or("(bare)"),
+                "dense channel enabled"
+            );
+            Some(stemma_embed::OpenAiEmbedder::new(
+                ep,
+                m,
+                embed_template.clone(),
+            ))
         }
         _ => None,
     };
@@ -386,7 +435,8 @@ async fn main() -> anyhow::Result<()> {
         for (name, user_db) in &args.dbs {
             let (name, user_db) = (name.clone(), user_db.clone());
             let (ep, model) = (ep.clone(), model.clone());
-            tokio::task::spawn_blocking(move || drain_task(&name, &user_db, &ep, &model));
+            let template = embed_template.clone();
+            tokio::task::spawn_blocking(move || drain_task(&name, &user_db, &ep, &model, template));
         }
     }
 

@@ -77,13 +77,15 @@ types rather than applying its usual affinity coercions.
 
 ```sql
 CREATE TABLE IF NOT EXISTS model_registry (
-    vector_table TEXT PRIMARY KEY,
-    backend      TEXT NOT NULL,
-    model        TEXT NOT NULL,
-    revision     TEXT NOT NULL DEFAULT '',
-    dimension    INTEGER NOT NULL,
-    quantization TEXT NOT NULL DEFAULT 'f32',
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    vector_table   TEXT PRIMARY KEY,
+    backend        TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    revision       TEXT NOT NULL DEFAULT '',
+    dimension      INTEGER NOT NULL,
+    quantization   TEXT NOT NULL DEFAULT 'f32',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    query_template TEXT NOT NULL DEFAULT '',
+    card_format    TEXT NOT NULL DEFAULT ''
 ) STRICT;
 ```
 
@@ -102,6 +104,26 @@ service returns from `ModelInfo`
 vector table can always be traced back to a running service. `dimension` and
 `quantization` are recorded rather than inferred because `vec0` needs both
 at DDL time and a mismatch is otherwise a silent correctness bug.
+
+Two columns extend the identity beyond the model name, both `''` where they
+do not apply:
+
+- **`query_template`** — the query-side convention (`{query}` placeholder,
+  empty = queries embedded bare) in force when the table was registered.
+  Endpoint, model and template must agree with each other (issue #5), so
+  the template is part of the model identity carried by
+  `stemma_embed::ModelIdentity`, not a global constant; see
+  [05-encoders-decoders.md](05-encoders-decoders.md#query-time-requirements).
+- **`card_format`** — for `'vec_interp'` only: the name of the
+  interpretation-card serialization
+  (`stemma_ingest::INTERP_CARD_FORMAT`) whose text the vectors embed.
+  Cards are embeddings *of card text*, so a format change strands every
+  existing vector; `enqueue_missing_interpretations` compares the recorded
+  format against the current constant and, on mismatch, drops `vec_interp`,
+  retires its registry row and requeues every card — loudly. A pre-format
+  store reports `''`, which mismatches by construction, so stale vectors
+  from before the column existed are invalidated on the first run that
+  knows better.
 
 The table is written from two places:
 `stemma_ingest::build_dense_index` upserts the `'vec_dense'` row at
@@ -206,11 +228,17 @@ CREATE VIRTUAL TABLE vec_interp USING vec0(
 One vector per **distinct value interpretation** — `(src_table, src_column,
 value_norm)` with `is_doc = 0` — keyed by the interpretation's
 representative cell, `src_rowid = MIN(src_rowid)` over the rows sharing the
-value. What is embedded is not the value but its **interpretation card**
+value. The representative is a **citation key only**: it anchors the unique
+provenance triple and never influences card text. What is embedded is not
+the value but its **interpretation card**
 (see [05-encoders-decoders.md](05-encoders-decoders.md#what-gets-embedded)):
-`table · column · value` plus up to two `col: value` fragments from the
-representative row, ≤ 300 characters, built at enqueue time into
-`embed_queue.serialized`.
+`table · column · value` plus up to two `col: value` fragments that are
+set-level statistics (strict-majority modes) over *all* rows sharing the
+interpretation, ≤ 300 characters, built at enqueue time into
+`embed_queue.serialized`. The serialization is named by
+`stemma_ingest::INTERP_CARD_FORMAT` and recorded in the registry row's
+`card_format`; a mismatch invalidates the table (see
+[`model_registry`](#model_registry)).
 
 The volume argument for a per-interpretation rather than per-cell table:
 interpretations dedupe over `value_norm`, so a column with a million rows
@@ -245,8 +273,24 @@ CREATE TABLE IF NOT EXISTS embed_queue (
     updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (src_table, src_column, src_rowid)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS embed_queue_status ON embed_queue(status);
+CREATE INDEX IF NOT EXISTS embed_queue_status_attempts_id
+    ON embed_queue(status, attempts, id);
 ```
+
+The composite index is shaped for the drain's batch selection —
+`WHERE status = 'pending' ORDER BY attempts, id LIMIT 32` — so SQLite walks
+the index in output order and stops at the LIMIT. Under the earlier
+status-only index the ORDER BY forced a temp B-tree over *every* pending row
+per batch, and the payload join ran before the sort, so a batch of 32 cost
+one `lex_values` lookup per queued item (issue #4: 3,695 ms → 0.2 ms per
+batch on 844K pending items; the scan was 71% of drain wall-clock). The
+batch statement is correspondingly join-free — it selects the 32 ids first
+and fetches payload text per selected item — and a test pins the plan to
+the index with no temp B-tree. The status-only index it replaces is
+redundant (equality lookups use the composite's prefix) and is dropped by
+the shape-guarded maintenance in `init_store_schema`, with no version bump:
+index creation and removal are idempotent and carry no data (see
+[Migration discipline](#migration-discipline)).
 
 The write path never waits on a model — the queue-driven external-worker
 pattern proven by the PostgreSQL vectorizer lineage [pgai-vectorizer],
@@ -402,14 +446,24 @@ The rules:
    the entire current schema to a store at any older version is correct and
    cheap. There is no per-version migration script to get wrong, and no
    ordering to maintain.
-3. **`ALTER` is the exception, and is guarded by version.** `ALTER TABLE …
-   ADD COLUMN` is not idempotent, so it cannot live in `SCHEMA_SQL`. v3's
-   addition of `query_log.source` and `query_log.session` is guarded by
-   `found == 2` — precisely the case where `query_log` exists without them.
-   A v0 or v1 store never had `query_log` at all, so `SCHEMA_SQL` creates it
-   already carrying the new columns and the `ALTER` must not run. The guard
-   is exact, not approximate.
-4. **Additive only.** No column is ever dropped or retyped, and no table is
+3. **`ALTER` is the exception, and is guarded.** `ALTER TABLE … ADD COLUMN`
+   is not idempotent, so it cannot live in `SCHEMA_SQL`. v3's addition of
+   `query_log.source` and `query_log.session` is guarded by `found == 2` —
+   precisely the case where `query_log` exists without them. A v0 or v1
+   store never had `query_log` at all, so `SCHEMA_SQL` creates it already
+   carrying the new columns and the `ALTER` must not run. The guard is
+   exact, not approximate. The other guard flavor is *shape*: the additive
+   `model_registry` columns (`query_template`, `card_format`) are applied by
+   probing `pragma_table_info` and `ALTER`ing only when the column is
+   missing, which also reaches stores already stamped at the current
+   version — so an additive column does not consume a version number.
+4. **Index shape is maintained below the version, unconditionally.**
+   `DROP INDEX IF EXISTS` / `CREATE INDEX IF NOT EXISTS` are idempotent and
+   indexes carry no data, so index changes (the `embed_queue` composite
+   replacing the status-only index) run on every open, outside the
+   versioned block. A version bump would buy nothing and would collide with
+   migrations that genuinely need one.
+5. **Additive only.** No column is ever dropped or retyped, and no table is
    renamed. This is affordable precisely because the store is derived: if a
    change ever genuinely needs to be destructive, the answer is to bump the
    version and let the user re-ingest. v4 is the one exercised case:
@@ -422,10 +476,10 @@ The rules:
 
 ### Shape-change self-healing below the version
 
-Two subsystems own tables whose *shape* can change without a store-version
-bump, because they are recomputable in seconds-to-minutes and a version bump
-would force an unnecessary full re-ingest of everything else. Both detect
-their own staleness and repair by dropping and rebuilding:
+Three subsystems own tables whose *shape or content contract* can change
+without a store-version bump, because they are recomputable and a version
+bump would force an unnecessary full re-ingest of everything else. Each
+detects its own staleness and repairs by dropping and rebuilding:
 
 - **Lexical index** (`build_lexical_index`): if `lex_values` exists but
   `pragma_table_info('lex_values')` has no `is_doc` column, drop
@@ -433,6 +487,12 @@ their own staleness and repair by dropping and rebuilding:
 - **Knowledge store** (`SqliteKnowledgeStore::new`): if `kg_edges` exists
   without a `props` column, drop `kg_edges`, `kg_nodes`, `kg_meta` and let
   the next `compile` rebuild.
+- **Interpretation cards** (`enqueue_missing_interpretations`): if the
+  `vec_interp` registry row's `card_format` differs from
+  `INTERP_CARD_FORMAT`, drop `vec_interp`, retire the row, delete the
+  queued card items and requeue everything in the current serialization —
+  the vectors embed card *text*, so a format change is a shape change of
+  the content.
 
 The discipline is: *store-version migrations for bookkeeping tables the user
 might care about; drop-and-rebuild for pure derived indexes.*
