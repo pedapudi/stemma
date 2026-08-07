@@ -169,9 +169,9 @@ kinds of item, and keeps them in two vector tables.
 classified `is_doc` — long text that mentions resolve *into* — embedded
 verbatim, with no instruction prefix, into `vec_dense`. That is the
 asymmetric convention of instruction-tuned retrieval encoders:
-`format_query()` decorates the query-time mention, documents stay raw, and
-applying the instruction on the document side would desert the space the
-queries live in. Documents longer than the encoder's context are truncated
+`Embedder::format_query()` decorates the query-time mention through the
+backend's own template, documents stay raw, and applying the instruction on
+the document side would desert the space the queries live in. Documents longer than the encoder's context are truncated
 by the endpoint today — chunking is designed, not built.
 
 *Interpretation cards, one vector per distinct value interpretation.*
@@ -200,12 +200,41 @@ For every qualifying distinct `(src_table, src_column, value_norm)` with
 offices · city · Seattle · name: Seattle - Northgate
 ```
 
-— the provenance line plus up to two `col: value` context fragments from a
-representative row's other short columns, deterministic and capped at
-300 characters. The card is stored in `embed_queue.serialized` at enqueue
-time and embedded raw (cards are "documents" in the asymmetric scheme) into
-`vec_interp`, a second `vec0` table with its own `model_registry` row and the
-same one-model-per-table invariant.
+— the provenance line plus up to two `col: value` context fragments,
+deterministic and capped at 300 characters. The card is stored in
+`embed_queue.serialized` at enqueue time and embedded raw (cards are
+"documents" in the asymmetric scheme) into `vec_interp`, a second `vec0`
+table with its own `model_registry` row and the same one-model-per-table
+invariant.
+
+**Fragments are set-level, never sampled.** An interpretation is a
+set-level object — all the rows sharing the value — and the first card
+format described it with two cells from the single row that won
+`MIN(src_rowid)`, an insertion-order artifact. Issue #6 measured the
+consequence: two cards for the *same* reading, differing only in the
+sampled row, were less similar (0.7652 cosine) than two cards for
+*different* readings (0.9485); on a real corpus the within-value spread
+(0.2907) was 5× the between-value gap (0.0581), and 4 of 6 tie-break
+probes changed answer with nothing but the representative row. Dropping
+timestamps did not help — with fewer fragments each remaining one occupies
+more of the card, so *any* single-row fragment destabilizes it. The card
+format therefore aggregates: for each other `text`-kind, non-doc column of
+the same table, the **modal value across all rows sharing the
+interpretation**, included only when that mode is a strict majority
+(> 50% of the column's values in the set — a definition, not a tunable,
+and one that makes the winner unique). A column with no majority
+contributes nothing; an interpretation with no majorities gets a bare
+`table · column · value` card, which the same measurement showed *beating*
+single-row-fragment cards on between-value separation — describing nothing
+is better than describing one arbitrary member. The displayed value is
+likewise the modal raw spelling (ties lexicographic). Aggregated cards were
+also the best retriever measured (MRR 0.766 vs 0.725 current, 0.705 bare).
+The representative `MIN(src_rowid)` survives only as the citation key of
+the provenance triple. Because a serialization change strands the vectors
+that embed the old text, the format is named
+(`stemma_ingest::INTERP_CARD_FORMAT`), recorded in the registry row's
+`card_format`, and a mismatch drops and requeues `vec_interp` wholesale —
+see [02-data-model.md](02-data-model.md#model_registry).
 
 The earlier documents-only policy should be named for what it was: **an
 over-fit to the first corpus.** On the legal corpus every interesting cell is
@@ -221,10 +250,10 @@ row, and the content that makes `offices` row 17 the right answer is spread
 across `name` and `city`. The resolve side consumes the cards through a
 narrow reorder pass: when fusion leaves two value interpretations tied
 (top-2 gap < 0.08, distinct `(table, column)`, both non-doc), the full query
-is embedded once through `format_query()` and each tied card's vector is read
-back by provenance key, the cosine attached as a `"context"` channel score,
-and the cosine winner boosted +0.04 (capped at 0.9 — never into the exact
-band) when the cosine gap exceeds 0.05.
+is embedded once through `Embedder::format_query()` and each tied card's
+vector is read back by provenance key, the cosine attached as a `"context"`
+channel score, and the cosine winner boosted +0.04 (capped at 0.9 — never
+into the exact band) when the cosine gap exceeds 0.05.
 
 ### Two ways vectors get in
 
@@ -304,15 +333,33 @@ agree on everything:
    `vec_dense` yields silently meaningless distances. Of everything listed in
    this document as outstanding, this is the one that fails quietly, and the
    check is four lines.
-2. **Same instruction prefix.** Instruction-tuned retrieval encoders — the
+2. **Same query template.** Instruction-tuned retrieval encoders — the
    Qwen3-Embedding family among them [Zhang 2025] — expect an
    asymmetric prompt: a task instruction on the query side, documents raw.
-   `stemma_embed::format_query()` implements it, and the same asymmetry was
-   used when the vectors were produced. Getting this wrong is the most common
-   way to lose most of an encoder's quality while everything still runs. It
-   is currently a hard-coded string in the crate; it belongs in the registry
-   beside the model identity, because a different encoder wants a different
-   instruction.
+   The template is part of the model identity
+   (`stemma_embed::ModelIdentity::query_template`, `{query}` placeholder,
+   empty = bare): `Embedder::format_query()` renders every query-side
+   embedding through it, the drain records it in the registry row beside
+   the model it must agree with, and it is configured where the endpoint
+   and model are — `server.embedder.query_template` in the config file,
+   `--embed-query-template` on the command line, with the default looked up
+   by model family (`stemma_embed::default_query_template`: Qwen3-Embedding
+   → its published instruction; anything else → bare). Getting the pairing
+   wrong is the most common way to lose most of an encoder's quality while
+   everything still runs — issue #5 measured a backend that does not
+   implement the convention collapsing ten unrelated queries to 0.82 mean
+   pairwise cosine under the foreign prefix (0.53 bare).
+
+   The same measurement is guidance on where a template earns its tokens,
+   not a code fork: on a non-implementing backend the prefix *helped* the
+   tie-break (6/6 vs 4/6 — one query against two cards, so query-space
+   compression cancels) while *hurting* KNN retrieval (top-1 8/16 vs 9/16,
+   MRR 0.655 vs 0.725 — one query against the whole index, where
+   discriminative power between queries is the entire mechanism). Both
+   paths share one template per deployment by design; the asymmetry is
+   something to weigh when configuring it, and the current deployment
+   (Qwen3-Embedding, which implements its own convention) keeps its
+   template on both paths unchanged.
 3. **Same normalization and pooling.** Handled inside the Embedder backend,
    which is why `Embedder` is a trait with a model-identity method rather
    than a raw HTTP call. Note the pipeline's L2→cosine conversion assumes

@@ -420,18 +420,15 @@ hits untouched.
 
 ### Query formatting is asymmetric
 
-```rust
-pub fn format_query(mention: &str) -> String {
-    format!("Instruct: Given a search query, retrieve relevant passages \
-             that answer the query\nQuery: {mention}")
-}
-```
-
-Documents were embedded raw; the *mention* carries the retrieval instruction.
-This is the Qwen3-Embedding-family convention [Zhang 2025], and it is
-in the code rather than in a config file because getting it wrong silently
-costs most of the encoder's quality — everything still runs, the numbers are
-just worse. See
+Documents were embedded raw; the *mention* passes through
+`Embedder::format_query()`, which renders the backend's query template
+(`{query}` placeholder). For the Qwen3-Embedding family the default template
+is the published retrieval instruction [Zhang 2025]; for other models the
+default is bare, and a deployment overrides either with
+`server.embedder.query_template` / `--embed-query-template`. The template
+lives with the model identity because endpoint, model and template must
+agree — getting the pairing wrong silently costs encoder quality;
+everything still runs, the numbers are just worse. See
 [05-encoders-decoders.md](05-encoders-decoders.md#query-time-requirements).
 
 ### Distance to similarity

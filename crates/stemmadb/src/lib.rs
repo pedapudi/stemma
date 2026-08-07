@@ -137,6 +137,52 @@ impl StemmaDb {
             self.conn
                 .pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
         }
+        // Shape-guarded maintenance, deliberately OUTSIDE the versioned
+        // block, so it also reaches stores already stamped at the current
+        // version. Index shape changes need no version bump — DROP INDEX IF
+        // EXISTS / CREATE INDEX IF NOT EXISTS are idempotent and indexes
+        // carry no data — and additive columns on the small, persistent
+        // model_registry are guarded by probing the table shape, the same
+        // discipline as the embed_queue reshape above (guarded by shape, not
+        // version). Keeping both version-free also keeps the version number
+        // free for migrations that genuinely need one.
+        //
+        // The composite index replaces the status-only index: drain's batch
+        // select is `WHERE status = 'pending' ORDER BY attempts, id LIMIT n`,
+        // and with (status, attempts, id) the index yields that order
+        // directly, so the scan stops after n rows instead of sorting every
+        // pending row into a temp B-tree per batch (issue #4: 3,695 ms →
+        // 0.2 ms on 844K pending items). The equality-only lookups the old
+        // index served are a prefix of the new one.
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS embed_queue_status;
+             CREATE INDEX IF NOT EXISTS embed_queue_status_attempts_id
+                 ON embed_queue(status, attempts, id);",
+        )?;
+        self.ensure_column(
+            "model_registry",
+            "query_template",
+            "ALTER TABLE model_registry ADD COLUMN query_template TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.ensure_column(
+            "model_registry",
+            "card_format",
+            "ALTER TABLE model_registry ADD COLUMN card_format TEXT NOT NULL DEFAULT ''",
+        )?;
+        Ok(())
+    }
+
+    /// Adds `column` to `table` if the store predates it. ALTER is not
+    /// idempotent, so additive columns are guarded by shape.
+    fn ensure_column(&self, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let present: i64 = self.conn.query_row(
+            "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |r| r.get(0),
+        )?;
+        if present == 0 {
+            self.conn.execute_batch(ddl)?;
+        }
         Ok(())
     }
 
@@ -183,14 +229,22 @@ const SCHEMA_SQL: &str = r#"
 -- Which embedding model produced the vectors of each vector table. A model
 -- change never mutates in place: a new vector table is backfilled and swapped
 -- in (blue-green), so vector spaces are never silently mixed.
+-- `query_template` is the query-side convention ('{query}' placeholder,
+-- empty = bare) in force when the table was registered — part of the model
+-- identity, since endpoint, model and template must agree. `card_format`
+-- names the interpretation-card serialization that produced vec_interp's
+-- vectors; a format change invalidates them (the ingest layer drops and
+-- requeues on mismatch). Both are '' where they do not apply.
 CREATE TABLE IF NOT EXISTS model_registry (
-    vector_table TEXT PRIMARY KEY,
-    backend      TEXT NOT NULL,
-    model        TEXT NOT NULL,
-    revision     TEXT NOT NULL DEFAULT '',
-    dimension    INTEGER NOT NULL,
-    quantization TEXT NOT NULL DEFAULT 'f32',
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    vector_table   TEXT PRIMARY KEY,
+    backend        TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    revision       TEXT NOT NULL DEFAULT '',
+    dimension      INTEGER NOT NULL,
+    quantization   TEXT NOT NULL DEFAULT 'f32',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    query_template TEXT NOT NULL DEFAULT '',
+    card_format    TEXT NOT NULL DEFAULT ''
 ) STRICT;
 
 -- Cells awaiting (re-)embedding. Writes never wait on the embedder: ingest
@@ -213,7 +267,11 @@ CREATE TABLE IF NOT EXISTS embed_queue (
     updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (src_table, src_column, src_rowid)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS embed_queue_status ON embed_queue(status);
+-- (status, attempts, id) serves both the drain's ordered batch select and
+-- the per-status counts; see the maintenance block in init_store_schema for
+-- why it replaced the status-only index without a version bump.
+CREATE INDEX IF NOT EXISTS embed_queue_status_attempts_id
+    ON embed_queue(status, attempts, id);
 
 -- v2: operational history. Query history is written by the resolution
 -- server; chat history by the console/agents. Both are per-database working
@@ -270,6 +328,120 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {t}");
         }
+    }
+
+    #[test]
+    fn fresh_store_has_the_composite_drain_index() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let index_of = |name: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(index_of("embed_queue_status_attempts_id"), 1);
+        assert_eq!(
+            index_of("embed_queue_status"),
+            0,
+            "status-only index is retired"
+        );
+        for col in ["query_template", "card_format"] {
+            let n: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('model_registry') WHERE name = ?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "missing model_registry column {col}");
+        }
+    }
+
+    /// A store already stamped at the current version, but with the previous
+    /// shape (status-only index, model_registry without the identity
+    /// columns): the shape-guarded maintenance must bring it current WITHOUT
+    /// touching user_version — the version number stays free for migrations
+    /// that need one.
+    #[test]
+    fn current_version_store_picks_up_index_and_registry_columns() {
+        let dir = std::env::temp_dir().join(format!("stemmadb-maint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        Connection::open(&user).unwrap();
+        {
+            let c = Connection::open(&store).unwrap();
+            c.execute_batch(&format!(
+                "CREATE TABLE model_registry (
+                     vector_table TEXT PRIMARY KEY,
+                     backend      TEXT NOT NULL,
+                     model        TEXT NOT NULL,
+                     revision     TEXT NOT NULL DEFAULT '',
+                     dimension    INTEGER NOT NULL,
+                     quantization TEXT NOT NULL DEFAULT 'f32',
+                     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                 ) STRICT;
+                 INSERT INTO model_registry (vector_table, backend, model, dimension)
+                 VALUES ('vec_dense', 'staged', 'some-model', 1024);
+                 CREATE TABLE embed_queue (
+                     id           INTEGER PRIMARY KEY,
+                     src_table    TEXT NOT NULL,
+                     src_column   TEXT NOT NULL,
+                     src_rowid    INTEGER NOT NULL,
+                     serialized   TEXT NOT NULL DEFAULT '',
+                     status       TEXT NOT NULL DEFAULT 'pending',
+                     attempts     INTEGER NOT NULL DEFAULT 0,
+                     error        TEXT NOT NULL DEFAULT '',
+                     enqueued_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                     UNIQUE (src_table, src_column, src_rowid)
+                 ) STRICT;
+                 CREATE INDEX embed_queue_status ON embed_queue(status);
+                 PRAGMA user_version = {STORE_SCHEMA_VERSION};",
+            ))
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        let v: i32 = db
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, STORE_SCHEMA_VERSION,
+            "maintenance never bumps the version"
+        );
+        let names: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'embed_queue' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["embed_queue_status_attempts_id".to_string()]);
+        // The additive registry columns arrive with their defaults; existing
+        // rows are preserved.
+        let (model, template, format): (String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT model, query_template, card_format FROM model_registry
+                 WHERE vector_table = 'vec_dense'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (model.as_str(), template.as_str(), format.as_str()),
+            ("some-model", "", "")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

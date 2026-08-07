@@ -323,9 +323,11 @@ The first backend, `OpenAiEmbedder`, speaks the OpenAI-compatible
 LiteLLM proxies and hosted compatibility endpoints with one implementation.
 It reports `backend = "openai-compat"` and learns its own dimension from the
 first response (`OnceLock`), since the protocol has no dimension query. The
-crate also owns `format_query()`, the asymmetric retrieval instruction —
-model-specific knowledge that belongs behind the seam rather than in the
-pipeline.
+trait also owns `format_query()`, which renders the query side of the
+asymmetric retrieval scheme through the backend's own template
+(`ModelIdentity::query_template`) — model-specific knowledge that belongs
+behind the seam, configured beside the endpoint and model it must agree
+with, rather than compiled into the pipeline.
 
 A richer wire shape is already specified in
 [`embedder.proto`](../../proto/stemma/v1/embedder.proto) — `Embed`, `Rerank`,
