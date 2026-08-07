@@ -19,12 +19,16 @@ pub enum Error {
     #[error("embedder error: {0}")]
     Embed(#[from] stemma_embed::Error),
     #[error(
-        "vec_dense is registered to model {registered:?} but the embedder \
+        "{table} is registered to model {registered:?} but the embedder \
          offers {offered:?}; refusing to mix vector spaces"
     )]
-    ModelMismatch { registered: String, offered: String },
-    #[error("vec_dense exists with no model_registry row; provenance unknown, refusing to append")]
-    UnregisteredVectorTable,
+    ModelMismatch {
+        table: String,
+        registered: String,
+        offered: String,
+    },
+    #[error("{table} exists with no model_registry row; provenance unknown, refusing to append")]
+    UnregisteredVectorTable { table: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -252,8 +256,9 @@ pub const EMBED_MAX_ATTEMPTS: i64 = 3;
 
 /// Finds document cells (`lex_values.is_doc = 1`) with no vector in
 /// `vec_dense` and enqueues them as pending work in `embed_queue`. Documents
-/// only: dense retrieval pays off where mentions resolve *into* long text;
-/// short values are already served by the lexical channels.
+/// only — short values travel through the interpretation-card path instead
+/// ([`enqueue_missing_interpretations`]), which serializes column context the
+/// raw value does not carry.
 ///
 /// Idempotent: an item already pending (or failed) is left alone; an item
 /// previously `done` whose vector has since disappeared is reset to pending.
@@ -302,6 +307,127 @@ pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
     Ok(queued)
 }
 
+/// Interpretation cards never exceed this many characters: enough for the
+/// provenance line plus two context fragments, small enough that the card is
+/// one embedding call's worth of text on any encoder.
+pub const INTERP_CARD_MAX_CHARS: usize = 300;
+
+/// Renders the interpretation card for one distinct value interpretation:
+/// `"{table} · {column} · {value}"` plus up to two `col: value` context
+/// fragments from the representative row's other short text columns.
+/// Deterministic — fragments arrive in column-name order and are appended
+/// only while the card stays within [`INTERP_CARD_MAX_CHARS`].
+fn interpretation_card(
+    table: &str,
+    column: &str,
+    value: &str,
+    fragments: &[(String, String)],
+) -> String {
+    let mut card = format!("{table} · {column} · {value}");
+    if card.chars().count() > INTERP_CARD_MAX_CHARS {
+        card = card.chars().take(INTERP_CARD_MAX_CHARS).collect();
+    }
+    for (col, val) in fragments.iter().take(2) {
+        let frag = format!(" · {col}: {val}");
+        if card.chars().count() + frag.chars().count() <= INTERP_CARD_MAX_CHARS {
+            card.push_str(&frag);
+        }
+    }
+    card
+}
+
+/// Finds distinct value interpretations — one per `(src_table, src_column,
+/// value_norm)` with `is_doc = 0` — that have no vector in `vec_interp`, and
+/// enqueues each as pending work with its serialization card stored in
+/// `embed_queue.serialized`. The queue key is the interpretation's
+/// representative cell: `src_rowid = MIN(src_rowid)` over the rows sharing
+/// the value, so the provenance-triple unique key stays exact and enqueue
+/// stays idempotent with the same reset-on-vanished-vector semantics as the
+/// document path.
+///
+/// This is the relational counterpart of the document queue: on value-shaped
+/// corpora nothing crosses `DOC_MIN_LEN`, so a documents-only dense channel
+/// is inert, and a value appearing in two columns needs column context to be
+/// separable at all. The card carries that context.
+pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
+    let conn = db.conn();
+    let has_interp: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'vec_interp'",
+        [],
+        |r| r.get(0),
+    )?;
+    // Same materialization trick as the document path: vec0 metadata columns
+    // are not probe-friendly, so the covered keys are copied out once.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS covered_interp (
+             src_table TEXT NOT NULL, src_column TEXT NOT NULL, src_rowid INTEGER NOT NULL
+         );
+         DELETE FROM covered_interp;",
+    )?;
+    if has_interp > 0 {
+        conn.execute(
+            "INSERT INTO covered_interp
+             SELECT src_table, src_column, src_rowid FROM vec_interp",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS temp.covered_interp_key
+             ON covered_interp(src_table, src_column, src_rowid);",
+    )?;
+
+    // One row per distinct interpretation; the bare `value` column resolves
+    // to the row that achieved MIN(src_rowid) (SQLite's documented bare-
+    // column-with-min semantics), which is exactly the representative cell.
+    let missing: Vec<(String, String, i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.src_table, t.src_column, t.rep, t.value FROM (
+                 SELECT src_table, src_column, MIN(src_rowid) AS rep, value
+                 FROM lex_values
+                 WHERE is_doc = 0
+                 GROUP BY src_table, src_column, value_norm
+             ) t
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM covered_interp c
+                 WHERE c.src_table = t.src_table
+                   AND c.src_column = t.src_column
+                   AND c.src_rowid = t.rep)
+             ORDER BY t.src_table, t.src_column, t.rep",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    let mut queued = 0usize;
+    {
+        let mut frag_stmt = conn.prepare_cached(
+            "SELECT src_column, value FROM lex_values
+             WHERE src_table = ?1 AND src_rowid = ?2 AND is_doc = 0
+               AND src_column != ?3
+             ORDER BY src_column LIMIT 2",
+        )?;
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO embed_queue (src_table, src_column, src_rowid, serialized)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (src_table, src_column, src_rowid) DO UPDATE SET
+                 status = 'pending', attempts = 0, error = '', serialized = ?4,
+                 updated_at = datetime('now')
+             WHERE embed_queue.status = 'done'",
+        )?;
+        for (table, column, rep, value) in missing {
+            let fragments: Vec<(String, String)> = frag_stmt
+                .query_map(stemmadb::rusqlite::params![table, rep, column], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            let card = interpretation_card(&table, &column, &value, &fragments);
+            queued += insert.execute(stemmadb::rusqlite::params![table, column, rep, card])?;
+        }
+    }
+    conn.execute_batch("DROP TABLE covered_interp;")?;
+    Ok(queued)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DrainStats {
     /// Items embedded and marked done by this call.
@@ -312,21 +438,25 @@ pub struct DrainStats {
     pub remaining: usize,
 }
 
-/// Drains one batch of pending `embed_queue` items through the embedder into
-/// `vec_dense`, creating the vec0 table (at the embedder's reported
-/// dimension) and its `model_registry` row on first use.
+/// Drains one batch of pending `embed_queue` items through the embedder.
+/// Document items (empty `serialized`) embed their raw stored text into
+/// `vec_dense`; interpretation items embed their serialization card — also
+/// raw, cards are "documents" in the asymmetric scheme — into `vec_interp`.
+/// Either vec0 table is created (at the embedder's reported dimension) with
+/// its own `model_registry` row on first use.
 ///
-/// Documents are embedded RAW — the asymmetric Qwen3-style convention puts
-/// the instruction on the query side only (`stemma_embed::format_query`);
-/// applying it here would desert the vector space the queries live in.
+/// Documents and cards are embedded RAW — the asymmetric Qwen3-style
+/// convention puts the instruction on the query side only
+/// (`stemma_embed::format_query`); applying it here would desert the vector
+/// space the queries live in.
 ///
 /// Failure semantics: an embedding-call failure bumps `attempts` on the batch
 /// and returns the error (the caller decides whether to keep going); an item
 /// out of retry budget, or whose source text has vanished, is marked
 /// `failed` with an error note and never blocks the rest. A registry row
-/// carrying a different model identity is a hard refusal: every pending item
-/// is marked failed and the call errors, because appending into a foreign
-/// vector space is worse than not embedding at all.
+/// carrying a different model identity — on either vector table — is a hard
+/// refusal: every pending item is marked failed and the call errors, because
+/// appending into a foreign vector space is worse than not embedding at all.
 pub fn drain_embed_queue(
     db: &StemmaDb,
     embedder: &dyn Embedder,
@@ -335,31 +465,46 @@ pub fn drain_embed_queue(
     let conn = db.conn();
     let mut failed = 0usize;
 
-    // Model identity discipline, checked before any embedding work. The
-    // `model` string is the vector-space identity; `backend` records how
-    // vectors arrived ('staged' loaders and a live embedder of the same
-    // model share a space).
+    // Model identity discipline, checked before any embedding work, for both
+    // vector tables the queue can feed. The `model` string is the
+    // vector-space identity; `backend` records how vectors arrived ('staged'
+    // loaders and a live embedder of the same model share a space).
     let offered = embedder.identity().model;
-    let registered: Option<String> = conn
-        .query_row(
-            "SELECT model FROM model_registry WHERE vector_table = 'vec_dense'",
-            [],
+    let mut has_dense = false;
+    let mut has_interp = false;
+    let mut refusal: Option<Error> = None;
+    for table in ["vec_dense", "vec_interp"] {
+        let exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+            [table],
             |r| r.get(0),
-        )
-        .ok();
-    let has_dense: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
-        [],
-        |r| r.get(0),
-    )?;
-    let refusal = match &registered {
-        Some(m) if *m != offered => Some(Error::ModelMismatch {
-            registered: m.clone(),
-            offered,
-        }),
-        None if has_dense > 0 => Some(Error::UnregisteredVectorTable),
-        _ => None,
-    };
+        )?;
+        match table {
+            "vec_dense" => has_dense = exists > 0,
+            _ => has_interp = exists > 0,
+        }
+        let registered: Option<String> = conn
+            .query_row(
+                "SELECT model FROM model_registry WHERE vector_table = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .ok();
+        refusal = match &registered {
+            Some(m) if *m != offered => Some(Error::ModelMismatch {
+                table: table.to_string(),
+                registered: m.clone(),
+                offered: offered.clone(),
+            }),
+            None if exists > 0 => Some(Error::UnregisteredVectorTable {
+                table: table.to_string(),
+            }),
+            _ => None,
+        };
+        if refusal.is_some() {
+            break;
+        }
+    }
     if let Some(err) = refusal {
         conn.execute(
             "UPDATE embed_queue SET status = 'failed', error = ?1,
@@ -380,12 +525,13 @@ pub fn drain_embed_queue(
     )?;
 
     // One batch of pending work, least-retried first. `serialized` is the
-    // text to embed when set; documents leave it empty and are fetched from
+    // text to embed when set — the interpretation card, which also routes the
+    // vector to vec_interp; documents leave it empty and are fetched from
     // lex_values so the store holds each document once.
-    let mut items: Vec<(i64, String, String, i64, Option<String>)> = Vec::new();
+    let mut items: Vec<(i64, String, String, i64, String, Option<String>)> = Vec::new();
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT q.id, q.src_table, q.src_column, q.src_rowid,
+            "SELECT q.id, q.src_table, q.src_column, q.src_rowid, q.serialized,
                     coalesce(nullif(q.serialized, ''), lv.value)
              FROM embed_queue q
              LEFT JOIN lex_values lv
@@ -396,7 +542,14 @@ pub fn drain_embed_queue(
              LIMIT ?1",
         )?;
         let rows = stmt.query_map([batch as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?;
         for row in rows {
             items.push(row?);
@@ -404,13 +557,19 @@ pub fn drain_embed_queue(
     }
 
     // Items whose source text is gone (index rebuilt out from under the
-    // queue) cannot be embedded, now or later.
+    // queue) cannot be embedded, now or later. Interpretation items carry
+    // their card in the queue, so only document items can go missing.
     let mut texts = Vec::new();
-    let mut work = Vec::new();
-    for (id, table, column, rowid, text) in items {
+    let mut work: Vec<(i64, String, String, i64, &'static str)> = Vec::new();
+    for (id, table, column, rowid, serialized, text) in items {
         match text {
             Some(t) => {
-                work.push((id, table, column, rowid));
+                let target = if serialized.is_empty() {
+                    "vec_dense"
+                } else {
+                    "vec_interp"
+                };
+                work.push((id, table, column, rowid, target));
                 texts.push(t);
             }
             None => {
@@ -447,29 +606,36 @@ pub fn drain_embed_queue(
         };
 
         let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
-        if has_dense == 0 {
-            conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_dense USING vec0(
-                     embedding float[{dim}],
-                     src_table text,
-                     src_column text,
-                     src_rowid integer
-                 );"
-            ))?;
-        }
         let identity = embedder.identity();
-        conn.execute(
-            "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
-             VALUES ('vec_dense', ?1, ?2, ?3, 'f32')
-             ON CONFLICT(vector_table) DO NOTHING",
-            stemmadb::rusqlite::params![identity.backend, identity.model, dim as i64],
-        )?;
+        for (target, exists) in [("vec_dense", has_dense), ("vec_interp", has_interp)] {
+            if !work.iter().any(|w| w.4 == target) {
+                continue;
+            }
+            if !exists {
+                conn.execute_batch(&format!(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS {target} USING vec0(
+                         embedding float[{dim}],
+                         src_table text,
+                         src_column text,
+                         src_rowid integer
+                     );"
+                ))?;
+            }
+            conn.execute(
+                "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
+                 VALUES (?1, ?2, ?3, ?4, 'f32')
+                 ON CONFLICT(vector_table) DO NOTHING",
+                stemmadb::rusqlite::params![target, identity.backend, identity.model, dim as i64],
+            )?;
+        }
 
-        for ((id, table, column, rowid), vector) in work.into_iter().zip(vectors) {
+        for ((id, table, column, rowid, target), vector) in work.into_iter().zip(vectors) {
             let blob: Vec<u8> = vector.iter().flat_map(|x| x.to_le_bytes()).collect();
             let inserted = conn.execute(
-                "INSERT INTO vec_dense (embedding, src_table, src_column, src_rowid)
-                 VALUES (?1, ?2, ?3, ?4)",
+                &format!(
+                    "INSERT INTO {target} (embedding, src_table, src_column, src_rowid)
+                     VALUES (?1, ?2, ?3, ?4)"
+                ),
                 stemmadb::rusqlite::params![blob, table, column, rowid],
             );
             match inserted {
@@ -799,6 +965,224 @@ mod tests {
         let stats = drain_embed_queue(&db, &broken, EMBED_BATCH).unwrap();
         assert_eq!((stats.drained, stats.failed, stats.remaining), (0, 3, 0));
         assert_eq!(queue_counts(&db), (0, 0, 3));
+    }
+
+    /// A value-shaped corpus: short cells only, with a value repeated across
+    /// rows ('Portland') and columns that give each interpretation context.
+    fn value_db() -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.offices(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+                 INSERT INTO src.offices VALUES
+                    (17, 'Seattle - Northgate', 'Seattle'),
+                    (18, 'Portland Downtown', 'Portland'),
+                    (19, 'Portland Airport', 'Portland');",
+            )
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn interpretation_cards_are_deterministic_and_bounded() {
+        let db = value_db();
+        enqueue_missing_interpretations(&db).unwrap();
+        let card: String = db
+            .conn()
+            .query_row(
+                "SELECT serialized FROM embed_queue
+                 WHERE src_table = 'offices' AND src_column = 'city' AND src_rowid = 17",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(card, "offices · city · Seattle · name: Seattle - Northgate");
+        let cards: Vec<String> = db
+            .conn()
+            .prepare("SELECT serialized FROM embed_queue")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        for card in &cards {
+            assert!(!card.is_empty(), "interpretation items carry their card");
+            assert!(card.chars().count() <= INTERP_CARD_MAX_CHARS);
+        }
+        // A near-limit value: the base line survives, fragments that would
+        // overflow are dropped, and the card never crosses the cap.
+        let long = "x".repeat(280);
+        let card = interpretation_card(
+            "t",
+            "c",
+            &long,
+            &[
+                ("other".into(), "y".repeat(50)),
+                ("more".into(), "z".into()),
+            ],
+        );
+        assert!(card.chars().count() <= INTERP_CARD_MAX_CHARS);
+        assert!(card.starts_with("t · c · x"));
+        assert!(!card.contains("other"), "oversized fragment is dropped");
+    }
+
+    #[test]
+    fn enqueue_finds_interpretations_exactly_once() {
+        let db = value_db();
+        let queued = enqueue_missing_interpretations(&db).unwrap();
+        // 3 distinct names + 2 distinct cities; the repeated 'Portland' is
+        // one interpretation, keyed by its representative MIN rowid.
+        assert_eq!(queued, 5);
+        assert_eq!(queue_counts(&db), (5, 0, 0));
+        let portland: Vec<i64> = db
+            .conn()
+            .prepare(
+                "SELECT src_rowid FROM embed_queue
+                 WHERE src_table = 'offices' AND src_column = 'city'
+                   AND serialized LIKE '%Portland%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(portland, vec![18], "one item at the representative rowid");
+        // Re-enqueue with items still pending is a no-op.
+        assert_eq!(enqueue_missing_interpretations(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn drain_populates_vec_interp_and_registry() {
+        let db = value_db();
+        let embedder = FakeEmbedder::new(8);
+        enqueue_missing_interpretations(&db).unwrap();
+        let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (5, 0, 0));
+
+        let vectors: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_interp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors, 5);
+        let (backend, model, dim): (String, String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT backend, model, dimension FROM model_registry
+                 WHERE vector_table = 'vec_interp'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (backend.as_str(), model.as_str(), dim),
+            ("fake", "fake-embedder", 8)
+        );
+        // No documents in this corpus, so no vec_dense and no dense registry
+        // row: the tables are independent.
+        let dense: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dense, 0);
+
+        // The full cycle again: nothing to queue, nothing to drain.
+        assert_eq!(enqueue_missing_interpretations(&db).unwrap(), 0);
+        let again = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!((again.drained, again.failed, again.remaining), (0, 0, 0));
+        let vectors_again: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_interp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors_again, 5, "idempotent: no duplicate vectors");
+    }
+
+    #[test]
+    fn mixed_queue_routes_docs_and_interps_to_their_tables() {
+        // doc_db has three document bodies AND three short titles: one queue,
+        // two vector tables, one drain.
+        let db = doc_db();
+        let embedder = FakeEmbedder::new(8);
+        let docs = enqueue_missing_embeddings(&db).unwrap();
+        let interps = enqueue_missing_interpretations(&db).unwrap();
+        assert_eq!((docs, interps), (3, 3));
+        let stats = drain_embed_queue(&db, &embedder, EMBED_BATCH).unwrap();
+        assert_eq!((stats.drained, stats.failed, stats.remaining), (6, 0, 0));
+        let count = |table: &str| -> i64 {
+            db.conn()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!((count("vec_dense"), count("vec_interp")), (3, 3));
+        let registered: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM model_registry
+                 WHERE vector_table IN ('vec_dense', 'vec_interp')
+                   AND model = 'fake-embedder'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(registered, 2, "each vector table owns a registry row");
+        // Interpretation vectors carry the card's embedding, not the value's:
+        // the drain embeds exactly what the queue serialized.
+        let card: String = db
+            .conn()
+            .query_row(
+                "SELECT serialized FROM embed_queue
+                 WHERE src_column = 'title' AND src_rowid = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored: Vec<u8> = db
+            .conn()
+            .query_row(
+                "SELECT embedding FROM vec_interp
+                 WHERE src_table = 'articles' AND src_column = 'title' AND src_rowid = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected: Vec<u8> = embedder
+            .vector(&card)
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        assert_eq!(stored, expected);
+    }
+
+    #[test]
+    fn interp_registry_mismatch_refuses_and_fails_items() {
+        let db = value_db();
+        db.conn()
+            .execute(
+                "INSERT INTO model_registry (vector_table, backend, model, dimension)
+                 VALUES ('vec_interp', 'staged', 'some-other-model', 1024)",
+                [],
+            )
+            .unwrap();
+        enqueue_missing_interpretations(&db).unwrap();
+        let err = drain_embed_queue(&db, &FakeEmbedder::new(8), EMBED_BATCH).unwrap_err();
+        match &err {
+            Error::ModelMismatch { table, .. } => assert_eq!(table, "vec_interp"),
+            other => panic!("expected ModelMismatch, got {other}"),
+        }
+        let (pending, done, failed) = queue_counts(&db);
+        assert_eq!((pending, done, failed), (0, 0, 5));
+        let note: String = db
+            .conn()
+            .query_row("SELECT error FROM embed_queue LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            note.contains("some-other-model") && note.contains("vec_interp"),
+            "error note names table and model: {note}"
+        );
     }
 
     #[test]

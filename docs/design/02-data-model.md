@@ -103,16 +103,19 @@ vector table can always be traced back to a running service. `dimension` and
 `quantization` are recorded rather than inferred because `vec0` needs both
 at DDL time and a mismatch is otherwise a silent correctness bug.
 
-The table is written from two places, both keyed `vector_table = 'vec_dense'`:
-`stemma_ingest::build_dense_index` upserts the row at promotion, with
-`backend = 'staged'` when the vectors arrived from an external loader, and
-`stemma_ingest::drain_embed_queue` inserts it (if absent) on the first drained
-batch, carrying the live embedder's `(backend, model)` identity and observed
+The table is written from two places:
+`stemma_ingest::build_dense_index` upserts the `'vec_dense'` row at
+promotion, with `backend = 'staged'` when the vectors arrived from an
+external loader, and `stemma_ingest::drain_embed_queue` inserts a row (if
+absent) for each vector table it feeds — `'vec_dense'` for document items,
+`'vec_interp'` for interpretation items — on the first drained batch,
+carrying the live embedder's `(backend, model)` identity and observed
 dimension. The `model` string is the vector-space identity the drain checks
-against; `backend` records how vectors arrived, so staged vectors and a live
-embedder of the same model share a table. `revision` is left at its default
-and `quantization` at `'f32'`. `StoreBrowser.store_meta()` surfaces the whole
-table to the console.
+against, for both tables, before any embedding work; `backend` records how
+vectors arrived, so staged vectors and a live embedder of the same model
+share a table. `revision` is left at its default and `quantization` at
+`'f32'`. `StoreBrowser.store_meta()` surfaces the whole table to the
+console.
 
 ### `vec_staging` and `vec_dense`
 
@@ -184,6 +187,48 @@ Four honest observations about this shape:
   Retrieval stays correct (unembedded rows simply never appear as dense
   hits), but dense recall is capped with nothing recording that it was.
 
+### `vec_interp`
+
+The second `vec0` table, created by `stemma_ingest::drain_embed_queue` on
+the first drained interpretation item, with the same shape as `vec_dense`
+and its own `model_registry` row under the same one-model-per-table
+invariant:
+
+```sql
+CREATE VIRTUAL TABLE vec_interp USING vec0(
+    embedding  float[{dim}],
+    src_table  text,
+    src_column text,
+    src_rowid  integer
+);
+```
+
+One vector per **distinct value interpretation** — `(src_table, src_column,
+value_norm)` with `is_doc = 0` — keyed by the interpretation's
+representative cell, `src_rowid = MIN(src_rowid)` over the rows sharing the
+value. What is embedded is not the value but its **interpretation card**
+(see [05-encoders-decoders.md](05-encoders-decoders.md#what-gets-embedded)):
+`table · column · value` plus up to two `col: value` fragments from the
+representative row, ≤ 300 characters, built at enqueue time into
+`embed_queue.serialized`.
+
+The volume argument for a per-interpretation rather than per-cell table:
+interpretations dedupe over `value_norm`, so a column with a million rows
+and two hundred distinct values costs two hundred vectors — on value-shaped
+corpora, interpretations ≪ cells. The honest exception is identifier-shaped
+columns (uuids), where every cell is its own interpretation and the dedupe
+buys nothing; the designed per-column profiling pass that would skip them
+(noted [below](#what-the-index-actually-looks-like)) applies here with extra
+force.
+
+The resolve pipeline reads `vec_interp` two ways: never (the table is not a
+retrieval channel — cards exist to *separate ties*, not to generate
+candidates) and by **direct key lookup** in the context-affinity pass, where
+a tied candidate's `(table, column, representative rowid)` selects its
+card's stored `embedding` back out of the virtual table in a plain filtered
+scan, no KNN involved, and the cosine against the query embedding is
+computed in-process.
+
 ### `embed_queue`
 
 ```sql
@@ -205,21 +250,25 @@ CREATE INDEX IF NOT EXISTS embed_queue_status ON embed_queue(status);
 
 The write path never waits on a model — the queue-driven external-worker
 pattern proven by the PostgreSQL vectorizer lineage [pgai-vectorizer],
-transplanted to SQLite. `stemma_ingest::enqueue_missing_embeddings`
-inserts one pending item per document cell (`lex_values.is_doc = 1`) that has
-no vector in `vec_dense` — documents only, because dense retrieval pays off
-where mentions resolve *into* long text, and short values are already served
-by the lexical channels. `stemma_ingest::drain_embed_queue` then works the
-queue in batches through the `Embedder` backend. The unique key over the
-provenance triple makes enqueue idempotent: an item already pending is a
-no-op, and an item once `done` is only reset to pending if its vector has
-since disappeared.
+transplanted to SQLite. Two enqueue passes fill it:
+`stemma_ingest::enqueue_missing_embeddings` inserts one pending item per
+document cell (`lex_values.is_doc = 1`) that has no vector in `vec_dense`,
+and `stemma_ingest::enqueue_missing_interpretations` one per distinct value
+interpretation with no vector in `vec_interp`, keyed by the representative
+`MIN(src_rowid)`. `stemma_ingest::drain_embed_queue` then works the queue in
+batches through the `Embedder` backend, routing each item's vector to its
+table by kind. The unique key over the provenance triple makes both
+enqueues idempotent: an item already pending is a no-op, and an item once
+`done` is only reset to pending if its vector has since disappeared. (The
+two kinds cannot collide on the key: a cell is either a document or a short
+value, never both.)
 
-`serialized` is the text the embedder will see. It is empty for document
-items — the drain fetches the stored value from `lex_values` at embed time
-rather than duplicating megabyte documents into the queue — and exists so a
-future value-shaped serialization (a row rendered to text) has somewhere to
-live.
+`serialized` is the text the embedder will see, and it is also the kind
+discriminator. It is empty for document items — the drain fetches the
+stored value from `lex_values` at embed time rather than duplicating
+megabyte documents into the queue — and holds the interpretation card
+(≤ 300 chars) for interpretation items, which therefore survive even a
+lexical-index rebuild: the card travels with the queue item.
 
 The item lifecycle is `pending → done | failed`, and every transition keeps
 the table honestly queryable — `SELECT status, count(*) FROM embed_queue
@@ -227,10 +276,11 @@ GROUP BY status` is the whole observability story, and the console's store
 panel shows the pending backlog. `failed` is reached three ways, each with an
 `error` note: the embedding call failed `attempts` times
 (`EMBED_MAX_ATTEMPTS = 3` — a retry budget, not a forever loop), the source
-text vanished from `lex_values` (index rebuilt out from under the queue), or
-the `model_registry` row for `vec_dense` names a *different* model than the
-configured embedder — in which case the drain refuses the entire queue and
-errors loudly rather than mixing vector spaces.
+text vanished from `lex_values` (index rebuilt out from under the queue —
+document items only, since interpretation items carry their card), or the
+`model_registry` row for `vec_dense` or `vec_interp` names a *different*
+model than the configured embedder — in which case the drain refuses the
+entire queue and errors loudly rather than mixing vector spaces.
 
 The failure semantics matter more than the schema: if the embedder is down,
 the queue keeps its pending items (with their attempt counts) and retrieval
@@ -707,9 +757,11 @@ expressed as one of these five is a candidate the system should not be
 returning.
 
 **Only `LexicalMatch` is produced today**, one per channel that fired, with
-`channel ∈ {exact, bm25, trigram, dense, kg}`. Two of those are not lexical
-at all: `kg` records the knowledge-coherence bonus, and `dense` records a
-vec0 KNN hit whose `score` is a cosine similarity. Both ride in
+`channel ∈ {exact, bm25, trigram, dense, kg, context}`. Three of those are
+not lexical at all: `kg` records the knowledge-coherence bonus, `dense`
+records a vec0 KNN hit whose `score` is a cosine similarity, and `context`
+records the query-conditioned interpretation-card cosine that separates tied
+value interpretations. All ride in
 `LexicalMatch` because `trace_to_proto` maps every `ChannelScore` through the
 same constructor. **`dense` hits should be emitting `SemanticMatch`** — the
 message exists, carries exactly the right fields (`model`, `similarity`), and
@@ -741,16 +793,17 @@ flagged `value_truncated` — transport economy, with the full value always one
 | Field | Status |
 |---|---|
 | `Candidate.{table, column, rowid, value, score, is_doc, snippet}` | live |
-| `Candidate.evidence[].lexical` | live (`exact`/`bm25`/`trigram`/`dense`/`kg`) |
+| `Candidate.evidence[].lexical` | live (`exact`/`bm25`/`trigram`/`dense`/`kg`/`context`) |
 | `Candidate.evidence[].semantic` | declared, never emitted — **dense hits use `lexical` instead** |
 | `Candidate.evidence[].{kg_path, probe, adjudication}` | declared, never emitted |
 | `Mention.nil` | declared, always `false` |
 | `ResolveResponse.rewritten_query` | declared, always `""` |
 | `ResolveOptions.{source, session}` | live — written to `query_log` |
 | `ResolveOptions.{max_candidates_per_mention, allow_lm, min_confidence}` | declared, **accepted and ignored by the server** |
-| `model_registry` | live — one `vec_dense` row written at promotion or first drain |
+| `model_registry` | live — `vec_dense` row written at promotion or first drain; `vec_interp` row at first interpretation drain |
 | `vec_staging` → `vec_dense` | live (external staging, promoted at startup) |
-| `embed_queue` | live — filled by `enqueue_missing_embeddings`, drained through the `Embedder` at server startup |
+| `vec_interp` | live — interpretation cards, created and filled by the drain |
+| `embed_queue` | live — filled by `enqueue_missing_embeddings` + `enqueue_missing_interpretations`, drained through the `Embedder` at server startup |
 
 Everything in the "declared" rows is designed-but-unbuilt. The proto carries
 them now so that the wire format does not need a breaking change when the

@@ -162,27 +162,51 @@ semantic similarity, and it is invisible unless the identity is recorded.
 
 ### What gets embedded
 
-**As built: documents, raw, one vector per document cell.** The queue path
-embeds exactly the cells the lexical index classified `is_doc` — long text
-that mentions resolve *into* — and embeds them verbatim, with no instruction
-prefix. That is the asymmetric convention of instruction-tuned retrieval
-encoders: `format_query()` decorates the query-time mention, documents stay
-raw, and applying the instruction on the document side would desert the
-space the queries live in. Short values are deliberately not embedded: the
-exact and trigram channels already serve them, and dense retrieval pays its
-full-scan cost only where meaning is spread through prose. Documents longer
-than the encoder's context are truncated by the endpoint today — chunking is
-designed, not built.
+**As built: documents plus interpretation cards.** The queue path embeds two
+kinds of item, and keeps them in two vector tables.
 
-The *designed* unit is broader: the **serialized row**.
-`embed_queue.serialized` holds the text the embedder will see when it is
-set; document items leave it empty and the drain fetches the stored value
-from `lex_values`, so the store keeps one copy of each document. For a
-value-shaped table the designed serialization is a compact rendering of the
-row's identifying columns — *"the Seattle office"* is about a row, and the
-semantic content that makes `offices` row 17 the right answer is spread
-across `name` and `city`. That serialization pass does not exist yet; the
-column is where its output will land.
+*Documents, raw, one vector per document cell.* The cells the lexical index
+classified `is_doc` — long text that mentions resolve *into* — embedded
+verbatim, with no instruction prefix, into `vec_dense`. That is the
+asymmetric convention of instruction-tuned retrieval encoders:
+`format_query()` decorates the query-time mention, documents stay raw, and
+applying the instruction on the document side would desert the space the
+queries live in. Documents longer than the encoder's context are truncated
+by the endpoint today — chunking is designed, not built.
+
+*Interpretation cards, one vector per distinct value interpretation.* For
+every distinct `(src_table, src_column, value_norm)` with `is_doc = 0`, the
+ingest pass serializes a card —
+
+```
+offices · city · Seattle · name: Seattle - Northgate
+```
+
+— the provenance line plus up to two `col: value` context fragments from a
+representative row's other short columns, deterministic and capped at
+300 characters. The card is stored in `embed_queue.serialized` at enqueue
+time and embedded raw (cards are "documents" in the asymmetric scheme) into
+`vec_interp`, a second `vec0` table with its own `model_registry` row and the
+same one-model-per-table invariant.
+
+The earlier documents-only policy should be named for what it was: **an
+over-fit to the first corpus.** On the legal corpus every interesting cell is
+a 2,600-character regulation body, so "embed the documents, skip the values"
+looked like a principle. On relational corpora (BIRD-shaped schemas) nothing
+crosses `DOC_MIN_LEN`, the queue enqueued nothing, and the dense channel was
+inert — while the case that most needs semantic help there, the same value
+living in two columns, is unresolvable by any channel that only sees the
+value's own characters. The card is the smallest serialization that fixes
+both: the `table · column` prefix gives the encoder the interpretation, and
+the row fragments give it the context — *"the Seattle office"* is about a
+row, and the content that makes `offices` row 17 the right answer is spread
+across `name` and `city`. The resolve side consumes the cards through a
+narrow reorder pass: when fusion leaves two value interpretations tied
+(top-2 gap < 0.08, distinct `(table, column)`, both non-doc), the full query
+is embedded once through `format_query()` and each tied card's vector is read
+back by provenance key, the cosine attached as a `"context"` channel score,
+and the cosine winner boosted +0.04 (capped at 0.9 — never into the exact
+band) when the cosine gap exceeds 0.05.
 
 ### Two ways vectors get in
 
@@ -200,22 +224,29 @@ configured, each database gets a background task on its own store connection
 (the store is WAL, so serving never blocks on it):
 
 1. `stemma_ingest::enqueue_missing_embeddings` inserts a pending
-   `embed_queue` item for every document cell with no `vec_dense` vector —
-   idempotent via the unique provenance key, and a `done` item is only reset
-   if its vector has since disappeared.
+   `embed_queue` item for every document cell with no `vec_dense` vector,
+   and `stemma_ingest::enqueue_missing_interpretations` one for every
+   distinct value interpretation with no `vec_interp` vector — keyed by the
+   interpretation's representative `MIN(src_rowid)`, with the card in
+   `serialized`. Both are idempotent via the unique provenance key, and a
+   `done` item is only reset if its vector has since disappeared.
 2. `stemma_ingest::drain_embed_queue` repeats until the queue is empty:
-   take a batch of 32 pending items (least-retried first), fetch their raw
-   document text, embed through the `Embedder`, insert into `vec_dense` —
-   creating the vec0 table at the embedder's observed dimension and its
+   take a batch of 32 pending items (least-retried first), fetch each item's
+   text — the raw document for document items, the stored card for
+   interpretation items — embed through the `Embedder` in one call, insert
+   each vector into its item's table (`vec_dense` or `vec_interp`) —
+   creating either vec0 table at the embedder's observed dimension with its
    `model_registry` row on first use — and mark the items `done`. Progress
-   (`queued`, `drained`, `failed`, `remaining`) is logged per batch, and the
-   task exits when the queue is empty; there is no polling loop.
+   (`queued_docs`, `queued_interps`, `drained`, `failed`, `remaining`) is
+   logged per batch, and the task exits when the queue is empty; there is no
+   polling loop.
 
 Model identity is checked before any embedding work: if `model_registry`
-already binds `vec_dense` to a *different* model, the drain marks every
-pending item `failed` with the mismatch spelled out and errors — refusing
-loudly beats mixing vector spaces. A staged table and a live embedder of the
-*same* model compose: the drain tops up whatever staging did not cover.
+already binds `vec_dense` *or* `vec_interp` to a *different* model, the
+drain marks every pending item `failed` with the mismatch spelled out and
+errors — refusing loudly beats mixing vector spaces. A staged table and a
+live embedder of the *same* model compose: the drain tops up whatever
+staging did not cover.
 
 The failure semantics are the point: **writes never wait on a model.** If
 the embedder is down, slow, or being replaced, items stay pending (bounded
@@ -228,9 +259,11 @@ story queryable in plain SQL.
 Honest limits of what is built: the drain runs at startup and exits — no
 watcher notices data changes afterward, and re-embedding after an edit means
 restarting the server; there is no online re-embed and no blue-green
-generation swap (the next section is still designed, not built); and only
-documents flow through the queue — the value-shaped serialized-row path has
-a column reserved and no code.
+generation swap (the next section is still designed, not built); and the
+interpretation cards inherit the lexical index's column-selection blind
+spots — an all-distinct identifier column (uuids) yields one card per row,
+paying embedding cost for interpretations nothing will ever tie on, until
+the designed per-column profiling pass lands.
 
 ### Query-time requirements
 

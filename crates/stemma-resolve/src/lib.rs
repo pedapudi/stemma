@@ -219,9 +219,8 @@ pub fn resolve_full(
     // entity are marked and favored in selection — multi-word entities like
     // "coastal development permit" beat their fragments.
     {
-        let mut stmt = conn.prepare(
-            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_nodes'",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT count(*) FROM sqlite_master WHERE name = 'kg_nodes'")?;
         let has_kg: i64 = stmt.query_row([], |r| r.get(0))?;
         if has_kg > 0 {
             let mut q = conn.prepare_cached(
@@ -238,8 +237,7 @@ pub fn resolve_full(
     }
 
     // Phase 1: lexical raw hits for every live span.
-    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> =
-        std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> = std::collections::HashMap::new();
     for span in spans.iter() {
         if span.status == "skipped" {
             continue;
@@ -308,6 +306,11 @@ pub fn resolve_full(
     // mentions are scored jointly against the knowledge graph and the data,
     // before final selection orders on the boosted scores.
     apply_collective_coherence(db, &mut spans)?;
+
+    // Phase 4b: context affinity — tied value interpretations (same value in
+    // two columns) separated by conditioning the interpretation cards on the
+    // full query. Self-contained section below; degrades silently.
+    apply_context_affinity(db, embedder, query, &mut spans);
 
     let mentions = select_mentions(&mut spans);
 
@@ -411,8 +414,7 @@ fn adjudication_prompt(
     for (i, &ci) in presented.iter().enumerate() {
         let c = &span.candidates[ci];
         let shown = c.snippet.as_deref().unwrap_or(&c.value);
-        let channels: Vec<&str> =
-            c.channels.iter().map(|ch| ch.channel.as_str()).collect();
+        let channels: Vec<&str> = c.channels.iter().map(|ch| ch.channel.as_str()).collect();
         listing.push_str(&format!(
             "{i}. {}.{} #{} — {:?} (channels: {})\n",
             c.table,
@@ -717,10 +719,9 @@ fn apply_kg_coherence(db: &StemmaDb, span: &str, candidates: &mut [Candidate]) -
     );
     let mut stmt = conn.prepare(&sql)?;
     let coterms: Vec<String> = stmt
-        .query_map(
-            stemmadb::rusqlite::params_from_iter(tokens.iter()),
-            |r| r.get(0),
-        )?
+        .query_map(stemmadb::rusqlite::params_from_iter(tokens.iter()), |r| {
+            r.get(0)
+        })?
         .collect::<std::result::Result<_, _>>()?;
     let coterms: Vec<&String> = coterms.iter().filter(|c| !tokens.contains(c)).collect();
     if coterms.is_empty() {
@@ -813,10 +814,8 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
     // Pairwise verification, cached: schema paths once per table pair, then
     // for each surviving candidate pair a LIMIT-1 probe per path until one
     // verifies. Everything downstream reads this map.
-    let mut path_cache: std::collections::HashMap<
-        (String, String),
-        Vec<Vec<stemma_kg::PathHop>>,
-    > = std::collections::HashMap::new();
+    let mut path_cache: std::collections::HashMap<(String, String), Vec<Vec<stemma_kg::PathHop>>> =
+        std::collections::HashMap::new();
     let mut verified: std::collections::HashMap<(usize, usize, usize, usize), String> =
         std::collections::HashMap::new();
     for p in 0..winners.len() {
@@ -904,7 +903,9 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
         }
     }
     for i in touched {
-        spans[i].candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        spans[i]
+            .candidates
+            .sort_by(|a, b| b.score.total_cmp(&a.score));
     }
     Ok(())
 }
@@ -995,6 +996,188 @@ fn render_kg_path(
     out
 }
 
+// ===========================================================================
+// Context affinity over interpretation cards (vec_interp) — self-contained.
+//
+// Motivation: on relational corpora the dense channel is inert (nothing
+// crosses DOC_MIN_LEN), and a value that appears in two columns — the same
+// string as a city and as a product name — produces two lexically identical
+// candidates fusion cannot order. The ingest layer embeds one interpretation
+// card per distinct (table, column, value); the card carries the column's
+// context, so conditioning on the FULL query separates the tie.
+//
+// Mechanics: for a span whose top two candidates are tied value
+// interpretations, the query is embedded once (format_query — the query side
+// of the asymmetric scheme) and the two cards' vectors are fetched directly
+// from vec_interp by their provenance key — a plain filtered read, no KNN —
+// with the cosine computed in-process, which is exact. Both candidates gain
+// a "context" ChannelScore (rank by cosine order, raw = cosine), and the
+// winner gets a bounded boost. Without an embedder, without vec_interp, on a
+// registry model mismatch, or on any per-span lookup failure, the pass
+// silently does nothing.
+// ===========================================================================
+
+/// Top-2 fused-score gap under which two value interpretations count as
+/// tied. Same rationale as [`ADJUDICATION_MARGIN`]: a gap under 0.08 is what
+/// fusion produces from roughly one rank inversion — noise, not evidence.
+const CONTEXT_TIE_GAP: f64 = 0.08;
+/// Minimum query-conditioned cosine gap between the two cards before the
+/// winner is boosted. At d = 1024 the null sd of a pair cosine is
+/// 1/√d ≈ 0.031, so 0.05 demands better than noise-level separation.
+const CONTEXT_COS_GAP: f64 = 0.05;
+/// Boost applied to the context winner: half the tie gap, so it can flip
+/// only ties tighter than itself and never overturns genuine multi-channel
+/// agreement.
+const CONTEXT_BOOST: f64 = 0.04;
+/// Context affinity never lifts a candidate into the exact band (0.9+): if
+/// the user typed the stored value, they meant the stored value.
+const CONTEXT_CAP: f64 = 0.9;
+
+/// Separates spans whose top two candidates are tied value interpretations —
+/// fused-score gap under [`CONTEXT_TIE_GAP`], both non-doc, distinct
+/// (table, column) — by cosine between the full query's embedding and each
+/// interpretation's card vector. Infallible by design: every missing signal
+/// degrades to a no-op.
+fn apply_context_affinity(
+    db: &StemmaDb,
+    embedder: Option<&dyn stemma_embed::Embedder>,
+    query: &str,
+    spans: &mut [Span],
+) {
+    let Some(embedder) = embedder else { return };
+    let conn = db.conn();
+    let has_interp: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'vec_interp'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_interp == 0 {
+        return;
+    }
+    // Same-space discipline as the drain: a registry row naming a different
+    // model makes the cosine meaningless — skip, don't guess.
+    let registered: Option<String> = conn
+        .query_row(
+            "SELECT model FROM model_registry WHERE vector_table = 'vec_interp'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if registered.as_deref() != Some(embedder.identity().model.as_str()) {
+        return;
+    }
+
+    // The query embedding is shared by every tied span; computed lazily so a
+    // resolution with no ties costs no embedding call.
+    let mut query_vec: Option<Vec<f32>> = None;
+    for span in spans.iter_mut() {
+        if span.status != "selected" || span.candidates.len() < 2 {
+            continue;
+        }
+        let tied = {
+            let (a, b) = (&span.candidates[0], &span.candidates[1]);
+            !a.is_doc
+                && !b.is_doc
+                && (a.table != b.table || a.column != b.column)
+                && a.score - b.score < CONTEXT_TIE_GAP
+        };
+        if !tied {
+            continue;
+        }
+        let key = |c: &Candidate| (c.table.clone(), c.column.clone(), c.rowid);
+        let (ka, kb) = (key(&span.candidates[0]), key(&span.candidates[1]));
+        let Some(va) = interp_vector(db, &ka.0, &ka.1, ka.2) else {
+            continue;
+        };
+        let Some(vb) = interp_vector(db, &kb.0, &kb.1, kb.2) else {
+            continue;
+        };
+        if query_vec.is_none() {
+            match embedder.embed(&[stemma_embed::format_query(query)]) {
+                Ok(mut v) if !v.is_empty() => query_vec = Some(v.remove(0)),
+                _ => return, // embedder down: the whole pass degrades
+            }
+        }
+        let q = query_vec.as_ref().unwrap();
+        let (Some(cos_a), Some(cos_b)) = (cosine(q, &va), cosine(q, &vb)) else {
+            continue;
+        };
+        let winner = if cos_a >= cos_b { 0 } else { 1 };
+        for (i, cos) in [cos_a, cos_b].into_iter().enumerate() {
+            span.candidates[i].channels.push(ChannelScore {
+                channel: "context".into(),
+                rank: usize::from(i != winner),
+                raw: cos,
+            });
+        }
+        if (cos_a - cos_b).abs() > CONTEXT_COS_GAP {
+            let c = &mut span.candidates[winner];
+            // Never reduce a score already above the cap (exact band).
+            c.score = c.score.max((c.score + CONTEXT_BOOST).min(CONTEXT_CAP));
+            span.candidates.sort_by(|x, y| y.score.total_cmp(&x.score));
+        }
+    }
+}
+
+/// The card vector for the interpretation a candidate cell belongs to. The
+/// index keys interpretations by their representative MIN(src_rowid) over
+/// rows sharing the value, so the candidate's rowid is first mapped to that
+/// representative; the embedding is then read straight out of vec_interp by
+/// provenance key (vec0 returns the stored blob on a plain filtered scan)
+/// and decoded from little-endian f32s. None on any miss.
+fn interp_vector(db: &StemmaDb, table: &str, column: &str, rowid: i64) -> Option<Vec<f32>> {
+    let conn = db.conn();
+    let rep: Option<i64> = conn
+        .query_row(
+            "SELECT MIN(l2.src_rowid) FROM lex_values l1
+             JOIN lex_values l2
+               ON l2.src_table = l1.src_table AND l2.src_column = l1.src_column
+              AND l2.value_norm = l1.value_norm AND l2.is_doc = 0
+             WHERE l1.src_table = ?1 AND l1.src_column = ?2 AND l1.src_rowid = ?3",
+            stemmadb::rusqlite::params![table, column, rowid],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT embedding FROM vec_interp
+             WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3",
+            stemmadb::rusqlite::params![table, column, rep?],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if blob.is_empty() || blob.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        blob.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Cosine over raw vectors, computed in-process — exact, with no unit-norm
+/// assumption. None on dimension mismatch or a zero vector.
+fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        dot += f64::from(*x) * f64::from(*y);
+        na += f64::from(*x) * f64::from(*x);
+        nb += f64::from(*y) * f64::from(*y);
+    }
+    if na == 0.0 || nb == 0.0 {
+        return None;
+    }
+    Some(dot / (na.sqrt() * nb.sqrt()))
+}
+
+// ======================= end context-affinity section ======================
+
 /// Reciprocal-rank fusion across channels, with a length-affinity factor so
 /// short stored values that closely match the span outrank long documents
 /// that merely contain it.
@@ -1034,7 +1217,11 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
         .into_iter()
         .map(|((table, column, rowid), g)| {
             let has_exact = g.channels.iter().any(|c| c.channel == "exact");
-            let rrf: f64 = g.channels.iter().map(|c| 1.0 / (RRF_K + c.rank as f64)).sum();
+            let rrf: f64 = g
+                .channels
+                .iter()
+                .map(|c| 1.0 / (RRF_K + c.rank as f64))
+                .sum();
             // Normalize: three channels at rank 0 -> 1.0. Docs never have the
             // exact channel, but since dense landed they can still reach three
             // (bm25 + trigram + dense), so their base can saturate too.
@@ -1047,8 +1234,7 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 // its length would break retrieval (the careg failure mode).
                 (base * 0.85).min(0.85)
             } else {
-                let affinity =
-                    (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
+                let affinity = (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
                 (base * (0.4 + 0.6 * affinity)).min(1.0)
             };
             // The dense channel's cosine is absolute evidence, not a rank:
@@ -1107,9 +1293,14 @@ fn selection_order(spans: &[Span]) -> Vec<usize> {
     order.sort_by(|&a, &b| {
         let key = |i: usize| {
             let s = spans[i].candidates.first().map(|c| c.score).unwrap_or(0.0);
-            if spans[i].kg_alias { s * 1.08 } else { s }
+            if spans[i].kg_alias {
+                s * 1.08
+            } else {
+                s
+            }
         };
-        key(b).total_cmp(&key(a))
+        key(b)
+            .total_cmp(&key(a))
             .then((spans[b].end - spans[b].start).cmp(&(spans[a].end - spans[a].start)))
     });
     order
@@ -1322,8 +1513,7 @@ mod tests {
         assert!(chen
             .candidates
             .iter()
-            .all(|c| !c.selected
-                && c.reject_reason.as_deref() == Some("span_not_selected")));
+            .all(|c| !c.selected && c.reject_reason.as_deref() == Some("span_not_selected")));
         assert!(
             chen.candidates.iter().any(|c| c.value.contains("Dana")),
             "the rival Chen must remain visible as a near-miss"
@@ -1540,10 +1730,16 @@ mod tests {
 
     impl FakeLm {
         fn replying(reply: &str) -> Self {
-            Self { reply: Some(reply.to_string()), calls: 0.into() }
+            Self {
+                reply: Some(reply.to_string()),
+                calls: 0.into(),
+            }
         }
         fn failing() -> Self {
-            Self { reply: None, calls: 0.into() }
+            Self {
+                reply: None,
+                calls: 0.into(),
+            }
         }
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::Relaxed)
@@ -1556,7 +1752,8 @@ mod tests {
             _messages: &[stemma_lm::ChatMessage],
             _schema: Option<&serde_json::Value>,
         ) -> stemma_lm::Result<String> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match &self.reply {
                 Some(r) => Ok(r.clone()),
                 None => Err(stemma_lm::Error::Http("fake endpoint down".into())),
@@ -1566,7 +1763,10 @@ mod tests {
             true
         }
         fn identity(&self) -> stemma_lm::LmIdentity {
-            stemma_lm::LmIdentity { backend: "fake".into(), model: "fake".into() }
+            stemma_lm::LmIdentity {
+                backend: "fake".into(),
+                model: "fake".into(),
+            }
         }
     }
 
@@ -1580,7 +1780,11 @@ mod tests {
             score,
             channels: channels
                 .iter()
-                .map(|ch| ChannelScore { channel: ch.to_string(), rank: 0, raw: 1.0 })
+                .map(|ch| ChannelScore {
+                    channel: ch.to_string(),
+                    rank: 0,
+                    raw: 1.0,
+                })
                 .collect(),
             selected: true,
             reject_reason: None,
@@ -1622,10 +1826,16 @@ mod tests {
         assert_eq!(lm.calls(), 1);
         let span = &trace.spans[0];
         assert_eq!(span.status, "selected");
-        assert_eq!(span.candidates[0].rowid, 2, "chosen candidate moves to front");
+        assert_eq!(
+            span.candidates[0].rowid, 2,
+            "chosen candidate moves to front"
+        );
         assert!(span.candidates[0].adjudicated);
         assert!(span.candidates[0].selected);
-        assert_eq!(span.candidates[1].rowid, 1, "displaced candidate stays visible");
+        assert_eq!(
+            span.candidates[1].rowid, 1,
+            "displaced candidate stays visible"
+        );
         assert!(!span.candidates[1].adjudicated);
     }
 
@@ -1677,5 +1887,240 @@ mod tests {
         adjudicate(&mut trace, &lm);
         assert_eq!(trace.spans[0].candidates[0].rowid, 1);
         assert_eq!(trace.spans[0].status, "selected");
+    }
+
+    // ------------------- context-affinity section tests -------------------
+
+    /// Test embedder with readable geometry: each marker word contributes an
+    /// axis plus a shared bias axis, so the cosine ordering between a query
+    /// and two interpretation cards is decided by which markers they share —
+    /// deterministic and directionally meaningful, unlike a hash embedder.
+    struct MarkerEmbedder;
+
+    const MARKERS: &[&str] = &["office", "tower", "product", "sku"];
+
+    impl MarkerEmbedder {
+        fn vector(text: &str) -> Vec<f32> {
+            let t = text.to_lowercase();
+            let mut v: Vec<f32> = MARKERS
+                .iter()
+                .map(|m| if t.contains(m) { 1.0 } else { 0.0 })
+                .collect();
+            v.push(0.25); // bias axis: zero-marker texts stay embeddable
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+            v
+        }
+    }
+
+    impl stemma_embed::Embedder for MarkerEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                backend: "fake".into(),
+                model: "marker-embedder".into(),
+                dimension: MARKERS.len() + 1,
+            }
+        }
+    }
+
+    /// The BIRD-shaped tie in miniature: the same value 'Mercury' lives in
+    /// offices.city and products.name, and only column context separates the
+    /// two interpretations. `drain` populates vec_interp from real cards.
+    fn interp_db(drain: bool) -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.offices(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+                 INSERT INTO src.offices VALUES
+                    (1, 'Mercury Tower', 'Mercury'),
+                    (2, 'Vine Street', 'Fresno');
+                 CREATE TABLE src.products(id INTEGER PRIMARY KEY, sku TEXT, name TEXT);
+                 INSERT INTO src.products VALUES
+                    (1, 'SKU-771', 'Mercury'),
+                    (2, 'SKU-772', 'Saturn');",
+            )
+            .unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        if drain {
+            stemma_ingest::enqueue_missing_interpretations(&db).unwrap();
+            stemma_ingest::drain_embed_queue(&db, &MarkerEmbedder, stemma_ingest::EMBED_BATCH)
+                .unwrap();
+        }
+        db
+    }
+
+    fn interp_cand(table: &str, column: &str, rowid: i64, score: f64) -> Candidate {
+        Candidate {
+            table: table.into(),
+            column: column.into(),
+            rowid,
+            value: "Mercury".into(),
+            value_truncated: false,
+            score,
+            channels: vec![ChannelScore {
+                channel: "trigram".into(),
+                rank: 0,
+                raw: 1.0,
+            }],
+            selected: false,
+            reject_reason: None,
+            is_doc: false,
+            snippet: None,
+            adjudicated: false,
+            coherence: None,
+        }
+    }
+
+    /// A span whose top two candidates are the two 'Mercury' interpretations,
+    /// with the wrong one (for a product query) narrowly on top.
+    fn tied_spans() -> Vec<Span> {
+        vec![Span {
+            id: 0,
+            text: "Mercury".into(),
+            start: 0,
+            end: 7,
+            status: "selected".into(),
+            candidates: vec![
+                interp_cand("offices", "city", 1, 0.60),
+                interp_cand("products", "name", 1, 0.58),
+            ],
+            kg_alias: false,
+        }]
+    }
+
+    #[test]
+    fn context_affinity_separates_a_tie_in_the_right_direction() {
+        let db = interp_db(true);
+        let mut spans = tied_spans();
+        // The query talks about products; the products card shares its
+        // markers ("product", "sku"), the offices card does not.
+        apply_context_affinity(
+            &db,
+            Some(&MarkerEmbedder),
+            "which product sku is Mercury",
+            &mut spans,
+        );
+        let span = &spans[0];
+        assert_eq!(
+            (span.candidates[0].table.as_str(), span.candidates[0].rowid),
+            ("products", 1),
+            "the context-matching interpretation must win: {:?}",
+            span.candidates
+                .iter()
+                .map(|c| (c.table.as_str(), c.score))
+                .collect::<Vec<_>>()
+        );
+        // Both tied candidates carry the evidence, ranked by cosine order.
+        for c in &span.candidates {
+            let ctx = c
+                .channels
+                .iter()
+                .find(|ch| ch.channel == "context")
+                .expect("both tied candidates carry a context ChannelScore");
+            assert_eq!(ctx.rank, usize::from(c.table != "products"));
+            assert!((-1.0..=1.0).contains(&ctx.raw));
+        }
+        let winner = &span.candidates[0];
+        let loser = &span.candidates[1];
+        assert!((winner.score - 0.62).abs() < 1e-9, "0.58 + CONTEXT_BOOST");
+        assert!((loser.score - 0.60).abs() < 1e-9, "loser untouched");
+        // The reorder is bounded: the winner never enters the exact band.
+        assert!(winner.score <= CONTEXT_CAP);
+    }
+
+    #[test]
+    fn context_affinity_is_a_noop_without_signals() {
+        let baseline = serde_json::to_value(tied_spans()).unwrap();
+
+        // No embedder.
+        let db = interp_db(true);
+        let mut spans = tied_spans();
+        apply_context_affinity(&db, None, "which product sku is Mercury", &mut spans);
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+
+        // No vec_interp (queue never drained).
+        let db = interp_db(false);
+        let mut spans = tied_spans();
+        apply_context_affinity(
+            &db,
+            Some(&MarkerEmbedder),
+            "which product sku is Mercury",
+            &mut spans,
+        );
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+
+        // vec_interp registered to a different model: mixing spaces would be
+        // worse than skipping, so the pass declines silently.
+        let db = interp_db(true);
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET model = 'some-other-model'
+                 WHERE vector_table = 'vec_interp'",
+                [],
+            )
+            .unwrap();
+        let mut spans = tied_spans();
+        apply_context_affinity(
+            &db,
+            Some(&MarkerEmbedder),
+            "which product sku is Mercury",
+            &mut spans,
+        );
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+
+        // Not a tie: a clear fused-score gap is left alone.
+        let db = interp_db(true);
+        let mut spans = tied_spans();
+        spans[0].candidates[0].score = 0.80;
+        spans[0].candidates[1].score = 0.58;
+        apply_context_affinity(
+            &db,
+            Some(&MarkerEmbedder),
+            "which product sku is Mercury",
+            &mut spans,
+        );
+        assert!(spans[0]
+            .candidates
+            .iter()
+            .all(|c| c.channels.iter().all(|ch| ch.channel != "context")));
+        assert_eq!(spans[0].candidates[0].score, 0.80);
+    }
+
+    #[test]
+    fn context_affinity_records_but_never_boosts_an_ambiguous_cosine() {
+        // A query naming both contexts is equidistant from the two cards by
+        // construction (each card holds exactly two markers plus the bias),
+        // so the cosine gap is 0 — under CONTEXT_COS_GAP — and the order
+        // must stand while the evidence is still recorded.
+        let db = interp_db(true);
+        let mut spans = tied_spans();
+        apply_context_affinity(
+            &db,
+            Some(&MarkerEmbedder),
+            "office product Mercury",
+            &mut spans,
+        );
+        let span = &spans[0];
+        assert_eq!(span.candidates[0].table, "offices", "order unchanged");
+        assert!((span.candidates[0].score - 0.60).abs() < 1e-9);
+        assert!((span.candidates[1].score - 0.58).abs() < 1e-9);
+        let raws: Vec<f64> = span
+            .candidates
+            .iter()
+            .map(|c| {
+                c.channels
+                    .iter()
+                    .find(|ch| ch.channel == "context")
+                    .expect("evidence recorded even without a boost")
+                    .raw
+            })
+            .collect();
+        assert!(
+            (raws[0] - raws[1]).abs() < 1e-6,
+            "symmetric by design: {raws:?}"
+        );
     }
 }
