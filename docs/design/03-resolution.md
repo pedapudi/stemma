@@ -47,9 +47,10 @@ Every tunable in the pipeline, with its source and its job:
 | `SELECT_THRESHOLD` | 0.35 | stemma-resolve | Fused score below which a candidate is traced but not selected |
 | `TOP_K` | 5 | stemma-resolve | Max selected candidates per mention |
 | `DENSE_MAX_SPANS` | 4 | stemma-resolve | Spans per query that get a dense KNN probe |
+| `DENSE_OVERFETCH` | 4 | stemma-resolve | KNN over-fetch factor; hits are collapsed per interpretation, then truncated |
 | `RRF_K` | 4.0 | stemma-resolve (`fuse`) | Reciprocal-rank-fusion damping constant |
-| `EXACT_MAX_LEN` | 120 | stemma-ingest | Values longer than this are excluded from the exact channel |
-| `DOC_MIN_LEN` | 200 | stemma-ingest | Values at least this long are classified `is_doc` |
+| `EXACT_MAX_LEN` | 120 | stemma-ingest | Values longer than this are excluded from the exact channel; also anchors "value scale" for the derived document boundary |
+| `CONFIDENCE_LEVEL` | 0.95 | stemma-ingest | Jeffreys lower-bound level for every column shape judgment |
 | KG bonus | 0.04 / matched co-term | stemma-resolve | Coherence increment, capped at 0.9 |
 | `CONTEXT_TERM_BONUS` | 0.05 / supporting term | stemma-resolve | Context-coherence increment for value candidates, capped at 0.9 |
 | `CONTEXT_TERM_MAX` | 2 | stemma-resolve | Distinct context terms that may support one candidate |
@@ -393,26 +394,41 @@ The selected spans are embedded in **one batched call**, then probed:
 
 ```sql
 SELECT src_table, src_column, src_rowid, distance FROM vec_dense
-WHERE embedding MATCH ?1 AND k = ?2          -- k = PER_CHANNEL_LIMIT = 8
+WHERE embedding MATCH ?1 AND k = ?2   -- k = PER_CHANNEL_LIMIT * DENSE_OVERFETCH = 32
 ```
+
+**Over-fetch and collapse.** `k` is applied *inside* the KNN, before any
+grouping is possible, and identical strings embed to identical vectors — so
+on a denormalized corpus the copies of one repeated document are guaranteed
+adjacent in the ordering and, with `k = 8`, consumed every slot (issue #3;
+the duplication factor is the fan-out of the join that copied the text). The
+channel therefore fetches `PER_CHANNEL_LIMIT × DENSE_OVERFETCH` rows,
+collapses them to one hit per `(src_table, src_column, value_norm)` — the
+nearest member is the representative, the collapsed copies are counted into
+`row_count`, up to `SAMPLE_ROWIDS` member rowids are kept — applies
+`DOC_COLUMN_QUOTA` per (table, column) over the collapsed document hits
+(the same window the FTS channels apply), and truncates to
+`PER_CHANNEL_LIMIT`. Dense candidates thus have the same interpretation
+shape as lexical ones, and **`row_count` means the same thing in every
+channel**: rows sharing this value among what the channel retrieved.
+Over-fetch is the only correct place to do this — a reading not retrieved by
+the KNN cannot be recovered downstream — and 4× covers realistic fan-out at
+the cost of a constant factor on an already-linear scan.
 
 A failed embedding call logs `dense channel degraded` and leaves phase 1's
 hits untouched.
 
 ### Query formatting is asymmetric
 
-```rust
-pub fn format_query(mention: &str) -> String {
-    format!("Instruct: Given a search query, retrieve relevant passages \
-             that answer the query\nQuery: {mention}")
-}
-```
-
-Documents were embedded raw; the *mention* carries the retrieval instruction.
-This is the Qwen3-Embedding-family convention [Zhang 2025], and it is
-in the code rather than in a config file because getting it wrong silently
-costs most of the encoder's quality — everything still runs, the numbers are
-just worse. See
+Documents were embedded raw; the *mention* passes through
+`Embedder::format_query()`, which renders the backend's query template
+(`{query}` placeholder). For the Qwen3-Embedding family the default template
+is the published retrieval instruction [Zhang 2025]; for other models the
+default is bare, and a deployment overrides either with
+`server.embedder.query_template` / `--embed-query-template`. The template
+lives with the model identity because endpoint, model and template must
+agree — getting the pairing wrong silently costs encoder quality;
+everything still runs, the numbers are just worse. See
 [05-encoders-decoders.md](05-encoders-decoders.md#query-time-requirements).
 
 ### Distance to similarity
@@ -427,11 +443,12 @@ within the KNN result is what feeds RRF; the cosine is carried for evidence —
 and, unlike the lexical raws, it is also *used* (next section but one).
 
 Because `vec_dense` stores only `(src_table, src_column, src_rowid)`, each
-dense hit is joined back to `lex_values` for its `value` and `is_doc` flag. A
-row present in the vector table but absent from the lexical index defaults to
-`is_doc = true` with an empty value — the conservative choice, since it takes
-the document scoring branch rather than being length-penalized against an
-empty value.
+dense hit is joined back to `lex_values` for its `value`, its `value_norm`
+(the collapse key) and its `is_doc` flag. A row present in the vector table
+but absent from the lexical index defaults to `is_doc = true` with an empty
+value and is never merged with other unknowns — the conservative choice,
+since it takes the document scoring branch rather than being
+length-penalized against an empty value.
 
 **Phase 3** fuses the union of lexical and dense hits per span, applies the
 knowledge-graph coherence bonus, and refines span status.
@@ -1123,7 +1140,11 @@ re-staging and restarting, not querying both — which is safe (spaces are
 never mixed) but is not the side-by-side A/B the registry design allows for.
 
 **Dense promotion happens only at server startup**, and staging must be
-written while the server is stopped. There is no online re-embed.
+written while the server is stopped. (Queue-fed vectors are different:
+changed rows re-embed online through the content-hashed queue and the
+server's refresh watch — see
+[02-data-model.md](02-data-model.md#the-refresh-discipline) — but a staged
+generation swap still means a restart.)
 
 ## References
 

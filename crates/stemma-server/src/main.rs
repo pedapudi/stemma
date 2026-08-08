@@ -43,6 +43,16 @@ struct Args {
     #[arg(long)]
     embed_model: Option<String>,
 
+    /// Query-side template for the embedder, with a "{query}" placeholder
+    /// (e.g. "Instruct: ...\nQuery: {query}"). Endpoint, model and template
+    /// must agree, so all three are configurable together; overrides
+    /// server.embedder.query_template in the config file. Unset, the
+    /// template is chosen by model family (Qwen3-Embedding models get their
+    /// published retrieval instruction, anything else embeds queries bare);
+    /// pass "{query}" to force bare on any model.
+    #[arg(long)]
+    embed_query_template: Option<String>,
+
     /// OpenAI-compatible /v1/chat/completions base URL enabling the LM
     /// adjudication band (e.g. http://host:8080/v1). Absent = no LM;
     /// resolution is fully local.
@@ -68,7 +78,7 @@ struct ConfigFile {
 #[derive(serde::Deserialize, Default)]
 struct ServerSection {
     listen: Option<SocketAddr>,
-    embedder: Option<EndpointSection>,
+    embedder: Option<EmbedderSection>,
     lm: Option<EndpointSection>,
 }
 
@@ -76,6 +86,18 @@ struct ServerSection {
 struct EndpointSection {
     endpoint: String,
     model: String,
+}
+
+/// The embedder carries one more knob than a plain endpoint: the query-side
+/// template ("{query}" placeholder) that must agree with the model. Absent,
+/// the default is looked up by model family
+/// (`stemma_embed::default_query_template`).
+#[derive(serde::Deserialize)]
+struct EmbedderSection {
+    endpoint: String,
+    model: String,
+    #[serde(default)]
+    query_template: Option<String>,
 }
 
 /// Flags override the file; relative database paths in the file resolve
@@ -107,6 +129,9 @@ fn merge_config(args: &mut Args) -> anyhow::Result<()> {
     if let Some(e) = cfg.server.embedder {
         args.embed_endpoint.get_or_insert(e.endpoint);
         args.embed_model.get_or_insert(e.model);
+        if let Some(t) = e.query_template {
+            args.embed_query_template.get_or_insert(t);
+        }
     }
     if let Some(l) = cfg.server.lm {
         args.lm_endpoint.get_or_insert(l.endpoint);
@@ -130,7 +155,7 @@ struct Resolver {
     // resolution is read-mostly. Revisit with a connection pool when the
     // pipeline lands.
     dbs: HashMap<String, Mutex<StemmaDb>>,
-    embedder: Option<stemma_embed::OpenAiEmbedder>,
+    embedder: Option<std::sync::Arc<stemma_embed::CooldownEmbedder<stemma_embed::OpenAiEmbedder>>>,
     lm: Option<Box<dyn stemma_lm::LmBackend>>,
 }
 
@@ -144,7 +169,7 @@ impl Resolver {
         let embedder = self
             .embedder
             .as_ref()
-            .map(|e| e as &dyn stemma_embed::Embedder);
+            .map(|e| e.as_ref() as &dyn stemma_embed::Embedder);
         // options.allow_lm gates the adjudication band per request: off, the
         // resolution is purely lexical/dense/KG and fully local.
         let lm = match req.options.as_ref().map(|o| o.allow_lm) {
@@ -210,28 +235,115 @@ impl ResolveService for Resolver {
     }
 }
 
-/// Enqueues missing embeddings for one database — document cells and value
-/// interpretations, into the same queue — and drains it to empty, batch by
-/// batch, on its own store connection. The drain routes each item by kind:
-/// documents into vec_dense, interpretation cards into vec_interp.
-fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str) {
+
+/// Cadence of the cheap change probe: every this-many seconds the
+/// background task reads `PRAGMA src.data_version` — a counter SQLite bumps
+/// when *another* connection commits to the user database — and only a
+/// changed counter triggers the (fingerprint-guarded) refresh. An
+/// operational polling interval, not a data-derived quantity: it trades
+/// staleness for probe cost, and the probe is one pragma read.
+const REFRESH_POLL_SECS: u64 = 60;
+
+/// The steady-state background task for one database: run the embed pass
+/// once at startup (when an embedder is configured), then watch the user
+/// database for change. `PRAGMA src.data_version` is the cheap global
+/// signal; when it moves, the registration path re-runs — the lexical
+/// index's receipts re-ingest exactly the changed tables, the knowledge
+/// compiler's fingerprints recompile exactly the changed tables, and the
+/// embed queue's content hashes re-embed exactly the changed rows. No
+/// filesystem watcher, no restart.
+fn background_task(
+    name: &str,
+    user_db: &std::path::Path,
+    embedder: Option<std::sync::Arc<stemma_embed::CooldownEmbedder<stemma_embed::OpenAiEmbedder>>>,
+) {
     let store = user_db.with_extension("stemmadb");
     let db = match StemmaDb::open(&store, user_db) {
         Ok(db) => db,
         Err(e) => {
-            tracing::warn!(name, error = %e, "embed drain: opening store failed");
+            tracing::warn!(name, error = %e, "background task: opening store failed");
             return;
         }
     };
-    let embedder = stemma_embed::OpenAiEmbedder::new(endpoint, model);
-    let queued_docs = match stemma_ingest::enqueue_missing_embeddings(&db) {
+    if let Some(embedder) = &embedder {
+        embed_pass(name, &db, embedder.as_ref());
+    }
+
+    let data_version = |db: &StemmaDb| -> i64 {
+        db.conn()
+            .query_row("PRAGMA src.data_version", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let mut last = data_version(&db);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(REFRESH_POLL_SECS));
+        if let Some(embedder) = &embedder {
+            if embedder.is_down() && embedder.probe().is_ok() {
+                tracing::info!(name, "embedding endpoint recovered; resuming drain");
+                embed_pass(name, &db, embedder.as_ref());
+            }
+        }
+        let seen = data_version(&db);
+        if seen == last {
+            continue;
+        }
+        last = seen;
+        tracing::info!(name, "user database changed; refreshing derived state");
+        match stemma_ingest::build_lexical_index(&db, false) {
+            Ok(stats) => tracing::info!(
+                name,
+                reingested_tables = stats.reingested_tables,
+                values = stats.values,
+                "refresh: lexical index"
+            ),
+            Err(e) => {
+                tracing::warn!(name, error = %e, "refresh: lexical index failed");
+                continue;
+            }
+        }
+        match stemma_kg::compile(&db, false) {
+            Ok(kg) => tracing::info!(
+                name,
+                recompiled_tables = kg.recompiled_tables,
+                "refresh: knowledge graph"
+            ),
+            Err(e) => tracing::warn!(name, error = %e, "refresh: kg compile failed"),
+        }
+        if let Some(embedder) = &embedder {
+            embed_pass(name, &db, embedder.as_ref());
+        }
+    }
+}
+
+/// Enqueues embedding work for one database and drains it, documents
+/// strictly before interpretation cards: enqueue docs → drain to empty →
+/// enqueue interps → drain to empty. The document sweep is small (the
+/// corpus's long cells) while the card sweep can be large, so this ordering
+/// lights the dense document channel in seconds instead of after the full
+/// interpretation pass. The drain routes each item by kind: documents into
+/// vec_dense, cards into vec_interp.
+fn embed_pass(name: &str, db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) {
+    let start = std::time::Instant::now();
+    let queued_docs = match stemma_ingest::enqueue_missing_embeddings(db) {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!(name, error = %e, "embed drain: enqueue failed");
+            tracing::warn!(name, error = %e, "embed drain: document enqueue failed");
             return;
         }
     };
-    let queued_interps = match stemma_ingest::enqueue_missing_interpretations(&db) {
+    tracing::info!(
+        name,
+        queued_docs,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "embed drain: documents enqueued"
+    );
+    log_dense_building(name, db);
+    if !drain_to_empty(name, db, embedder, "documents") {
+        return;
+    }
+
+    let start = std::time::Instant::now();
+    let queued_interps = match stemma_ingest::enqueue_missing_interpretations(db) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(name, error = %e, "embed drain: interpretation enqueue failed");
@@ -240,32 +352,60 @@ fn drain_task(name: &str, user_db: &std::path::Path, endpoint: &str, model: &str
     };
     tracing::info!(
         name,
-        queued_docs,
         queued_interps,
-        "embed drain: queue filled"
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "embed drain: interpretations enqueued"
     );
+    log_dense_building(name, db);
+    drain_to_empty(name, db, embedder, "interpretations");
+}
+
+/// One line distinguishing "dense index still building" from "no
+/// dense-channel candidates": while items are pending and either vector
+/// table has yet to materialize, a dense query legitimately returns nothing.
+fn log_dense_building(name: &str, db: &StemmaDb) {
+    let count = |sql: &str| -> i64 { db.conn().query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    let tables = count(
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('vec_dense', 'vec_interp')",
+    );
+    let docs = count("SELECT count(*) FROM embed_queue WHERE status = 'pending' AND serialized = ''");
+    let interps =
+        count("SELECT count(*) FROM embed_queue WHERE status = 'pending' AND serialized != ''");
+    if tables < 2 && docs + interps > 0 {
+        tracing::info!(
+            name,
+            "dense channel building: {docs} docs, {interps} interps pending"
+        );
+    }
+}
+
+/// Drains the queue until nothing is pending; false = stopped on error
+/// (left-over items keep their attempt counts for the next server start).
+fn drain_to_empty(
+    name: &str,
+    db: &StemmaDb,
+    embedder: &dyn stemma_embed::Embedder,
+    phase: &str,
+) -> bool {
     loop {
-        match stemma_ingest::drain_embed_queue(&db, &embedder, stemma_ingest::EMBED_BATCH) {
+        match stemma_ingest::drain_embed_queue(db, embedder, stemma_ingest::EMBED_BATCH) {
             Ok(stats) => {
                 tracing::info!(
                     name,
-                    queued_docs,
-                    queued_interps,
+                    phase,
                     drained = stats.drained,
                     failed = stats.failed,
                     remaining = stats.remaining,
                     "embed drain: batch"
                 );
                 if stats.remaining == 0 {
-                    tracing::info!(name, "embed drain: queue empty");
-                    return;
+                    tracing::info!(name, phase, "embed drain: queue empty");
+                    return true;
                 }
             }
             Err(e) => {
-                // Left-over items stay pending with their attempt counts;
-                // the next server start picks them back up.
-                tracing::warn!(name, error = %e, "embed drain: stopped");
-                return;
+                tracing::warn!(name, phase, error = %e, "embed drain: stopped");
+                return false;
             }
         }
     }
@@ -316,10 +456,29 @@ async fn main() -> anyhow::Result<()> {
         dbs.insert(name.clone(), Mutex::new(db));
     }
 
+    // The query template is part of the model identity: explicit config
+    // (flag over file) wins, otherwise it is looked up by model family —
+    // Qwen3-Embedding gets its published instruction, anything else embeds
+    // queries bare.
+    let embed_template = args.embed_query_template.clone().or_else(|| {
+        args.embed_model
+            .as_deref()
+            .and_then(stemma_embed::default_query_template)
+    });
     let embedder = match (&args.embed_endpoint, &args.embed_model) {
         (Some(ep), Some(m)) => {
-            tracing::info!(endpoint = %ep, model = %m, "dense channel enabled");
-            Some(stemma_embed::OpenAiEmbedder::new(ep, m))
+            tracing::info!(
+                endpoint = %ep,
+                model = %m,
+                query_template = embed_template.as_deref().unwrap_or("(bare)"),
+                "dense channel enabled"
+            );
+            Some(std::sync::Arc::new(stemma_embed::CooldownEmbedder::new(
+                stemma_embed::OpenAiEmbedder::new(ep, m, embed_template.clone()),
+                // Down-marker refresh window; the background task owns the
+                // recovery probe, so user queries always short-circuit.
+                std::time::Duration::from_secs(60),
+            )))
         }
         _ => None,
     };
@@ -332,17 +491,15 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    // Index-time embedding: with an embedder configured, each database gets a
-    // background task that enqueues its unembedded documents and drains the
-    // queue until empty, then exits — no polling loop. The store is WAL, so
-    // the task opens its own connection and serving is never blocked; a
-    // drain failure degrades the dense channel, never the server.
-    if let (Some(ep), Some(model)) = (&args.embed_endpoint, &args.embed_model) {
-        for (name, user_db) in &args.dbs {
-            let (name, user_db) = (name.clone(), user_db.clone());
-            let (ep, model) = (ep.clone(), model.clone());
-            tokio::task::spawn_blocking(move || drain_task(&name, &user_db, &ep, &model));
-        }
+
+    // Each database gets a background task on its own store connection: an
+    // initial embed pass (when an embedder is configured), then the
+    // data_version watch that keeps derived state fresh without a restart.
+    // The store is WAL, so serving is never blocked; a background failure
+    // degrades the dense channel or freshness, never the server.
+    for (name, user_db) in &args.dbs {
+        let (name, user_db, embedder) = (name.clone(), user_db.clone(), embedder.clone());
+        tokio::task::spawn_blocking(move || background_task(&name, &user_db, embedder));
     }
 
     tracing::info!(listen = %listen, "stemma-server starting");

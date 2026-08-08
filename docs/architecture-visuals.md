@@ -161,14 +161,16 @@ produced.
 
 ![the .stemmadb store](../assets/diagrams/store.svg)
 
-One SQLite file (WAL mode, `PRAGMA user_version = 4`) holds everything
+One SQLite file (WAL mode, `PRAGMA user_version = 5`) holds everything
 stemma derives; the user database is attached read-only as `src` and is
 never written. Groups, with their writers:
 
-**lexical index** — written by `stemma-ingest` at server startup (skipped
-when already populated, rebuilt on `force` or shape change). `lex_values`
+**lexical index** — written by `stemma-ingest` at server startup and on
+refresh (receipt-driven: only tables whose content fingerprint moved
+re-ingest; `force` re-ingests everything). `lex_values`
 carries every text value of every user table with its normalized form and an
-`is_doc` flag (length ≥ 200: a document a mention resolves *into*, not a
+`is_doc` flag (derived per column from the corpus's length distribution: a
+document a mention resolves *into*, not a
 value it equals; values over 120 chars are excluded from the exact channel).
 `lex_fts` and `lex_trigram` are content-linked FTS5 indexes over the same
 rows; `lex_vocab` is an fts5vocab table the knowledge compiler uses for term
