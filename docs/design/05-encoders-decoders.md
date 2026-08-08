@@ -15,9 +15,11 @@ mechanics of the built parts are specified in
 [02-data-model.md](02-data-model.md#vec_staging-and-vec_dense) and
 [03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted);
 this document gives the *why*, and everything it describes beyond those
-mechanics — online blue-green swaps, re-embedding on data change,
+mechanics — online blue-green swaps,
 cross-encoder reranking, mention expansion, and the `Adjudication` evidence
-record — is **designed, not built**.
+record — is **designed, not built**. (Re-embedding on data change *is*
+built: the content-hashed queue plus the server's refresh watch,
+[02-data-model.md](02-data-model.md#the-refresh-discipline).)
 
 The design rests on one division of labour, and this document argues it,
 specifies both halves, and then addresses the failure mode that decides
@@ -165,36 +167,85 @@ semantic similarity, and it is invisible unless the identity is recorded.
 **As built: documents plus interpretation cards.** The queue path embeds two
 kinds of item, and keeps them in two vector tables.
 
-*Documents, raw, one vector per document cell.* The cells the lexical index
-classified `is_doc` — long text that mentions resolve *into* — embedded
-verbatim, with no instruction prefix, into `vec_dense`. That is the
+*Documents, raw, one vector per document cell.* The cells of columns the
+derived document boundary classified `is_doc` — prose that mentions resolve
+*into* — embedded verbatim, with no instruction prefix, into `vec_dense`. That is the
 asymmetric convention of instruction-tuned retrieval encoders:
-`format_query()` decorates the query-time mention, documents stay raw, and
-applying the instruction on the document side would desert the space the
-queries live in. Documents longer than the encoder's context are truncated
+`Embedder::format_query()` decorates the query-time mention through the
+backend's own template, documents stay raw, and applying the instruction on
+the document side would desert the space the queries live in. Documents longer than the encoder's context are truncated
 by the endpoint today — chunking is designed, not built.
 
-*Interpretation cards, one vector per distinct value interpretation.* For
-every distinct `(src_table, src_column, value_norm)` with `is_doc = 0`, the
-ingest pass serializes a card —
+*Interpretation cards, one vector per distinct value interpretation.*
+**Candidacy is column-typed.** A card is only ever consulted when the same
+value ties across distinct `(table, column)` readings, so recurrence across
+≥ 2 columns has always been required — but on denormalized schemas
+recurrence is dominated by *copied data* (a foreign key exists precisely
+because the same value lives in two columns, and fact tables copy their
+dimensions' timestamps and SKUs), which no natural-language paraphrase can
+ever retrieve. Issue #2 measured the failure: 846,989 cards on one 6-table
+warehouse, 90.4% of them epoch floats, queued ahead of the corpus's 98
+useful documents. The fix is semantic, not per-value regex: candidacy —
+both the outer selection and the recurrence subquery — is restricted to
+columns the [`is_paraphrasable_column` predicate](02-data-model.md#lex_columns--column-measurements)
+admits (letter-bearing by majority, and not *confidently* shape-structural
+at the Jeffreys bound), plus a per-value guard that the normalized value
+contains a letter. Timestamps, keys and id-shaped strings are excluded
+because of what their *columns* measurably are, and the expectation is
+honest again: the queue holds the corpus's shared vocabulary, typically a
+few hundred cards. (The letter guard means purely non-Latin values rely on
+the column-level measurements alone — `alpha_ratio` shares the same `[a-z]`
+definition.)
+
+For every qualifying distinct `(src_table, src_column, value_norm)` with
+`is_doc = 0`, the ingest pass serializes a card —
 
 ```
 offices · city · Seattle · name: Seattle - Northgate
 ```
 
-— the provenance line plus up to two `col: value` context fragments from a
-representative row's other short columns, deterministic and capped at
-300 characters. The card is stored in `embed_queue.serialized` at enqueue
-time and embedded raw (cards are "documents" in the asymmetric scheme) into
-`vec_interp`, a second `vec0` table with its own `model_registry` row and the
-same one-model-per-table invariant.
+— the provenance line plus up to two `col: value` context fragments,
+deterministic and capped at 300 characters. The card is stored in
+`embed_queue.serialized` at enqueue time and embedded raw (cards are
+"documents" in the asymmetric scheme) into `vec_interp`, a second `vec0`
+table with its own `model_registry` row and the same one-model-per-table
+invariant.
+
+**Fragments are set-level, never sampled.** An interpretation is a
+set-level object — all the rows sharing the value — and the first card
+format described it with two cells from the single row that won
+`MIN(src_rowid)`, an insertion-order artifact. Issue #6 measured the
+consequence: two cards for the *same* reading, differing only in the
+sampled row, were less similar (0.7652 cosine) than two cards for
+*different* readings (0.9485); on a real corpus the within-value spread
+(0.2907) was 5× the between-value gap (0.0581), and 4 of 6 tie-break
+probes changed answer with nothing but the representative row. Dropping
+timestamps did not help — with fewer fragments each remaining one occupies
+more of the card, so *any* single-row fragment destabilizes it. The card
+format therefore aggregates: for each other `text`-kind, non-doc column of
+the same table, the **modal value across all rows sharing the
+interpretation**, included only when that mode is a strict majority
+(> 50% of the column's values in the set — a definition, not a tunable,
+and one that makes the winner unique). A column with no majority
+contributes nothing; an interpretation with no majorities gets a bare
+`table · column · value` card, which the same measurement showed *beating*
+single-row-fragment cards on between-value separation — describing nothing
+is better than describing one arbitrary member. The displayed value is
+likewise the modal raw spelling (ties lexicographic). Aggregated cards were
+also the best retriever measured (MRR 0.766 vs 0.725 current, 0.705 bare).
+The representative `MIN(src_rowid)` survives only as the citation key of
+the provenance triple. Because a serialization change strands the vectors
+that embed the old text, the format is named
+(`stemma_ingest::INTERP_CARD_FORMAT`), recorded in the registry row's
+`card_format`, and a mismatch drops and requeues `vec_interp` wholesale —
+see [02-data-model.md](02-data-model.md#model_registry).
 
 The earlier documents-only policy should be named for what it was: **an
 over-fit to the first corpus.** On the legal corpus every interesting cell is
 a 2,600-character regulation body, so "embed the documents, skip the values"
-looked like a principle. On relational corpora (BIRD-shaped schemas) nothing
-crosses `DOC_MIN_LEN`, the queue enqueued nothing, and the dense channel was
-inert — while the case that most needs semantic help there, the same value
+looked like a principle. On relational corpora (BIRD-shaped schemas) no
+column crosses the document boundary, the queue enqueued nothing, and the
+dense channel was inert — while the case that most needs semantic help there, the same value
 living in two columns, is unresolvable by any channel that only sees the
 value's own characters. The card is the smallest serialization that fixes
 both: the `table · column` prefix gives the encoder the interpretation, and
@@ -203,10 +254,10 @@ row, and the content that makes `offices` row 17 the right answer is spread
 across `name` and `city`. The resolve side consumes the cards through a
 narrow reorder pass: when fusion leaves two value interpretations tied
 (top-2 gap < 0.08, distinct `(table, column)`, both non-doc), the full query
-is embedded once through `format_query()` and each tied card's vector is read
-back by provenance key, the cosine attached as a `"context"` channel score,
-and the cosine winner boosted +0.04 (capped at 0.9 — never into the exact
-band) when the cosine gap exceeds 0.05.
+is embedded once through `Embedder::format_query()` and each tied card's
+vector is read back by provenance key, the cosine attached as a `"context"`
+channel score, and the cosine winner boosted +0.04 (capped at 0.9 — never
+into the exact band) when the cosine gap exceeds 0.05.
 
 ### Two ways vectors get in
 
@@ -224,12 +275,24 @@ configured, each database gets a background task on its own store connection
 (the store is WAL, so serving never blocks on it):
 
 1. `stemma_ingest::enqueue_missing_embeddings` inserts a pending
-   `embed_queue` item for every document cell with no `vec_dense` vector,
-   and `stemma_ingest::enqueue_missing_interpretations` one for every
-   distinct value interpretation with no `vec_interp` vector — keyed by the
-   interpretation's representative `MIN(src_rowid)`, with the card in
-   `serialized`. Both are idempotent via the unique provenance key, and a
-   `done` item is only reset if its vector has since disappeared.
+   `embed_queue` item for every document cell needing work,
+   and the queue is drained **to empty** before
+   `stemma_ingest::enqueue_missing_interpretations` runs — one item per
+   qualifying distinct value interpretation (paraphrasable columns only,
+   see above) needing work, keyed by the interpretation's
+   representative `MIN(src_rowid)`, with the card in `serialized` —
+   followed by a second drain. Documents strictly first: the document sweep
+   is small and is what makes the dense channel useful, so it must not sit
+   behind the (potentially much larger) card sweep. Both enqueues are
+   idempotent via the unique provenance key, log their count and duration,
+   and a `done` item is reset only when its vector has disappeared or its
+   `content_hash` no longer matches the text the encoder would see — the
+   raw document, or the card — in which case the stale vector is deleted
+   and the changed row re-embeds through the ordinary drain.
+   While items are pending and a vector table has yet to materialize, the
+   task logs `dense channel building: N docs, M interps pending` — the line
+   that distinguishes "index still building" from "no dense-channel
+   candidates".
 2. `stemma_ingest::drain_embed_queue` repeats until the queue is empty:
    take a batch of 32 pending items (least-retried first), fetch each item's
    text — the raw document for document items, the stored card for
@@ -237,9 +300,8 @@ configured, each database gets a background task on its own store connection
    each vector into its item's table (`vec_dense` or `vec_interp`) —
    creating either vec0 table at the embedder's observed dimension with its
    `model_registry` row on first use — and mark the items `done`. Progress
-   (`queued_docs`, `queued_interps`, `drained`, `failed`, `remaining`) is
-   logged per batch, and the task exits when the queue is empty; there is no
-   polling loop.
+   (`drained`, `failed`, `remaining`, per phase) is logged per batch, and
+   the task exits when the queue is empty; there is no polling loop.
 
 Model identity is checked before any embedding work: if `model_registry`
 already binds `vec_dense` *or* `vec_interp` to a *different* model, the
@@ -256,14 +318,19 @@ degrades to lexical-plus-KG. Resolution still works, the next server start
 picks the queue back up, and the queue's status column keeps the whole
 story queryable in plain SQL.
 
-Honest limits of what is built: the drain runs at startup and exits — no
-watcher notices data changes afterward, and re-embedding after an edit means
-restarting the server; there is no online re-embed and no blue-green
-generation swap (the next section is still designed, not built); and the
-interpretation cards inherit the lexical index's column-selection blind
-spots — an all-distinct identifier column (uuids) yields one card per row,
-paying embedding cost for interpretations nothing will ever tie on, until
-the designed per-column profiling pass lands.
+Honest limits of what is built: re-embedding on data change is now online —
+the server's background task watches `PRAGMA src.data_version`, re-runs the
+registration path when it moves, and the content-hashed queue re-embeds
+exactly the changed rows
+([02-data-model.md](02-data-model.md#the-refresh-discipline)) — but the
+change probe is a poll (up to `REFRESH_POLL_SECS` of staleness) and the
+fingerprint misses in-place edits that preserve count/max/sum of rowids;
+there is still no blue-green generation swap (the next section is designed,
+not built); and candidacy, while now derived per corpus (measured bounds,
+Otsu boundary) rather than thresholded, still flips a column wholesale when
+the evidence crosses a confident-majority line — the hysteresis on the
+document cut damps that for document-ness, the shape predicates have no
+equivalent damping.
 
 ### Query-time requirements
 
@@ -278,15 +345,33 @@ agree on everything:
    `vec_dense` yields silently meaningless distances. Of everything listed in
    this document as outstanding, this is the one that fails quietly, and the
    check is four lines.
-2. **Same instruction prefix.** Instruction-tuned retrieval encoders — the
+2. **Same query template.** Instruction-tuned retrieval encoders — the
    Qwen3-Embedding family among them [Zhang 2025] — expect an
    asymmetric prompt: a task instruction on the query side, documents raw.
-   `stemma_embed::format_query()` implements it, and the same asymmetry was
-   used when the vectors were produced. Getting this wrong is the most common
-   way to lose most of an encoder's quality while everything still runs. It
-   is currently a hard-coded string in the crate; it belongs in the registry
-   beside the model identity, because a different encoder wants a different
-   instruction.
+   The template is part of the model identity
+   (`stemma_embed::ModelIdentity::query_template`, `{query}` placeholder,
+   empty = bare): `Embedder::format_query()` renders every query-side
+   embedding through it, the drain records it in the registry row beside
+   the model it must agree with, and it is configured where the endpoint
+   and model are — `server.embedder.query_template` in the config file,
+   `--embed-query-template` on the command line, with the default looked up
+   by model family (`stemma_embed::default_query_template`: Qwen3-Embedding
+   → its published instruction; anything else → bare). Getting the pairing
+   wrong is the most common way to lose most of an encoder's quality while
+   everything still runs — issue #5 measured a backend that does not
+   implement the convention collapsing ten unrelated queries to 0.82 mean
+   pairwise cosine under the foreign prefix (0.53 bare).
+
+   The same measurement is guidance on where a template earns its tokens,
+   not a code fork: on a non-implementing backend the prefix *helped* the
+   tie-break (6/6 vs 4/6 — one query against two cards, so query-space
+   compression cancels) while *hurting* KNN retrieval (top-1 8/16 vs 9/16,
+   MRR 0.655 vs 0.725 — one query against the whole index, where
+   discriminative power between queries is the entire mechanism). Both
+   paths share one template per deployment by design; the asymmetry is
+   something to weigh when configuring it, and the current deployment
+   (Qwen3-Embedding, which implements its own convention) keeps its
+   template on both paths unchanged.
 3. **Same normalization and pooling.** Handled inside the Embedder backend,
    which is why `Embedder` is a trait with a model-identity method rather
    than a raw HTTP call. Note the pipeline's L2→cosine conversion assumes
@@ -296,6 +381,15 @@ agree on everything:
    the one requirement on this list that cannot be violated silently.
 
 ### Entering fusion
+
+What enters fusion is one candidate per *interpretation*, in the dense
+channel like everywhere else: the KNN is over-fetched
+(`PER_CHANNEL_LIMIT × DENSE_OVERFETCH`) and collapsed by
+`(src_table, src_column, value_norm)` — nearest member as representative,
+copies counted into `row_count`, document hits quota'd per column — before
+truncation, so a fact table repeating one document 24× spends one slot, not
+all eight. Mechanics in
+[03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted).
 
 The dense channel joins as a fourth channel in
 [reciprocal rank fusion](03-resolution.md#stage-5--reciprocal-rank-fusion) —

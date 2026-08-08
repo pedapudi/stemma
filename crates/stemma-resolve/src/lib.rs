@@ -51,10 +51,24 @@ const DOC_COLUMN_QUOTA: usize = if PER_CHANNEL_LIMIT / 2 > 2 {
 } else {
     2
 };
+/// Dense KNN over-fetch factor: vec0 applies `k` inside the KNN, before any
+/// grouping is possible, so on a denormalized corpus copies of one repeated
+/// string (identical text ⇒ identical vector ⇒ adjacent in the ordering) can
+/// consume every slot. Fetch `PER_CHANNEL_LIMIT * DENSE_OVERFETCH`, collapse
+/// to one hit per interpretation, then truncate: 4 covers realistic join
+/// fan-out at a small constant cost — the collapse is linear.
+const DENSE_OVERFETCH: usize = 4;
 /// Fused score below which a candidate is kept in the trace but not selected.
 const SELECT_THRESHOLD: f64 = 0.35;
 /// Max selected candidates per mention.
 const TOP_K: usize = 5;
+/// Interpretation aggregation in the FTS channels runs over this many
+/// best-ranked matches, not the entire match set: a common token can match
+/// hundreds of thousands of document rows, and a reading whose best match
+/// sits below thousands of better-ranked rows cannot reach the channel's
+/// top slots anyway. Bounded work per span; large duplicate runs (the
+/// issue-#1 2,100-copy column) still collapse inside the window.
+const FTS_AGGREGATION_WINDOW: usize = 512;
 /// Dense KNN is a full scan of the vector table per probe; spend it only on
 /// spans the lexical channels left uncertain, at most this many per query.
 const DENSE_MAX_SPANS: usize = 4;
@@ -310,7 +324,7 @@ pub fn resolve_full(
             targets.truncate(DENSE_MAX_SPANS);
             let texts: Vec<String> = targets
                 .iter()
-                .map(|s| stemma_embed::format_query(&s.text))
+                .map(|s| embedder.format_query(&s.text))
                 .collect();
             let ids: Vec<usize> = targets.iter().map(|s| s.id).collect();
             match embedder.embed(&texts) {
@@ -726,14 +740,20 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
             // MATERIALIZED: the CTE is read by both UNION arms, and FTS5
             // auxiliary functions (bm25, snippet) are only usable inside
             // the MATCH query itself — materialization keeps them there.
-            "WITH matched AS MATERIALIZED (
+            "WITH hits AS MATERIALIZED (
+                SELECT rowid AS id, bm25({fts}) AS b,
+                       snippet({fts}, 0, '⟨', '⟩', '…', 10) AS snip
+                FROM {fts}
+                WHERE {fts} MATCH ?1
+                ORDER BY rank
+                LIMIT {window}
+             ),
+             matched AS MATERIALIZED (
                 SELECT v.src_table AS t, v.src_column AS c, v.src_rowid AS r,
                        v.value AS value, v.value_norm AS vn, v.is_doc AS is_doc,
-                       bm25({fts}) AS b,
-                       CASE WHEN v.is_doc = 1
-                            THEN snippet({fts}, 0, '⟨', '⟩', '…', 10) END AS snip
-                FROM {fts} f JOIN lex_values v ON v.id = f.rowid
-                WHERE {fts} MATCH ?1
+                       h.b AS b,
+                       CASE WHEN v.is_doc = 1 THEN h.snip END AS snip
+                FROM hits h JOIN lex_values v ON v.id = h.id
              )
              SELECT t, c, rep, value, vn, b, is_doc, n, snip FROM (
                 SELECT t, c, min(r) AS rep, min(value) AS value, vn,
@@ -748,7 +768,8 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
                 WHERE rn <= ?3
              )
              ORDER BY b, t, c LIMIT ?2",
-            fts = fts_table
+            window = FTS_AGGREGATION_WINDOW,
+            fts = fts_table,
         );
         let mut stmt = conn.prepare_cached(&sql)?;
         // Quote as an FTS5 string so query punctuation isn't FTS syntax.
@@ -822,16 +843,24 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
 
 /// Dense KNN over vec0. Documents were embedded whole; the span vector
 /// carries the retrieval instruction. L2 on unit vectors → cos = 1 − d²/2.
+///
+/// Mirrors the lexical channels' interpretation semantics (issue #3): the
+/// KNN is over-fetched by [`DENSE_OVERFETCH`], hits are collapsed to one per
+/// `(table, column, value_norm)` keeping the nearest member as the
+/// representative and counting the collapsed copies into `row_count`, the
+/// collapsed *document* hits then pass the same per-(table, column)
+/// [`DOC_COLUMN_QUOTA`] window the FTS channels apply, and the result is
+/// truncated to [`PER_CHANNEL_LIMIT`]. Dense and lexical candidates report
+/// the same shape, and `row_count` means the same thing in every channel.
 fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
     let conn = db.conn();
-    let mut hits = Vec::new();
     let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     let mut stmt = conn.prepare_cached(
         "SELECT src_table, src_column, src_rowid, distance FROM vec_dense
          WHERE embedding MATCH ?1 AND k = ?2",
     )?;
     let rows = stmt.query_map(
-        stemmadb::rusqlite::params![blob, PER_CHANNEL_LIMIT as i64],
+        stemmadb::rusqlite::params![blob, (PER_CHANNEL_LIMIT * DENSE_OVERFETCH) as i64],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -841,35 +870,120 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
             ))
         },
     );
+
+    /// One interpretation's collapsed KNN members, nearest first.
+    struct Group {
+        table: String,
+        column: String,
+        /// Nearest member — the representative.
+        rowid: i64,
+        value: String,
+        cosine: f64,
+        is_doc: bool,
+        row_count: u32,
+        member_rowids: Vec<i64>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut index: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
     if let Ok(rows) = rows {
-        for (rank, row) in rows.enumerate() {
+        // vec0 returns ascending distance, so the first member of each
+        // interpretation seen is its nearest — the representative.
+        for row in rows {
             let Ok((table, column, rowid, dist)) = row else {
                 continue;
             };
             let cosine = 1.0 - (dist * dist) / 2.0;
-            let looked: Option<(String, i64)> = conn
+            let looked: Option<(String, String, i64)> = conn
                 .query_row(
-                    "SELECT value, is_doc FROM lex_values
+                    "SELECT value, value_norm, is_doc FROM lex_values
                      WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3",
                     stemmadb::rusqlite::params![table, column, rowid],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .ok();
-            let (value, is_doc) = looked.unwrap_or((String::new(), 1));
-            hits.push(RawHit {
-                table,
-                column,
-                rowid,
-                value,
-                channel: "dense",
-                rank,
-                raw: cosine,
-                is_doc: is_doc != 0,
-                snippet: None,
-                row_count: 1,
-                sample_rowids: vec![rowid],
-            });
+            // A vector whose lex row vanished has no collapse key; keep it
+            // as its own group (rowid-keyed) rather than merging unknowns.
+            let (value, norm, is_doc) = match looked {
+                Some((v, n, d)) => (v, n, d != 0),
+                None => (String::new(), format!("\u{0}missing:{rowid}"), true),
+            };
+            let key = (table.clone(), column.clone(), norm);
+            match index.get(&key) {
+                Some(&i) => {
+                    groups[i].row_count += 1;
+                    groups[i].member_rowids.push(rowid);
+                }
+                None => {
+                    index.insert(key, groups.len());
+                    groups.push(Group {
+                        table,
+                        column,
+                        rowid,
+                        value,
+                        cosine,
+                        is_doc,
+                        row_count: 1,
+                        member_rowids: vec![rowid],
+                    });
+                }
+            }
         }
+    }
+
+    // The lexical window semantics, post-collapse: one (table, column) of
+    // documents may fill at most DOC_COLUMN_QUOTA slots; value hits are
+    // already one-per-interpretation and get no quota.
+    let mut doc_seen: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut hits: Vec<RawHit> = Vec::new();
+    for g in groups {
+        if g.is_doc {
+            let seen = doc_seen
+                .entry((g.table.clone(), g.column.clone()))
+                .or_insert(0);
+            *seen += 1;
+            if *seen > DOC_COLUMN_QUOTA {
+                continue;
+            }
+        }
+        // Representative first, remaining members ascending — the same
+        // "first = rowid" contract the lexical samples keep.
+        let mut rest: Vec<i64> = g
+            .member_rowids
+            .iter()
+            .copied()
+            .filter(|&r| r != g.rowid)
+            .collect();
+        rest.sort_unstable();
+        let mut sample_rowids = vec![g.rowid];
+        sample_rowids.extend(rest);
+        sample_rowids.truncate(SAMPLE_ROWIDS);
+        hits.push(RawHit {
+            table: g.table,
+            column: g.column,
+            rowid: g.rowid,
+            value: g.value,
+            channel: "dense",
+            rank: 0, // assigned below
+            raw: g.cosine,
+            is_doc: g.is_doc,
+            snippet: None,
+            row_count: g.row_count,
+            sample_rowids,
+        });
+    }
+    hits.truncate(PER_CHANNEL_LIMIT);
+    // Competition ranking on the cosine, as in the lexical channels:
+    // identical evidence shares a rank.
+    let mut prev_raw = f64::INFINITY;
+    let mut rank = 0usize;
+    for (idx, h) in hits.iter_mut().enumerate() {
+        if h.raw < prev_raw {
+            rank = idx;
+            prev_raw = h.raw;
+        }
+        h.rank = rank;
     }
     Ok(hits)
 }
@@ -1373,16 +1487,18 @@ fn render_kg_path(
 // ===========================================================================
 // Context affinity over interpretation cards (vec_interp) — self-contained.
 //
-// Motivation: on relational corpora the dense channel is inert (nothing
-// crosses DOC_MIN_LEN), and a value that appears in two columns — the same
+// Motivation: on relational corpora the dense channel is inert (no column
+// crosses the derived document boundary), and a value that appears in two
+// columns — the same
 // string as a city and as a product name — produces two lexically identical
 // candidates fusion cannot order. The ingest layer embeds one interpretation
 // card per distinct (table, column, value); the card carries the column's
 // context, so conditioning on the FULL query separates the tie.
 //
 // Mechanics: for a span whose top two candidates are tied value
-// interpretations, the query is embedded once (format_query — the query side
-// of the asymmetric scheme) and the two cards' vectors are fetched directly
+// interpretations, the query is embedded once (Embedder::format_query — the
+// query side of the asymmetric scheme, rendered through the backend's own
+// template) and the two cards' vectors are fetched directly
 // from vec_interp by their provenance key — a plain filtered read, no KNN —
 // with the cosine computed in-process, which is exact. Both candidates gain
 // a "context" ChannelScore (rank by cosine order, raw = cosine), and the
@@ -1469,7 +1585,7 @@ fn apply_context_affinity(
             continue;
         };
         if query_vec.is_none() {
-            match embedder.embed(&[stemma_embed::format_query(query)]) {
+            match embedder.embed(&[embedder.format_query(query)]) {
                 Ok(mut v) if !v.is_empty() => query_vec = Some(v.remove(0)),
                 _ => return, // embedder down: the whole pass degrades
             }
@@ -2180,6 +2296,122 @@ mod tests {
         assert!(manuals <= DOC_COLUMN_QUOTA, "per-column quota holds");
     }
 
+    /// Deterministic embedder for the dense channel: each text hashes to a
+    /// unit vector, so identical texts embed identically and distinct texts
+    /// land apart — the exact geometry that makes duplicate rows adjacent
+    /// in a KNN.
+    struct HashEmbedder;
+
+    impl HashEmbedder {
+        const DIM: usize = 8;
+        fn vector(text: &str) -> Vec<f32> {
+            let mut state: u64 = 0xcbf29ce484222325;
+            for b in text.bytes() {
+                state ^= b as u64;
+                state = state.wrapping_mul(0x100000001b3);
+            }
+            let mut z = state;
+            let mut v: Vec<f32> = (0..Self::DIM)
+                .map(|_| {
+                    z = z.wrapping_add(0x9e3779b97f4a7c15);
+                    let mut x = z;
+                    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                    x ^= x >> 31;
+                    (x as f64 / u64::MAX as f64) as f32 - 0.5
+                })
+                .collect();
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+            v
+        }
+    }
+
+    impl stemma_embed::Embedder for HashEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                backend: "fake".into(),
+                model: "hash-embedder".into(),
+                dimension: Self::DIM,
+                query_template: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn dense_channel_collapses_duplicate_documents() {
+        // Issue #3: a fact table repeating one document string across many
+        // rows made every copy a separate KNN hit — identical text, identical
+        // vector, adjacent in the ordering — so with k = PER_CHANNEL_LIMIT
+        // the copies consumed all eight slots and the corpus's other
+        // documents were unreachable through the channel. Over-fetch plus
+        // collapse must return the repeated string ONCE, with row_count
+        // carrying the fan-out, and surface the previously crowded-out rest.
+        let pad = "Additional descriptive language follows so every record \
+                   clears the document classification threshold comfortably. "
+            .repeat(3);
+        let repeated =
+            format!("PT903W Womens Cut Single Ply Light Weight Track Singlet. {pad}");
+        let others = [
+            format!("Marathon foam trainer with recycled mesh upper. {pad}"),
+            format!("Alpine down parka rated for deep winter conditions. {pad}"),
+            format!("Trail running vest with soft flask pockets. {pad}"),
+        ];
+        let mut ddl =
+            String::from("CREATE TABLE inventory_items (id INTEGER PRIMARY KEY, product_name TEXT);");
+        for _ in 0..8 {
+            ddl.push_str(&format!(
+                "INSERT INTO inventory_items (product_name) VALUES ('{repeated}');"
+            ));
+        }
+        for o in &others {
+            ddl.push_str(&format!(
+                "INSERT INTO inventory_items (product_name) VALUES ('{o}');"
+            ));
+        }
+        let db = custom_db("densedup", &ddl);
+        stemma_ingest::enqueue_missing_embeddings(&db).unwrap();
+        stemma_ingest::drain_embed_queue(&db, &HashEmbedder, stemma_ingest::EMBED_BATCH).unwrap();
+        let vectors: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors, 11, "8 copies + 3 distinct documents");
+
+        let hits = dense_hits(&db, &HashEmbedder::vector(&repeated)).unwrap();
+        for h in &hits {
+            println!(
+                "{}.{} #{} rank={} cos={:.4} row_count={} samples={:?} '{}…'",
+                h.table, h.column, h.rowid, h.rank, h.raw, h.row_count,
+                h.sample_rowids, &h.value[..24]
+            );
+        }
+        // One hit per interpretation, not per row.
+        assert_eq!(hits.len(), 4, "4 distinct documents, 4 candidates");
+        let top = &hits[0];
+        assert_eq!(top.value, repeated);
+        assert_eq!(top.rank, 0);
+        assert!(top.raw > 0.999, "query text is the stored text");
+        // The collapse counts copies the same way the lexical GROUP BY does.
+        assert_eq!(top.row_count, 8, "row_count carries the fan-out");
+        assert_eq!(top.sample_rowids.len(), SAMPLE_ROWIDS);
+        assert_eq!(top.sample_rowids[0], top.rowid, "representative leads");
+        assert!(top.sample_rowids.windows(2).skip(1).all(|w| w[0] < w[1]));
+        // The previously crowded-out documents surface, one hit each.
+        for o in &others {
+            let hit = hits
+                .iter()
+                .find(|h| h.value == *o)
+                .expect("every distinct document reachable through the channel");
+            assert_eq!(hit.row_count, 1);
+        }
+        // The per-column quota bounds the collapsed set like the FTS window.
+        assert!(hits.len() <= DOC_COLUMN_QUOTA.max(PER_CHANNEL_LIMIT));
+    }
+
     #[test]
     fn collective_disambiguation_prefers_connected_chen() {
         // The associative-mention case: "Chen" alone matches both Wei Chen
@@ -2745,6 +2977,7 @@ mod tests {
                 backend: "fake".into(),
                 model: "marker-embedder".into(),
                 dimension: MARKERS.len() + 1,
+                query_template: String::new(),
             }
         }
     }

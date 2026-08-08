@@ -46,7 +46,10 @@ deliberately not a virtual one), and the knowledge store (`kg_nodes`,
 forward-only `PRAGMA user_version`, additive idempotent DDL re-applied
 wholesale, version-guarded `ALTER`s, drop-and-rebuild for pure derived
 indexes, and compiler-versioned fingerprints that let the knowledge
-algorithms change without any migration at all. The evidence and trace model
+algorithms change without any migration at all. The refresh discipline:
+`derivations` receipts, per-table content fingerprints, the server's
+`data_version` watch, content-hashed re-embedding, and hysteresis on the
+derived document boundary. The evidence and trace model
 end to end, from the internal `Trace` through `ResolveResponse` and
 `ExplainResponse`, with a field-by-field table of what is live and what is
 declared-but-never-emitted. The history model and why attribution
@@ -55,7 +58,7 @@ declared-but-never-emitted. The history model and why attribution
 **[03 — Resolution](03-resolution.md)**
 The pipeline stage by stage with every real constant — `MIN_SPAN_CHARS`,
 `MAX_SPAN_TOKENS`, `PER_CHANNEL_LIMIT`, `SELECT_THRESHOLD`, `TOP_K`,
-`DENSE_MAX_SPANS`, `RRF_K`, `DOC_MIN_LEN`, `EXACT_MAX_LEN`. Tokenization and
+`DENSE_MAX_SPANS`, `RRF_K`, `EXACT_MAX_LEN`. Tokenization and
 soft span enumeration; knowledge-graph-assisted mention detection; the three
 lexical channels and their exact SQL, plus the dense channel and why it is
 the one channel that is *conditional* (a `vec0` KNN is a full table scan, so
