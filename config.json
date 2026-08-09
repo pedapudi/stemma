@@ -11,7 +11,10 @@
     },
     "lm": {
       "endpoint": "http://kossel.lan:8080/v1",
-      "model": "gemma-4-26B-A4B-it-FP8"
+      "model": "gemma-4-26B-A4B-it-FP8",
+      "extra_body": {
+        "chat_template_kwargs": { "enable_thinking": false }
+      }
     }
   },
   "console": {
