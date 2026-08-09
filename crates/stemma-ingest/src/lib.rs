@@ -1026,8 +1026,13 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
     }))
 }
 
-/// Items per embedding call when draining the queue.
-pub const EMBED_BATCH: usize = 32;
+/// Items per embedding call when draining the queue. Sized for a pooling
+/// endpoint, which packs the whole request into wide forward passes (vLLM
+/// defaults allow 1024 sequences / 131k tokens per pass) and, under data
+/// parallelism, spreads one request across replicas — so a small batch
+/// leaves the server idle between round trips. 256 long documents stay
+/// comfortably inside the client's 60s read timeout.
+pub const EMBED_BATCH: usize = 256;
 
 /// The drain's batch selection. Deliberately join-free: it reads only
 /// embed_queue, and the `(status, attempts, id)` index satisfies both the
