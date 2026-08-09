@@ -16,6 +16,13 @@ use serde::Deserialize;
 pub enum Error {
     #[error("embedding endpoint: {0}")]
     Http(String),
+    /// The endpoint is alive and refused this request (4xx). Distinct from
+    /// [`Error::Http`] because the two demand opposite reactions: transport
+    /// failures and 5xx mean the endpoint is unhealthy and callers should
+    /// back off, a rejection means this payload is bad and retrying it —
+    /// or marking the endpoint down over it — is wrong.
+    #[error("embedding endpoint rejected the request ({status}): {detail}")]
+    Rejected { status: u16, detail: String },
     #[error("embedding endpoint returned {got} vectors for {want} inputs")]
     CountMismatch { got: usize, want: usize },
 }
@@ -115,15 +122,44 @@ impl Embedder for OpenAiEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        // Read timeout sized for the worst-case drain chunk — 256 documents
+        // at the model cap is ~8M tokens, ~40s on a saturated 3-replica
+        // endpoint — not for the interactive case, which stays snappy via
+        // the connect timeout and the cooldown wrapper.
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(180))
             .build();
-        let resp: EmbeddingsResponse = agent
+        // `truncate_prompt_tokens: -1` asks the server to clip each input at
+        // its own model cap instead of rejecting the whole request when one
+        // document exceeds it (vLLM semantics; endpoints without the
+        // extension ignore the field). Embedding a legal opinion's first 32k
+        // tokens is a bounded approximation; failing 255 neighbours over one
+        // oversized document is an exclusion.
+        let resp = match agent
             .post(&format!("{}/embeddings", self.endpoint))
-            .timeout(std::time::Duration::from_secs(60))
-            .send_json(ureq::json!({ "model": self.model, "input": texts }))
-            .map_err(|e| Error::Http(e.to_string()))?
+            .timeout(std::time::Duration::from_secs(180))
+            .send_json(ureq::json!({
+                "model": self.model,
+                "input": texts,
+                "truncate_prompt_tokens": -1
+            })) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) if (400..500).contains(&code) => {
+                let detail: String = r
+                    .into_string()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect();
+                return Err(Error::Rejected {
+                    status: code,
+                    detail,
+                });
+            }
+            Err(e) => return Err(Error::Http(e.to_string())),
+        };
+        let resp: EmbeddingsResponse = resp
             .into_json()
             .map_err(|e| Error::Http(e.to_string()))?;
         if resp.data.len() != texts.len() {
@@ -271,6 +307,11 @@ impl<E: Embedder> Embedder for CooldownEmbedder<E> {
         }
         match self.inner.embed(texts) {
             Ok(v) => Ok(v),
+            // A rejection (4xx) is the endpoint working: the payload is bad,
+            // the endpoint is not. Marking down over it would let one
+            // malformed request short-circuit every healthy sibling and cost
+            // a probe window for nothing.
+            Err(e @ Error::Rejected { .. }) => Err(e),
             Err(e) => {
                 self.failed_at.store(Self::now_ms(), Ordering::Relaxed);
                 Err(e)

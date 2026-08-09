@@ -66,8 +66,19 @@ pub trait LmBackend: Send + Sync {
 /// Map a configured `(endpoint, model)` to a backend. Every model string
 /// currently routes to the OpenAI-compatible backend; a model family needing
 /// a different protocol earns a new arm here, not a new abstraction.
-pub fn backend_for(endpoint: &str, model: &str) -> Box<dyn LmBackend> {
-    Box::new(OpenAiChat::new(endpoint, model))
+///
+/// `extra_body` is merged verbatim into every request body — the escape
+/// hatch for backend-specific serving knobs the config must control, e.g.
+/// vLLM's `chat_template_kwargs {"enable_thinking": false}`: adjudication
+/// is constrained select-among-k, and reasoning tokens spent before a
+/// forced-choice JSON answer are pure latency (measured 24s median per
+/// adjudicated resolve with thinking on).
+pub fn backend_for(
+    endpoint: &str,
+    model: &str,
+    extra_body: Option<serde_json::Value>,
+) -> Box<dyn LmBackend> {
+    Box::new(OpenAiChat::new(endpoint, model, extra_body))
 }
 
 /// An OpenAI-compatible `/v1/chat/completions` client. Deterministic by
@@ -75,6 +86,7 @@ pub fn backend_for(endpoint: &str, model: &str) -> Box<dyn LmBackend> {
 pub struct OpenAiChat {
     endpoint: String,
     model: String,
+    extra_body: Option<serde_json::Value>,
     /// Cleared the first time the endpoint 4xx-rejects `response_format`;
     /// later schema calls then go straight to the instruction fallback.
     native_schema: std::sync::atomic::AtomicBool,
@@ -98,10 +110,11 @@ struct ChatResponseMessage {
 }
 
 impl OpenAiChat {
-    pub fn new(endpoint: &str, model: &str) -> Self {
+    pub fn new(endpoint: &str, model: &str, extra_body: Option<serde_json::Value>) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model: model.to_string(),
+            extra_body,
             native_schema: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -116,6 +129,11 @@ impl OpenAiChat {
         });
         if let Some(rf) = response_format {
             body["response_format"] = rf;
+        }
+        if let Some(serde_json::Value::Object(extra)) = &self.extra_body {
+            for (k, v) in extra {
+                body[k] = v.clone();
+            }
         }
         let resp: ChatResponse = ureq::post(&format!("{}/chat/completions", self.endpoint))
             .timeout(TIMEOUT)
@@ -230,7 +248,7 @@ mod tests {
 
     #[test]
     fn registry_routes_to_openai_compat() {
-        let lm = backend_for("http://example.invalid/v1/", "m");
+        let lm = backend_for("http://example.invalid/v1/", "m", None);
         let id = lm.identity();
         assert_eq!(id.backend, "openai-compat");
         assert_eq!(id.model, "m");

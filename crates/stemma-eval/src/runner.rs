@@ -97,6 +97,11 @@ pub struct EndpointSection {
     /// would.
     #[serde(default)]
     pub query_template: Option<String>,
+    /// Extra request-body JSON merged into every LM call (LM only) — the
+    /// same knob the server reads, so an eval run adjudicates the way the
+    /// deployment would.
+    #[serde(default)]
+    pub extra_body: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -440,6 +445,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
             endpoint,
             model,
             query_template: None,
+            extra_body: None,
         }),
         _ => cfg.server.embedder.clone(),
     };
@@ -448,6 +454,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
             endpoint,
             model,
             query_template: None,
+            extra_body: None,
         }),
         _ => cfg.server.lm.clone(),
     };
@@ -513,7 +520,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
             drain_embeddings(&db, e, &mut notes);
         }
         let lm = match (&lm_cfg, ab.lm) {
-            (Some(l), true) => Some(MeteredLm::new(stemma_lm::backend_for(&l.endpoint, &l.model))),
+            (Some(l), true) => Some(MeteredLm::new(stemma_lm::backend_for(
+                &l.endpoint,
+                &l.model,
+                l.extra_body.clone(),
+            ))),
             (None, true) => {
                 notes.push(format!("{}: no LM configured; adjudication absent", ab.name));
                 None

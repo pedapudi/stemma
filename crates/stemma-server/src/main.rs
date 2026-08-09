@@ -62,6 +62,14 @@ struct Args {
     /// Model name for --lm-endpoint.
     #[arg(long)]
     lm_model: Option<String>,
+
+    /// Extra request-body JSON merged into every LM call, from the config's
+    /// server.lm.extra_body (no CLI flag — structured values belong in the
+    /// file). E.g. vLLM's chat_template_kwargs {"enable_thinking": false}:
+    /// adjudication is a forced choice, and reasoning tokens ahead of it are
+    /// pure latency.
+    #[arg(skip)]
+    lm_extra_body: Option<serde_json::Value>,
 }
 
 /// The stemma config file (config.json). The server reads `databases` and
@@ -86,6 +94,8 @@ struct ServerSection {
 struct EndpointSection {
     endpoint: String,
     model: String,
+    #[serde(default)]
+    extra_body: Option<serde_json::Value>,
 }
 
 /// The embedder carries one more knob than a plain endpoint: the query-side
@@ -136,6 +146,9 @@ fn merge_config(args: &mut Args) -> anyhow::Result<()> {
     if let Some(l) = cfg.server.lm {
         args.lm_endpoint.get_or_insert(l.endpoint);
         args.lm_model.get_or_insert(l.model);
+        if args.lm_extra_body.is_none() {
+            args.lm_extra_body = l.extra_body;
+        }
     }
     Ok(())
 }
@@ -278,8 +291,15 @@ fn background_task(
     loop {
         std::thread::sleep(std::time::Duration::from_secs(REFRESH_POLL_SECS));
         if let Some(embedder) = &embedder {
-            if embedder.is_down() && embedder.probe().is_ok() {
-                tracing::info!(name, "embedding endpoint recovered; resuming drain");
+            // Resume from the work state, never from an observed down→up
+            // transition: the cooldown marker is shared across databases, so
+            // whichever task probes first consumes the transition and every
+            // other task would sleep forever on a non-empty queue. The queue
+            // is the source of truth — usable embedder + pending items means
+            // drain, regardless of who cleared the marker.
+            let usable = !embedder.is_down() || embedder.probe().is_ok();
+            if usable && pending_embed_work(&db) {
+                tracing::info!(name, "embed queue pending and endpoint usable; resuming drain");
                 embed_pass(name, &db, embedder.as_ref());
             }
         }
@@ -313,6 +333,21 @@ fn background_task(
             embed_pass(name, &db, embedder.as_ref());
         }
     }
+}
+
+/// Whether the embed queue holds pending items — the cheap steady-state
+/// check the background loop gates on. EXISTS under the (status, attempts,
+/// id) index is constant-time, so polling it every cycle costs nothing when
+/// the queue is empty.
+fn pending_embed_work(db: &StemmaDb) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM embed_queue WHERE status = 'pending')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n != 0)
+        .unwrap_or(false)
 }
 
 /// Enqueues embedding work for one database and drains it, documents
@@ -486,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
     let lm = match (&args.lm_endpoint, &args.lm_model) {
         (Some(ep), Some(m)) => {
             tracing::info!(endpoint = %ep, model = %m, "adjudication band enabled");
-            Some(stemma_lm::backend_for(ep, m))
+            Some(stemma_lm::backend_for(ep, m, args.lm_extra_body.clone()))
         }
         _ => None,
     };
