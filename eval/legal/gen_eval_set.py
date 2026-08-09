@@ -42,6 +42,7 @@ never writes anything except the output JSONL files and the review HTML.
 """
 
 import argparse
+import concurrent.futures
 import html
 import itertools
 import json
@@ -50,6 +51,7 @@ import random
 import re
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -156,6 +158,55 @@ def ro_connect(path):
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.execute("PRAGMA query_only = ON")
     return conn
+
+
+class ThreadLocal:
+    """One lazily-built instance of `factory` per worker thread. SQLite
+    connections are not shareable across threads; everything else about a
+    row attempt is."""
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._tl = threading.local()
+
+    def __call__(self):
+        v = getattr(self._tl, "v", None)
+        if v is None:
+            v = self._tl.v = self._factory()
+        return v
+
+
+def parallel_collect(draw, attempt, n, workers):
+    """Rows are independent; only the feedback loop inside one row is
+    serial. Draw items on the caller's thread (streams stay deterministic),
+    run `attempt(item)` across `workers` threads in waves, and yield results
+    in draw order so acceptance order matches the serial generator's. The
+    caller merges stats and stops consuming once it has `n` — a wave may
+    overshoot by design, which costs one wave of LM calls at most.
+
+    `attempt` must be self-contained: no shared mutable state, stats
+    returned as deltas, never mutated in place."""
+    if workers <= 1:
+        while True:
+            item = draw()
+            if item is None:
+                return
+            yield attempt(item)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        done = 0
+        while done < n:
+            wave = []
+            while len(wave) < workers:
+                item = draw()
+                if item is None:
+                    break
+                wave.append(item)
+            if not wave:
+                return
+            for res in ex.map(attempt, wave):
+                yield res
+                if res[0] is not None:
+                    done += 1
 
 
 def fts_phrase(tokens):
@@ -504,7 +555,8 @@ class LM:
                 self.consecutive_failures = 0
                 return result
             except (urllib.error.URLError, urllib.error.HTTPError,
-                    KeyError, json.JSONDecodeError, TimeoutError) as e:
+                    KeyError, TypeError, json.JSONDecodeError,
+                    TimeoutError) as e:
                 last = e
                 time.sleep(2 * (attempt + 1))
         self.consecutive_failures += 1
@@ -625,19 +677,29 @@ QUESTION: {q}
 
 # --------------------------------------------------------------- generation
 
-def gen_tier_l1_l2(tier, lex, legal, lm, stream_reg, stream_sec, n, seed,
-                   stats, review, max_calls=6, k=4):
-    """Shared loop for the single-row tiers L1 and L2."""
-    records = []
-    take_reg = True
-    while len(records) < n:
-        table = "regulations" if take_reg else "sections"
-        stream = stream_reg if take_reg else stream_sec
-        take_reg = not take_reg
-        try:
-            rowid = next(stream)
-        except StopIteration:
-            break
+def gen_tier_l1_l2(tier, mk_lex, mk_legal, lm, stream_reg, stream_sec, n, seed,
+                   stats, review, max_calls=6, k=4, workers=1):
+    """Shared loop for the single-row tiers L1 and L2. Rows run in parallel
+    (each row's feedback iteration stays serial); acceptance follows stream
+    order, stats merge on this thread."""
+    state = {"take_reg": True}
+
+    def draw():
+        for _ in range(2):
+            stream = stream_reg if state["take_reg"] else stream_sec
+            table = "regulations" if state["take_reg"] else "sections"
+            state["take_reg"] = not state["take_reg"]
+            try:
+                return table, next(stream)
+            except StopIteration:
+                continue
+        return None
+
+    def attempt(item):
+        table, rowid = item
+        lex, legal = mk_lex(), mk_legal()
+        d = dict.fromkeys(("candidates", "rejected", "rows_abandoned",
+                           "accepted"), 0)
         text = legal.execute(
             f"SELECT text FROM {table} WHERE id = ?", (rowid,)).fetchone()[0]
         ex = excerpt(text)
@@ -667,7 +729,7 @@ def gen_tier_l1_l2(tier, lex, legal, lm, stream_reg, stream_sec, n, seed,
                 if not q:
                     continue
                 candidates += 1
-                stats[tier]["candidates"] += 1
+                d["candidates"] += 1
                 if tier == "L1":
                     ok, anchor, v = verify_l1(lex, q, table, rowid)
                 else:
@@ -676,7 +738,7 @@ def gen_tier_l1_l2(tier, lex, legal, lm, stream_reg, stream_sec, n, seed,
                 if ok:
                     accepted = (q, anchor, v, calls, candidates)
                     break
-                stats[tier]["rejected"] += 1
+                d["rejected"] += 1
                 rejected_here.append({"question": q, "fail": v.get("fail")})
                 for o in v.get("offending_tokens", []):
                     offenders_seen.append(o["token"])
@@ -689,10 +751,10 @@ def gen_tier_l1_l2(tier, lex, legal, lm, stream_reg, stream_sec, n, seed,
                             "copied verbatim from the text. Copy one short "
                             "distinctive phrase exactly.\n")
         if not accepted:
-            stats[tier]["rows_abandoned"] += 1
-            continue
+            d["rows_abandoned"] += 1
+            return None, None, d, None
         q, anchor, v, calls, candidates = accepted
-        stats[tier]["accepted"] += 1
+        d["accepted"] += 1
         target = {"table": table, "column": "text", "rowids": [rowid],
                   "match_mode": "doc"}
         if anchor:
@@ -710,11 +772,22 @@ def gen_tier_l1_l2(tier, lex, legal, lm, stream_reg, stream_sec, n, seed,
                 "verification": v,
             },
         }
+        rv = {"rec": rec, "snippets": [(table, rowid, text[:500])],
+              "rejected": rejected_here[:4]}
+        log = f"{table}#{rowid} ({candidates} candidates, {calls} calls): {q}"
+        return rec, rv, d, log
+
+    records = []
+    for rec, rv, d, log in parallel_collect(draw, attempt, n, workers):
+        if rec is not None and len(records) >= n:
+            d = {**d, "accepted": 0}  # overshoot row: effort counts, row doesn't
+        for key, delta in d.items():
+            stats[tier][key] += delta
+        if rec is None or len(records) >= n:
+            continue
         records.append(rec)
-        review.append({"rec": rec, "snippets": [(table, rowid, text[:500])],
-                       "rejected": rejected_here[:4]})
-        print(f"  [{tier}] {len(records)}/{n} {table}#{rowid} "
-              f"({candidates} candidates, {calls} calls): {q}")
+        review.append(rv)
+        print(f"  [{tier}] {len(records)}/{n} {log}")
     return records
 
 
@@ -738,18 +811,22 @@ def find_partner(lex, legal, reg_rowid):
     return None, None
 
 
-def gen_tier_l4(lex, legal, lm, stream_reg, n, seed, stats, review,
-                max_calls=6, k=4):
-    records = []
-    while len(records) < n:
+def gen_tier_l4(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
+                max_calls=6, k=4, workers=1):
+    def draw():
         try:
-            reg_rowid = next(stream_reg)
+            return next(stream_reg)
         except StopIteration:
-            break
+            return None
+
+    def attempt(reg_rowid):
+        lex, legal = mk_lex(), mk_legal()
+        d = dict.fromkeys(("candidates", "rejected", "rows_abandoned",
+                           "accepted", "no_partner"), 0)
         sec_rowid, terms = find_partner(lex, legal, reg_rowid)
         if sec_rowid is None:
-            stats["L4"]["no_partner"] += 1
-            continue
+            d["no_partner"] += 1
+            return None, None, d, None
         reg_text = legal.execute(
             "SELECT text FROM regulations WHERE id = ?", (reg_rowid,)).fetchone()[0]
         sec_text = legal.execute(
@@ -778,12 +855,12 @@ def gen_tier_l4(lex, legal, lm, stream_reg, n, seed, stats, review,
                 if not q:
                     continue
                 candidates += 1
-                stats["L4"]["candidates"] += 1
+                d["candidates"] += 1
                 ok, v = verify_l4(lex, q, reg_rowid, sec_rowid)
                 if ok:
                     accepted = (q, v, calls, candidates)
                     break
-                stats["L4"]["rejected"] += 1
+                d["rejected"] += 1
                 rejected_here.append({"question": q, "fail": v.get("fail")})
                 for key in ("regulations_offending", "sections_offending"):
                     for o in v.get(key, []):
@@ -793,11 +870,11 @@ def gen_tier_l4(lex, legal, lm, stream_reg, n, seed, stats, review,
                             "the texts, avoid them and any word containing "
                             "them: " + ", ".join(sorted(set(offenders_seen))) + "\n")
         if not accepted:
-            stats["L4"]["rows_abandoned"] += 1
-            continue
+            d["rows_abandoned"] += 1
+            return None, None, d, None
         q, v, calls, candidates = accepted
         v["pairing_terms"] = list(terms)
-        stats["L4"]["accepted"] += 1
+        d["accepted"] += 1
         rec = {
             "question": q,
             "tier": "L4",
@@ -816,36 +893,54 @@ def gen_tier_l4(lex, legal, lm, stream_reg, n, seed, stats, review,
                 "verification": v,
             },
         }
+        rv = {"rec": rec,
+              "snippets": [("regulations", reg_rowid, reg_text[:400]),
+                           ("sections", sec_rowid, sec_text[:400])],
+              "rejected": rejected_here[:4]}
+        log = (f"regulations#{reg_rowid} + sections#{sec_rowid} "
+               f"[{v['mode']}]: {q}")
+        return rec, rv, d, log
+
+    records = []
+    for rec, rv, d, log in parallel_collect(draw, attempt, n, workers):
+        if rec is not None and len(records) >= n:
+            d = {**d, "accepted": 0}
+        for key, delta in d.items():
+            stats["L4"][key] += delta
+        if rec is None or len(records) >= n:
+            continue
         records.append(rec)
-        review.append({"rec": rec,
-                       "snippets": [("regulations", reg_rowid, reg_text[:400]),
-                                    ("sections", sec_rowid, sec_text[:400])],
-                       "rejected": rejected_here[:4]})
-        print(f"  [L4] {len(records)}/{n} regulations#{reg_rowid} + "
-              f"sections#{sec_rowid} [{v['mode']}]: {q}")
+        review.append(rv)
+        print(f"  [L4] {len(records)}/{n} {log}")
     return records
 
 
-def gen_tier_nil(lex, lm, n, seed, rng, stats, review, k=3):
-    records = []
+def gen_tier_nil(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
     topics = list(NIL_TOPICS)
     rng.shuffle(topics)
-    for phrase, argument in topics:
-        if len(records) >= n:
-            break
+    topic_iter = iter(topics)
+
+    def draw():
+        return next(topic_iter, None)
+
+    def attempt(item):
+        phrase, argument = item
+        lex = mk_lex()
+        d = dict.fromkeys(("candidates", "rejected", "rows_abandoned",
+                           "accepted", "topics_rejected_present"), 0)
         fts_n, tri_n = lex.corpus_phrase_counts(phrase)
         if fts_n or tri_n:
-            stats["NIL"]["topics_rejected_present"] += 1
+            d["topics_rejected_present"] += 1
             print(f"  [NIL] topic '{phrase}' PRESENT in corpus "
                   f"(fts={fts_n}, trigram={tri_n}) — discarded")
-            continue
+            return None, None, d, None
         try:
             out = lm.generate_json(
                 NIL_PROMPT.format(k=k, topic=phrase, feedback=""),
                 QUESTIONS_SCHEMA)
         except RuntimeError as e:
             print(f"  [NIL] LM error on '{phrase}': {e}", file=sys.stderr)
-            continue
+            return None, None, d, None
         accepted = None
         candidates = 0
         rejected_here = []
@@ -854,19 +949,19 @@ def gen_tier_nil(lex, lm, n, seed, rng, stats, review, k=3):
             if not q:
                 continue
             candidates += 1
-            stats["NIL"]["candidates"] += 1
+            d["candidates"] += 1
             ok, v = verify_nil(lex, q, phrase)
             if ok:
                 accepted = (q, v)
                 break
-            stats["NIL"]["rejected"] += 1
+            d["rejected"] += 1
             rejected_here.append({"question": q, "fail": v.get("fail")})
         if not accepted:
-            stats["NIL"]["rows_abandoned"] += 1
-            continue
+            d["rows_abandoned"] += 1
+            return None, None, d, None
         q, v = accepted
         v["absence_argument"] = argument
-        stats["NIL"]["accepted"] += 1
+        d["accepted"] += 1
         rec = {
             "question": q,
             "tier": "NIL",
@@ -880,9 +975,20 @@ def gen_tier_nil(lex, lm, n, seed, rng, stats, review, k=3):
                 "verification": v,
             },
         }
+        rv = {"rec": rec, "snippets": [], "rejected": rejected_here[:4]}
+        return rec, rv, d, f"'{phrase}': {q}"
+
+    records = []
+    for rec, rv, d, log in parallel_collect(draw, attempt, n, workers):
+        if rec is not None and len(records) >= n:
+            d = {**d, "accepted": 0}
+        for key, delta in d.items():
+            stats["NIL"][key] += delta
+        if rec is None or len(records) >= n:
+            continue
         records.append(rec)
-        review.append({"rec": rec, "snippets": [], "rejected": rejected_here[:4]})
-        print(f"  [NIL] {len(records)}/{n} '{phrase}': {q}")
+        review.append(rv)
+        print(f"  [NIL] {len(records)}/{n} {log}")
     return records
 
 
@@ -1188,6 +1294,9 @@ def main():
                     help="review page (default: <out-stem>-review.html)")
     ap.add_argument("--tiers", default="L1,L2,L3,L4,NIL",
                     help="comma list of tiers to generate")
+    ap.add_argument("--workers", type=int, default=12,
+                    help="concurrent rows in flight (each row's feedback "
+                         "loop stays serial; the endpoint batches requests)")
     args = ap.parse_args()
 
     cfg, lm_cfg, dbs = load_lm_config(args.config)
@@ -1202,6 +1311,8 @@ def main():
     legal = ro_connect(legal_db)
     mini = ro_connect(mini_db)
     lex = LexIndex(stemmadb)
+    mk_lex = ThreadLocal(lambda: LexIndex(stemmadb))
+    mk_legal = ThreadLocal(lambda: ro_connect(legal_db))
     lm = LM(lm_cfg["endpoint"], lm_cfg["model"], lm_cfg.get("api_key", ""),
             lm_cfg.get("extra_body"))
     rng = random.Random(args.seed)
@@ -1273,22 +1384,25 @@ def main():
     t0 = time.time()
     if "L1" in tiers:
         print("== L1 (lexical anchor) ==")
-        records += gen_tier_l1_l2("L1", lex, legal, lm, s_reg_l1, s_sec_l1,
-                                  args.n_per_tier, args.seed, stats, review)
+        records += gen_tier_l1_l2("L1", mk_lex, mk_legal, lm, s_reg_l1, s_sec_l1,
+                                  args.n_per_tier, args.seed, stats, review,
+                                  workers=args.workers)
         flush()
     if "L2" in tiers:
         print("== L2 (semantic, no lexical anchor) ==")
-        records += gen_tier_l1_l2("L2", lex, legal, lm, s_reg_l2, s_sec_l2,
-                                  args.n_per_tier, args.seed, stats, review)
+        records += gen_tier_l1_l2("L2", mk_lex, mk_legal, lm, s_reg_l2, s_sec_l2,
+                                  args.n_per_tier, args.seed, stats, review,
+                                  workers=args.workers)
         flush()
     if "L4" in tiers:
         print("== L4 (cross-record, state + federal) ==")
-        records += gen_tier_l4(lex, legal, lm, s_reg_l4, args.n_per_tier,
-                               args.seed, stats, review)
+        records += gen_tier_l4(mk_lex, mk_legal, lm, s_reg_l4, args.n_per_tier,
+                               args.seed, stats, review, workers=args.workers)
         flush()
     if "NIL" in tiers:
         print("== NIL (verified absence) ==")
-        records += gen_tier_nil(lex, lm, args.n_nil, args.seed, rng, stats, review)
+        records += gen_tier_nil(mk_lex, lm, args.n_nil, args.seed, rng, stats,
+                                review, workers=args.workers)
         flush()
     if "L3" in tiers:
         print("== L3 (relational, mini corpus) ==")
