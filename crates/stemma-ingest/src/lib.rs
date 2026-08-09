@@ -1026,13 +1026,22 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
     }))
 }
 
-/// Items per embedding call when draining the queue. Sized for a pooling
-/// endpoint, which packs the whole request into wide forward passes (vLLM
-/// defaults allow 1024 sequences / 131k tokens per pass) and, under data
-/// parallelism, spreads one request across replicas — so a small batch
-/// leaves the server idle between round trips. 256 long documents stay
-/// comfortably inside the client's 60s read timeout.
-pub const EMBED_BATCH: usize = 256;
+/// Items per drain cycle: claimed together, embedded as [`EMBED_CONCURRENCY`]
+/// concurrent requests, written back in one transaction. Sized so each
+/// request carries EMBED_BATCH / EMBED_CONCURRENCY documents — wide enough
+/// to fill a pooling endpoint's forward passes, small enough that one
+/// request stays comfortably inside the client's 60s read timeout.
+pub const EMBED_BATCH: usize = 768;
+
+/// Concurrent embedding requests in flight per drain cycle. One request at
+/// a time leaves the endpoint idle while the client claims, fetches and
+/// writes, and leaves all but one of the endpoint's API processes idle
+/// during tokenization — measured against a 3-replica data-parallel
+/// endpoint, per-item wall time was identical at batch 32 and batch 256
+/// because that serial work, not GPU compute, set the pace. A few requests
+/// in flight overlap those stages; more multiplies peak payload without
+/// adding overlap.
+pub const EMBED_CONCURRENCY: usize = 3;
 
 /// The drain's batch selection. Deliberately join-free: it reads only
 /// embed_queue, and the `(status, attempts, id)` index satisfies both the
@@ -1693,8 +1702,13 @@ pub fn drain_embed_queue(
     // queue, so only document items can go missing.
     let mut texts = Vec::new();
     let mut work: Vec<(i64, String, String, i64, &'static str)> = Vec::new();
+    // INDEXED BY is load-bearing: without stats the planner answers this
+    // point lookup with the (src_table, src_column) index, whose prefix
+    // matches every row of a document column — measured at 33ms per lookup
+    // against ~0 through (src_table, src_rowid), which turned the fetch
+    // phase into 3× the embedding wall time per drain cycle.
     let mut doc_text = conn.prepare_cached(
-        "SELECT value FROM lex_values
+        "SELECT value FROM lex_values INDEXED BY lex_values_src
          WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3",
     )?;
     for (id, table, column, rowid, serialized) in items {
@@ -1732,28 +1746,61 @@ pub fn drain_embed_queue(
 
     let mut drained = 0usize;
     if !work.is_empty() {
-        let vectors = match embedder.embed(&texts) {
-            Ok(v) => v,
-            Err(e) => {
-                // The whole batch shares one call; charge one attempt each
-                // and leave the items pending for the budget to bound.
-                let note = e.to_string();
-                for (id, ..) in &work {
-                    conn.execute(
-                        "UPDATE embed_queue SET attempts = attempts + 1, error = ?2,
-                                updated_at = datetime('now')
-                         WHERE id = ?1",
-                        stemmadb::rusqlite::params![id, note],
-                    )?;
+        // The cycle's texts go out as EMBED_CONCURRENCY concurrent chunk
+        // requests: the endpoint's serial per-request work (tokenizing,
+        // scheduling) then overlaps its own compute and this thread's
+        // write-back, instead of the two sides taking turns. Threads only
+        // embed — the connection never leaves this thread.
+        let chunk = work.len().div_ceil(EMBED_CONCURRENCY);
+        let outcomes: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = texts
+                .chunks(chunk)
+                .map(|c| s.spawn(move || embedder.embed(c)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("embed worker panicked"))
+                .collect()
+        });
+
+        // A failed chunk is charged one attempt per item and left pending
+        // for the retry budget to bound; successful sibling chunks are
+        // still written — their GPU work is done, and discarding it buys
+        // nothing. Only a cycle with no successes at all propagates the
+        // error (the endpoint is down, not one request unlucky).
+        let mut embed_err = None;
+        let mut writes: Vec<(&(i64, String, String, i64, &'static str), Vec<f32>)> = Vec::new();
+        for (wchunk, outcome) in work.chunks(chunk).zip(outcomes) {
+            match outcome {
+                Ok(vectors) => writes.extend(wchunk.iter().zip(vectors)),
+                Err(e) => {
+                    let note = e.to_string();
+                    for (id, ..) in wchunk {
+                        conn.execute(
+                            "UPDATE embed_queue SET attempts = attempts + 1, error = ?2,
+                                    updated_at = datetime('now')
+                             WHERE id = ?1",
+                            stemmadb::rusqlite::params![id, note],
+                        )?;
+                    }
+                    embed_err.get_or_insert(e);
                 }
+            }
+        }
+        if writes.is_empty() {
+            if let Some(e) = embed_err {
                 return Err(e.into());
             }
-        };
+        }
 
-        let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+        // One transaction for the whole write-back: per-item autocommits
+        // were a measurable share of the serial overhead the concurrency
+        // above exists to hide.
+        let tx = conn.unchecked_transaction()?;
+        let dim = writes.first().map(|(_, v)| v.len()).unwrap_or(0);
         let identity = embedder.identity();
         for (target, exists) in [("vec_dense", has_dense), ("vec_interp", has_interp)] {
-            if !work.iter().any(|w| w.4 == target) {
+            if !writes.iter().any(|(w, _)| w.4 == target) {
                 continue;
             }
             if !exists {
@@ -1791,7 +1838,7 @@ pub fn drain_embed_queue(
             )?;
         }
 
-        for ((id, table, column, rowid, target), vector) in work.into_iter().zip(vectors) {
+        for ((id, table, column, rowid, target), vector) in writes {
             let blob: Vec<u8> = vector.iter().flat_map(|x| x.to_le_bytes()).collect();
             let inserted = conn.execute(
                 &format!(
@@ -1823,6 +1870,7 @@ pub fn drain_embed_queue(
                 }
             }
         }
+        tx.commit()?;
     }
 
     let remaining: i64 = conn.query_row(
