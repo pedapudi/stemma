@@ -278,8 +278,15 @@ fn background_task(
     loop {
         std::thread::sleep(std::time::Duration::from_secs(REFRESH_POLL_SECS));
         if let Some(embedder) = &embedder {
-            if embedder.is_down() && embedder.probe().is_ok() {
-                tracing::info!(name, "embedding endpoint recovered; resuming drain");
+            // Resume from the work state, never from an observed down→up
+            // transition: the cooldown marker is shared across databases, so
+            // whichever task probes first consumes the transition and every
+            // other task would sleep forever on a non-empty queue. The queue
+            // is the source of truth — usable embedder + pending items means
+            // drain, regardless of who cleared the marker.
+            let usable = !embedder.is_down() || embedder.probe().is_ok();
+            if usable && pending_embed_work(&db) {
+                tracing::info!(name, "embed queue pending and endpoint usable; resuming drain");
                 embed_pass(name, &db, embedder.as_ref());
             }
         }
@@ -313,6 +320,21 @@ fn background_task(
             embed_pass(name, &db, embedder.as_ref());
         }
     }
+}
+
+/// Whether the embed queue holds pending items — the cheap steady-state
+/// check the background loop gates on. EXISTS under the (status, attempts,
+/// id) index is constant-time, so polling it every cycle costs nothing when
+/// the queue is empty.
+fn pending_embed_work(db: &StemmaDb) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM embed_queue WHERE status = 'pending')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n != 0)
+        .unwrap_or(false)
 }
 
 /// Enqueues embedding work for one database and drains it, documents
