@@ -173,11 +173,11 @@ pub struct Candidate {
     /// is a representative of that set (its smallest rowid). Always 1 for
     /// document candidates, which keep per-row identity.
     pub row_count: u32,
-    /// The dense channel's best cosine for this candidate, calibrated
-    /// against the corpus's derived geometry: 0.0 at the null-pair mean
-    /// (what unrelated rows score on THIS corpus), 1.0 at the
-    /// nearest-neighbor mean. `None` when the candidate has no dense
-    /// evidence or the corpus has no derived geometry.
+    /// The best semantic-channel cosine (dense or interp) for this
+    /// candidate, calibrated against the corpus's derived geometry: 0.0 at
+    /// the null-pair mean (what unrelated rows score on THIS corpus), 1.0
+    /// at the nearest-neighbor mean. `None` when the candidate has no
+    /// semantic evidence or the corpus has no derived geometry.
     pub dense_confidence: Option<f64>,
     /// Up to [`SAMPLE_ROWIDS`] concrete rowids carrying the interpretation,
     /// ascending; the first is `rowid`.
@@ -222,10 +222,10 @@ pub struct Span {
     pub divergence: f64,
     /// Which rule, other than the fused-score threshold, admitted this span
     /// into `mentions`. `None` for ordinary selection. "dense_geometry": the
-    /// span's only evidence is dense and its calibrated confidence sits
-    /// above the corpus's null-pair mean — surfaced as a nomination (status
-    /// stays "weak", candidates stay unselected) rather than a confident
-    /// mention, so NIL semantics are untouched.
+    /// span's only evidence is semantic (dense or interp) and its calibrated
+    /// confidence sits above the corpus's null-pair mean — surfaced as a
+    /// nomination (status stays "weak", candidates stay unselected) rather
+    /// than a confident mention, so NIL semantics are untouched.
     pub admitted_by: Option<String>,
 }
 
@@ -341,10 +341,19 @@ pub fn resolve_full(
     // self-selection, run concurrently. See [`gather_lexical_hits`].
     let mut raw = gather_lexical_hits(db, &spans)?;
 
-    // Phase 2: the dense channel, targeted. KNN over vec0 is a full scan of
-    // the vector table per probe, so it is spent only where lexical evidence
-    // is thin — spans without an exact hit — longest spans first, capped.
-    // One batched embedding call; failures degrade, never abort.
+    // Phase 2: the semantic channels, targeted. KNN over vec0 is a full scan
+    // of the vector table per probe, so it is spent only where lexical
+    // evidence is thin — longest spans first, capped at DENSE_MAX_SPANS.
+    // One batched embedding call serves both vector tables; failures
+    // degrade, never abort. Two gates, both structural:
+    // - vec_dense (whole documents) probes every span without an exact hit;
+    // - vec_interp (interpretation cards, issue #7) probes only spans with
+    //   no strong lexical candidate at all — see [`has_strong_lexical`] —
+    //   and only when the store's registry names this embedder's space
+    //   ([`interp_channel_ready`], the drain's same-space discipline).
+    // The interp targets are a subset of the dense targets (an exact hit is
+    // strong), so the shared target list is the dense one when vec_dense
+    // exists and the interp one otherwise.
     if let Some(embedder) = embedder {
         let has_dense: i64 = conn
             .query_row(
@@ -353,14 +362,34 @@ pub fn resolve_full(
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        if has_dense > 0 {
+        let has_dense = has_dense > 0;
+        let interp_ready = interp_channel_ready(db, embedder);
+        if has_dense || interp_ready {
+            let strong: std::collections::HashSet<usize> = if interp_ready {
+                spans
+                    .iter()
+                    .filter(|s| s.status != "skipped")
+                    .filter(|s| {
+                        raw.get(&s.id)
+                            .is_some_and(|h| has_strong_lexical(&s.text, h))
+                    })
+                    .map(|s| s.id)
+                    .collect()
+            } else {
+                Default::default()
+            };
             let mut targets: Vec<&Span> = spans
                 .iter()
                 .filter(|s| s.status != "skipped")
                 .filter(|s| {
-                    raw.get(&s.id)
-                        .map(|h| !h.iter().any(|x| x.channel == "exact"))
-                        .unwrap_or(false)
+                    let Some(hits) = raw.get(&s.id) else {
+                        return false;
+                    };
+                    if has_dense {
+                        !hits.iter().any(|x| x.channel == "exact")
+                    } else {
+                        !strong.contains(&s.id)
+                    }
                 })
                 .collect();
             targets.sort_by_key(|s| std::cmp::Reverse(s.end - s.start));
@@ -379,11 +408,17 @@ pub fn resolve_full(
                         if Some(id) == full_span_id {
                             query_vec = Some(v.clone());
                         }
-                        let hits = dense_hits(db, &v)?;
-                        raw.entry(id).or_default().extend(hits);
+                        if has_dense {
+                            let hits = dense_hits(db, &v)?;
+                            raw.entry(id).or_default().extend(hits);
+                        }
+                        if interp_ready && !strong.contains(&id) {
+                            let hits = interp_hits(db, &v)?;
+                            raw.entry(id).or_default().extend(hits);
+                        }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "dense channel degraded"),
+                Err(e) => tracing::warn!(error = %e, "semantic channels degraded"),
             }
         }
     }
@@ -692,6 +727,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
     spans
 }
 
+#[derive(Clone)]
 struct RawHit {
     table: String,
     column: String,
@@ -1203,6 +1239,170 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
         h.rank = rank;
     }
     Ok(hits)
+}
+
+/// KNN over the interpretation-card index — the channel that lets a
+/// paraphrase reach a value it shares no substring with (issue #7). Cards
+/// are one per distinct (table, column, value_norm) by construction, so no
+/// within-column collapse is needed; the same over-fetch as the dense
+/// channel still buys headroom for the cross-column case — the same value
+/// read in two columns returns two cards, and both are legitimate distinct
+/// readings — and for stale cards whose lexical row has vanished, which are
+/// dropped (a card describes an interpretation; without the interpretation
+/// it describes nothing). L2 on unit vectors → cos = 1 − d²/2, exactly as
+/// in [`dense_hits`], and the cosines calibrate downstream against the same
+/// corpus geometry (see [`fuse`]).
+///
+/// Hits carry full interpretation semantics: the stored `src_rowid` IS the
+/// representative `MIN(src_rowid)` the drain keyed the card by, `row_count`
+/// counts the rows sharing the reading, and `sample_rowids` are the same
+/// bounded ascending samples the lexical channels attach — so an interp
+/// candidate is indistinguishable in shape from a lexical value candidate
+/// and fuses into the same group when both channels reach one reading.
+fn interp_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
+    let conn = db.conn();
+    let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_table, src_column, src_rowid, distance FROM vec_interp
+         WHERE embedding MATCH ?1 AND k = ?2",
+    )?;
+    let rows = stmt.query_map(
+        stemmadb::rusqlite::params![blob, (PER_CHANNEL_LIMIT * DENSE_OVERFETCH) as i64],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        },
+    );
+    let mut samples = std::collections::HashMap::new();
+    let mut hits: Vec<RawHit> = Vec::new();
+    if let Ok(rows) = rows {
+        // vec0 returns ascending distance; cards are unique per
+        // interpretation, so the ordering is already one hit per reading.
+        for row in rows {
+            let Ok((table, column, rowid, dist)) = row else {
+                continue;
+            };
+            if hits.len() >= PER_CHANNEL_LIMIT {
+                break;
+            }
+            let cosine = 1.0 - (dist * dist) / 2.0;
+            let looked: Option<(String, String, i64)> = conn
+                .query_row(
+                    "SELECT l.value, l.value_norm,
+                            (SELECT count(*) FROM lex_values v
+                              WHERE v.src_table = l.src_table
+                                AND v.src_column = l.src_column
+                                AND v.value_norm = l.value_norm AND v.is_doc = 0)
+                     FROM lex_values l
+                     WHERE l.src_table = ?1 AND l.src_column = ?2
+                       AND l.src_rowid = ?3 AND l.is_doc = 0",
+                    stemmadb::rusqlite::params![table, column, rowid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            // Stale card (index rebuilt out from under the vectors): skip.
+            let Some((value, value_norm, n)) = looked else {
+                continue;
+            };
+            let sample_rowids =
+                interpretation_samples(conn, &mut samples, &table, &column, &value_norm)?;
+            hits.push(RawHit {
+                table,
+                column,
+                rowid,
+                value,
+                channel: "interp",
+                rank: 0, // assigned below
+                raw: cosine,
+                is_doc: false,
+                snippet: None,
+                row_count: n.max(1) as u32,
+                sample_rowids,
+            });
+        }
+    }
+    // Competition ranking on the cosine, as in every channel: identical
+    // evidence shares a rank.
+    let mut prev_raw = f64::INFINITY;
+    let mut rank = 0usize;
+    for (idx, h) in hits.iter_mut().enumerate() {
+        if h.raw < prev_raw {
+            rank = idx;
+            prev_raw = h.raw;
+        }
+        h.rank = rank;
+    }
+    Ok(hits)
+}
+
+/// Same-space discipline for the interp channel, checked the way the drain
+/// checks before appending (see stemma_ingest::drain_embed_queue): the
+/// table must exist, its registry row must exist (an existing table with no
+/// row is unknown provenance — refused, not guessed), the row must name the
+/// embedder's own model, and its query-side template must agree with the
+/// embedder's ('' predates the column and constrains nothing). Resolution
+/// refuses by not firing the channel — degradation, never an error, like
+/// every optional signal here.
+fn interp_channel_ready(db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) -> bool {
+    let conn = db.conn();
+    let exists: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'vec_interp'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return false;
+    }
+    let registered: Option<(String, String)> = conn
+        .query_row(
+            "SELECT model, query_template FROM model_registry
+             WHERE vector_table = 'vec_interp'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let identity = embedder.identity();
+    match registered {
+        Some((model, template)) => {
+            model == identity.model
+                && (template.is_empty()
+                    || stemma_embed::query_templates_agree(&template, &identity.query_template))
+        }
+        None => false,
+    }
+}
+
+/// The interp channel's per-span gate: a span already holding a STRONG
+/// lexical candidate does not need a semantic fallback. Strong is defined
+/// structurally, not by a new tunable: any exact hit (the user typed a
+/// stored value), or any candidate that reaches [`SELECT_THRESHOLD`] on the
+/// lexical channels alone — which under RRF arithmetic means at least two
+/// lexical channels corroborating one reading (a single channel at rank 0
+/// tops out at base 1/3, under the threshold).
+///
+/// Why gate at all, when the span's vector is already paid for (one batched
+/// embed call serves every semantic probe)? Because the cost of running
+/// interp everywhere is not embeds, it is the audit trail: every KNN
+/// returns SOMETHING, and on a span the lexical cascade already resolved
+/// those hits are noise a trace reader must wade through. The channel is
+/// the fallback for spans lexical retrieval cannot reach — the paraphrase
+/// tier — so it fires exactly where the fallback is needed. The known cost,
+/// accepted deliberately: a query where a paraphrase and a strong lexical
+/// match coexist on one span keeps only the lexical reading.
+fn has_strong_lexical(span_text: &str, hits: &[RawHit]) -> bool {
+    if hits.iter().any(|h| h.channel == "exact") {
+        return true;
+    }
+    // Lexical-only hits carry no cosines, so geometry cannot matter: None.
+    fuse(span_text, hits.to_vec(), None)
+        .first()
+        .is_some_and(|c| c.score >= SELECT_THRESHOLD)
 }
 
 /// The GraphRAG-lite assist: when the span's tokens are characteristic terms
@@ -2490,7 +2690,7 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
                 let affinity = (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
                 (base * (0.4 + 0.6 * affinity)).min(1.0)
             };
-            // The dense channel's cosine is absolute evidence, not a rank —
+            // A semantic channel's cosine is absolute evidence, not a rank —
             // but only relative to THIS corpus's geometry. Calibrate between
             // the corpus's null-pair mean (what unrelated rows score here;
             // +0.21 on legal, not 0) and its nearest-neighbor mean (what a
@@ -2502,12 +2702,19 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
             // ((cos-0.30)/0.30 · 0.78) let dense-only documents displace
             // correct anchored candidates: legal L1 recall@5 fell 0.68→0.48
             // the day the dense index filled.
+            //
+            // The interp channel's cosines calibrate through the SAME
+            // derived geometry: its vectors live in the same registry-
+            // guarded encoder space, and one calibration law for all
+            // semantic evidence beats a second derivation with a second
+            // failure mode.
+            let semantic = |c: &&ChannelScore| c.channel == "dense" || c.channel == "interp";
             let mut dense_confidence = None;
             if let (Some((null_mean, nn_mean)), Some(best_cos)) = (
                 geometry,
                 g.channels
                     .iter()
-                    .filter(|c| c.channel == "dense")
+                    .filter(semantic)
                     .map(|c| c.raw)
                     .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x)))),
             ) {
@@ -2634,18 +2841,20 @@ fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
 /// ones (median 0.31), because topically-adjacent NIL queries embed close
 /// to real documents.
 ///
-/// So dense-only evidence is admitted as a *nomination*, not a mention
+/// So semantic-only evidence is admitted as a *nomination*, not a mention
 /// claim: the longest weak span whose top candidate's evidence is entirely
-/// dense and whose calibrated confidence is positive — its best cosine is
+/// semantic — dense or interp, which share the calibration law and the
+/// structural ceiling, so they share nomination eligibility — and whose
+/// calibrated confidence is positive — its best cosine is
 /// above the corpus's own null-pair mean, the one bar the geometry actually
 /// derives — joins `mentions` with status still "weak", candidates still
 /// unselected, and `admitted_by = "dense_geometry"` naming the rule. It
 /// claims no byte range (lexical selection is untouched), it grounds no
 /// answer, and it never flips a NIL: absence semantics key on selected
 /// spans/candidates, which a nomination has none of. One nomination per
-/// resolution — the dense probes embed whole spans against documents, so
+/// resolution — the semantic probes embed whole spans, so
 /// overlapping sub-span nominations are the same reading, and the longest
-/// span carries the most context (dense probing already targets longest
+/// span carries the most context (semantic probing already targets longest
 /// first).
 fn dense_nomination(spans: &[Span]) -> Option<usize> {
     spans
@@ -2654,7 +2863,9 @@ fn dense_nomination(spans: &[Span]) -> Option<usize> {
         .filter(|s| {
             s.candidates.first().is_some_and(|c| {
                 !c.channels.is_empty()
-                    && c.channels.iter().all(|ch| ch.channel == "dense")
+                    && c.channels
+                        .iter()
+                        .all(|ch| ch.channel == "dense" || ch.channel == "interp")
                     && c.dense_confidence.is_some_and(|x| x > 0.0)
             })
         })
@@ -4738,5 +4949,406 @@ mod tests {
         let mut spans = spans_fixture();
         apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+    }
+
+    // --------------------- interp-channel section tests --------------------
+
+    /// Marker embedder for the paraphrase gap (issue #7): each axis groups a
+    /// query concept with the category vocabulary that MEANS it but shares
+    /// no substring with it, plus a bias axis so zero-marker texts stay
+    /// embeddable. "cold winter" and "Outerwear & Coats" land on the same
+    /// axis the way a real encoder lands them in the same region.
+    struct CategoryEmbedder;
+
+    const CATEGORY_AXES: &[&[&str]] = &[
+        &["cold", "winter", "outerwear", "coats"],
+        &["swim", "pool"],
+        &["belt", "accessories"],
+    ];
+
+    impl CategoryEmbedder {
+        fn vector(text: &str) -> Vec<f32> {
+            let t = text.to_lowercase();
+            let mut v: Vec<f32> = CATEGORY_AXES
+                .iter()
+                .map(|words| {
+                    if words.iter().any(|w| t.contains(w)) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            v.push(0.25); // bias axis: zero-marker texts stay embeddable
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+            v
+        }
+    }
+
+    impl stemma_embed::Embedder for CategoryEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                backend: "fake".into(),
+                model: "category-embedder".into(),
+                dimension: CATEGORY_AXES.len() + 1,
+                query_template: String::new(),
+            }
+        }
+    }
+
+    /// Issue #7's shape, miniaturized: category vocabulary reachable only by
+    /// paraphrase. 'Outerwear & Coats' lives in TWO columns (two legitimate
+    /// readings, the cross-column case), and products.category rows 1–2
+    /// share the value so interpretation semantics — representative rowid,
+    /// row_count, samples — are observable. vec_interp is built by hand
+    /// from crafted card vectors keyed at each interpretation's
+    /// MIN(src_rowid) representative (the dense-geometry test's pattern),
+    /// restricted to the category columns as the vocabulary gate would
+    /// leave it. `geometry` writes the corpus-geometry receipt fuse
+    /// calibrates against; without it the channel participates by rank
+    /// alone.
+    fn category_db(geometry: bool) -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.products(id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+                 INSERT INTO src.products VALUES
+                    (1, 'Alpine Parka', 'Outerwear & Coats'),
+                    (2, 'City Jacket', 'Outerwear & Coats'),
+                    (3, 'Lap Shark Suit', 'Swimwear'),
+                    (4, 'Braided Strap', 'Accessories');
+                 CREATE TABLE src.inventory_items(id INTEGER PRIMARY KEY,
+                     product_category TEXT);
+                 INSERT INTO src.inventory_items VALUES
+                    (1, 'Outerwear & Coats'), (2, 'Swimwear'), (3, 'Accessories');",
+            )
+            .unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_interp USING vec0(
+                 embedding float[4], src_table text, src_column text, src_rowid integer);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO model_registry (vector_table, backend, model, dimension,
+                                         quantization, query_template, card_format)
+             VALUES ('vec_interp', 'fake', 'category-embedder', 4, 'f32', '', ?1)",
+            [stemma_ingest::INTERP_CARD_FORMAT],
+        )
+        .unwrap();
+        let reps: Vec<(String, String, i64, String)> = conn
+            .prepare(
+                "SELECT src_table, src_column, MIN(src_rowid), value FROM lex_values
+                 WHERE is_doc = 0 AND src_column IN ('category', 'product_category')
+                 GROUP BY src_table, src_column, value_norm",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        for (t, c, rowid, value) in reps {
+            let card = format!("{t} · {c} · {value}");
+            let v = CategoryEmbedder::vector(&card);
+            let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            conn.execute(
+                "INSERT INTO vec_interp (embedding, src_table, src_column, src_rowid)
+                 VALUES (?1, ?2, ?3, ?4)",
+                stemmadb::rusqlite::params![blob, t, c, rowid],
+            )
+            .unwrap();
+        }
+        if geometry {
+            // Null above the bias-only baseline cosine (≈ 0.24), so junk
+            // spans calibrate to zero confidence like unrelated rows do.
+            conn.execute(
+                "INSERT INTO derivations
+                     (artifact, input_fingerprint, derivation_version, value_json)
+                 VALUES ('dense:geometry', 'test', 1, ?1)",
+                [r#"{"null_mean":0.25,"nn_mean":0.9}"#],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// The capability the issue asks for: a query sharing no substring with
+    /// the stored value reaches it as a candidate, generated (not re-ranked)
+    /// by the interp channel, with full interpretation semantics.
+    #[test]
+    fn interp_channel_reaches_a_paraphrase_with_no_lexical_overlap() {
+        let db = category_db(true);
+        let trace = resolve(&db, "warm layers for cold winter months", Some(&CategoryEmbedder))
+            .unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| {
+                s.candidates
+                    .iter()
+                    .any(|c| c.channels.iter().any(|ch| ch.channel == "interp"))
+            })
+            .expect("a mention generated by the interp channel");
+        let c = span
+            .candidates
+            .iter()
+            .find(|c| c.table == "products" && c.column == "category")
+            .expect("the category reading");
+        assert_eq!(c.value, "Outerwear & Coats");
+        assert!(c.selected, "calibrated semantic evidence selects: {c:?}");
+        assert!(
+            c.channels.iter().any(|ch| ch.channel == "interp"),
+            "the reading is the interp channel's"
+        );
+        assert!(
+            c.channels
+                .iter()
+                .all(|ch| !matches!(ch.channel.as_str(), "exact" | "bm25" | "trigram")),
+            "no lexical channel can reach this value: {:?}",
+            c.channels
+        );
+        // Interpretation semantics, exactly like a lexical value hit:
+        // representative rowid, fan-out count, bounded ascending samples.
+        assert_eq!(c.rowid, 1, "representative is MIN(src_rowid)");
+        assert_eq!(c.row_count, 2, "two rows share the reading");
+        assert_eq!(c.sample_rowids, vec![1, 2]);
+        assert!(
+            c.dense_confidence.is_some_and(|x| x > 0.99),
+            "same-axis cosine calibrates to full confidence: {:?}",
+            c.dense_confidence
+        );
+    }
+
+    /// The cross-column case the issue calls correct: the same value_norm in
+    /// two columns is two legitimate distinct readings, and both return.
+    #[test]
+    fn interp_returns_both_cross_column_readings() {
+        let db = category_db(true);
+        let trace = resolve(&db, "warm layers for cold winter months", Some(&CategoryEmbedder))
+            .unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| !s.candidates.is_empty())
+            .expect("the paraphrase mention");
+        let readings: Vec<_> = span
+            .candidates
+            .iter()
+            .filter(|c| c.value == "Outerwear & Coats")
+            .collect();
+        assert_eq!(readings.len(), 2, "both readings: {readings:?}");
+        let keys: std::collections::HashSet<(&str, &str)> = readings
+            .iter()
+            .map(|c| (c.table.as_str(), c.column.as_str()))
+            .collect();
+        assert!(keys.contains(&("products", "category")));
+        assert!(keys.contains(&("inventory_items", "product_category")));
+        for c in &readings {
+            assert!(c.selected);
+            assert!(c.channels.iter().any(|ch| ch.channel == "interp"));
+        }
+        let inv = readings
+            .iter()
+            .find(|c| c.table == "inventory_items")
+            .unwrap();
+        assert_eq!((inv.rowid, inv.row_count), (1, 1));
+    }
+
+    /// The gate: a span the lexical cascade already anchored does not run
+    /// the interp KNN — its audit trail stays lexical — while bare spans of
+    /// the same query still probe the cards.
+    #[test]
+    fn interp_gate_skips_spans_with_strong_lexical_evidence() {
+        let db = category_db(true);
+        let trace = resolve(&db, "Swimwear stock levels", Some(&CategoryEmbedder)).unwrap();
+        let swim = trace
+            .spans
+            .iter()
+            .find(|s| s.text == "Swimwear")
+            .expect("Swimwear span");
+        assert!(swim
+            .candidates
+            .iter()
+            .any(|c| c.channels.iter().any(|ch| ch.channel == "exact")));
+        assert!(
+            swim.candidates
+                .iter()
+                .all(|c| c.channels.iter().all(|ch| ch.channel != "interp")),
+            "an exact-anchored span must not run the interp KNN: {:?}",
+            swim.candidates
+        );
+        // Per span, not per query: a bare span of the same query probes.
+        assert!(
+            trace
+                .spans
+                .iter()
+                .flat_map(|s| &s.candidates)
+                .any(|c| c.channels.iter().any(|ch| ch.channel == "interp")),
+            "the channel must still fire where lexical evidence is thin"
+        );
+    }
+
+    /// "Strong" is structural, not tuned: an exact hit, or lexical fusion
+    /// alone reaching SELECT_THRESHOLD — which the RRF arithmetic grants to
+    /// two corroborating channels (2/3) and denies to one alone (1/3).
+    #[test]
+    fn interp_gate_strength_is_structural() {
+        let lex_hit = |channel: &'static str| RawHit {
+            table: "t".into(),
+            column: "c".into(),
+            rowid: 1,
+            value: "vocab".into(),
+            channel,
+            rank: 0,
+            raw: 1.0,
+            is_doc: false,
+            snippet: None,
+            row_count: 1,
+            sample_rowids: vec![1],
+        };
+        assert!(has_strong_lexical("vocab", &[lex_hit("exact")]));
+        assert!(has_strong_lexical("vocab", &[lex_hit("bm25"), lex_hit("trigram")]));
+        assert!(!has_strong_lexical("vocab", &[lex_hit("bm25")]));
+        assert!(!has_strong_lexical("vocab", &[]));
+    }
+
+    /// The drain's same-space discipline, applied to reads: a registry row
+    /// naming a different model, a disagreeing query template, or no row at
+    /// all for an existing table each silence the channel — mixing vector
+    /// spaces is worse than not searching.
+    #[test]
+    fn interp_refuses_a_mismatched_vector_space() {
+        let query = "warm layers for cold winter months";
+        let interp_fired = |db: &StemmaDb| {
+            let trace = resolve(db, query, Some(&CategoryEmbedder)).unwrap();
+            trace
+                .spans
+                .iter()
+                .flat_map(|s| &s.candidates)
+                .any(|c| c.channels.iter().any(|ch| ch.channel == "interp"))
+        };
+
+        // Control: the intact registry fires.
+        assert!(interp_fired(&category_db(true)));
+
+        // Model mismatch.
+        let db = category_db(true);
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET model = 'some-other-model'
+                 WHERE vector_table = 'vec_interp'",
+                [],
+            )
+            .unwrap();
+        assert!(!interp_fired(&db));
+
+        // Query-template mismatch: a registered convention the embedder
+        // does not share means its queries live in a foreign space.
+        let db = category_db(true);
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET query_template = 'Instruct: {query}'
+                 WHERE vector_table = 'vec_interp'",
+                [],
+            )
+            .unwrap();
+        assert!(!interp_fired(&db));
+
+        // Existing table, no registry row: provenance unknown, refused.
+        let db = category_db(true);
+        db.conn()
+            .execute(
+                "DELETE FROM model_registry WHERE vector_table = 'vec_interp'",
+                [],
+            )
+            .unwrap();
+        assert!(!interp_fired(&db));
+    }
+
+    /// No geometry receipt = no calibration: the channel participates by
+    /// rank alone (base 1/3, under SELECT_THRESHOLD), never a default
+    /// constant, and rank-only evidence neither selects nor nominates.
+    #[test]
+    fn interp_without_geometry_participates_by_rank_only() {
+        let db = category_db(false);
+        let trace = resolve(&db, "warm layers for cold winter months", Some(&CategoryEmbedder))
+            .unwrap();
+        assert!(
+            trace.mentions.is_empty(),
+            "rank-only semantic evidence claims nothing: {:?}",
+            trace.mentions
+        );
+        assert!(
+            trace.spans.iter().all(|s| s.admitted_by.is_none()),
+            "no geometry, no nomination"
+        );
+        let c = trace
+            .spans
+            .iter()
+            .flat_map(|s| &s.candidates)
+            .find(|c| c.value == "Outerwear & Coats")
+            .expect("rank participation still surfaces the reading in the trace");
+        assert!(c.channels.iter().any(|ch| ch.channel == "interp"));
+        assert_eq!(c.dense_confidence, None, "never a default constant");
+        assert!(c.score < SELECT_THRESHOLD);
+        assert!(!c.selected);
+    }
+
+    /// An unselected interp-only value candidate at the given calibrated
+    /// confidence, scored as fuse scores rank-only interp evidence (base
+    /// 1/3, under the threshold) — the paraphrase tier's weak shape.
+    fn interp_only_cand(rowid: i64, conf: f64) -> Candidate {
+        let mut c = cand(rowid, "Outerwear & Coats", 1.0 / 3.0, &["interp"]);
+        c.selected = false;
+        c.dense_confidence = Some(conf);
+        c
+    }
+
+    /// Nomination eligibility extends to interp-only spans exactly as to
+    /// dense-only ones: the calibration law and the structural ceiling are
+    /// shared, so the honest-surfacing rule is too — and any lexical
+    /// evidence in the mix keeps SELECT_THRESHOLD in charge.
+    #[test]
+    fn interp_only_span_is_nominated_like_dense_only() {
+        let mut spans = vec![span_at(0, 0, 20, "weak", vec![interp_only_cand(1, 0.4)])];
+        let mentions = select_mentions(&mut spans);
+        assert_eq!(mentions, vec![0], "interp-only semantic evidence nominates");
+        assert_eq!(spans[0].status, "weak", "a nomination is not a claim");
+        assert_eq!(spans[0].admitted_by.as_deref(), Some("dense_geometry"));
+        assert!(spans[0].candidates.iter().all(|c| !c.selected));
+
+        // Mixed dense + interp evidence is still all-semantic: eligible.
+        let mut c = interp_only_cand(2, 0.4);
+        c.channels.push(ChannelScore {
+            channel: "dense".into(),
+            rank: 0,
+            raw: 0.5,
+        });
+        let mut spans = vec![span_at(0, 0, 20, "weak", vec![c])];
+        assert_eq!(select_mentions(&mut spans), vec![0]);
+
+        // Lexical evidence in the mix: the fused threshold governs, as ever.
+        let mut c = interp_only_cand(3, 0.9);
+        c.channels.push(ChannelScore {
+            channel: "trigram".into(),
+            rank: 0,
+            raw: 1.0,
+        });
+        let mut spans = vec![span_at(0, 0, 20, "weak", vec![c])];
+        assert!(select_mentions(&mut spans).is_empty());
+        assert!(spans[0].admitted_by.is_none());
+
+        // Uncalibrated interp evidence (no geometry) never nominates.
+        let mut c = interp_only_cand(4, 0.0);
+        c.dense_confidence = None;
+        let mut spans = vec![span_at(0, 0, 20, "weak", vec![c])];
+        assert!(select_mentions(&mut spans).is_empty());
     }
 }
