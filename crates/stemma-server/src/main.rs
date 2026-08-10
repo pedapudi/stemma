@@ -376,6 +376,11 @@ fn embed_pass(name: &str, db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) 
     if !drain_to_empty(name, db, embedder, "documents") {
         return;
     }
+    // Fresh vectors move the corpus's dense geometry; re-derive (receipted,
+    // so an unchanged index costs one fingerprint check).
+    if let Err(e) = stemma_ingest::derive_dense_geometry(db) {
+        tracing::warn!(name, error = %e, "dense geometry derivation failed");
+    }
 
     let start = std::time::Instant::now();
     let queued_interps = match stemma_ingest::enqueue_missing_interpretations(db) {

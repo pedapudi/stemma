@@ -358,13 +358,17 @@ pub fn resolve_full(
         }
     }
 
-    // Phase 3: fuse and refine.
+    // Phase 3: fuse and refine. The dense channel's cosines calibrate
+    // against the corpus's own derived geometry (see
+    // stemma_ingest::derive_dense_geometry); absent geometry, dense
+    // participates by rank alone.
+    let geometry = dense_geometry(db);
     for span in spans.iter_mut() {
         if span.status == "skipped" {
             continue;
         }
         let hits = raw.remove(&span.id).unwrap_or_default();
-        let mut candidates = fuse(&span.text, hits);
+        let mut candidates = fuse(&span.text, hits, geometry);
         apply_kg_coherence(db, &span.text, &mut candidates)?;
         apply_context_coherence(db, &tokens, span.start, span.end, &mut candidates)?;
         span.candidates = candidates;
@@ -1897,7 +1901,29 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
 /// Reciprocal-rank fusion across channels, with a length-affinity factor so
 /// short stored values that closely match the span outrank long documents
 /// that merely contain it.
-fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
+/// The corpus's derived dense geometry (null-pair mean, nearest-neighbor
+/// mean), written by ingest with the other derivation receipts. One row;
+/// absent or unparsable means "no calibration", never a default constant.
+fn dense_geometry(db: &StemmaDb) -> Option<(f64, f64)> {
+    let json: String = db
+        .conn()
+        .query_row(
+            "SELECT value_json FROM derivations WHERE artifact = 'dense:geometry'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    match (
+        v.get("null_mean").and_then(|x| x.as_f64()),
+        v.get("nn_mean").and_then(|x| x.as_f64()),
+    ) {
+        (Some(nm), Some(nn)) if nn > nm => Some((nm, nn)),
+        _ => None,
+    }
+}
+
+fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Candidate> {
     use std::collections::BTreeMap;
     const RRF_K: f64 = 4.0;
 
@@ -1966,18 +1992,30 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 let affinity = (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
                 (base * (0.4 + 0.6 * affinity)).min(1.0)
             };
-            // The dense channel's cosine is absolute evidence, not a rank:
-            // calibrate it to the score scale and let it floor the fusion —
-            // a 0.6 cosine match must survive having no lexical company.
-            if let Some(best_cos) = g
-                .channels
-                .iter()
-                .filter(|c| c.channel == "dense")
-                .map(|c| c.raw)
-                .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x))))
-            {
-                let calibrated = (((best_cos - 0.30) / 0.30).clamp(0.0, 1.0)) * 0.78;
-                score = score.max(calibrated);
+            // The dense channel's cosine is absolute evidence, not a rank —
+            // but only relative to THIS corpus's geometry. Calibrate between
+            // the corpus's null-pair mean (what unrelated rows score here;
+            // +0.21 on legal, not 0) and its nearest-neighbor mean (what a
+            // genuine match scores). The ceiling is structural, not tuned:
+            // full semantic confidence counts as exactly "two lexical
+            // channels agree at rank 0 on a document" — enough to nominate
+            // what no lexical channel can reach, never enough to outrank a
+            // corroborated lexical hit. The previous constant floor
+            // ((cos-0.30)/0.30 · 0.78) let dense-only documents displace
+            // correct anchored candidates: legal L1 recall@5 fell 0.68→0.48
+            // the day the dense index filled.
+            if let (Some((null_mean, nn_mean)), Some(best_cos)) = (
+                geometry,
+                g.channels
+                    .iter()
+                    .filter(|c| c.channel == "dense")
+                    .map(|c| c.raw)
+                    .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x)))),
+            ) {
+                let confidence =
+                    ((best_cos - null_mean) / (nn_mean - null_mean)).clamp(0.0, 1.0);
+                let two_channel_doc = (2.0 / RRF_K) / (3.0 / RRF_K) * 0.85;
+                score = score.max(confidence * two_channel_doc);
             }
             let (value, value_truncated) = truncate_value(&g.value);
             Candidate {
@@ -2570,6 +2608,57 @@ mod tests {
                 query_template: String::new(),
             }
         }
+    }
+
+    #[test]
+    fn dense_only_calibrates_against_corpus_geometry_and_defers_to_lexical() {
+        let hit = |channel: &'static str, rank: usize, raw: f64, rowid: i64| RawHit {
+            table: "docs".into(),
+            column: "text".into(),
+            rowid,
+            value: "a document long enough to be a document".into(),
+            channel,
+            rank,
+            raw,
+            is_doc: true,
+            snippet: None,
+            row_count: 1,
+            sample_rowids: vec![rowid],
+        };
+        // A dense-only hit at the corpus's nearest-neighbor scale vs a
+        // two-channel lexical document.
+        let geometry = Some((0.2, 0.7));
+        let out = fuse(
+            "span",
+            vec![
+                hit("dense", 0, 0.7, 1),
+                hit("bm25", 0, 5.0, 2),
+                hit("trigram", 0, 0.9, 2),
+            ],
+            geometry,
+        );
+        let dense = out.iter().find(|c| c.rowid == 1).unwrap();
+        let lexical = out.iter().find(|c| c.rowid == 2).unwrap();
+        // Full semantic confidence equals, never exceeds, two agreeing
+        // lexical channels at rank 0.
+        assert!(
+            dense.score <= lexical.score + 1e-9,
+            "dense {} must not outrank corroborated lexical {}",
+            dense.score,
+            lexical.score
+        );
+        // At the null point the floor vanishes; the hit still exists via RRF.
+        let out = fuse("span", vec![hit("dense", 0, 0.2, 3)], geometry);
+        let base_only = out[0].score;
+        let out = fuse("span", vec![hit("dense", 0, 0.2, 3)], None);
+        assert!(
+            (base_only - out[0].score).abs() < 1e-9,
+            "at null cosine, geometry must add nothing over rank participation"
+        );
+        // Between null and nn the floor scales; without geometry it is absent.
+        let out_mid = fuse("span", vec![hit("dense", 0, 0.45, 4)], geometry);
+        let out_none = fuse("span", vec![hit("dense", 0, 0.45, 4)], None);
+        assert!(out_mid[0].score > out_none[0].score);
     }
 
     #[test]

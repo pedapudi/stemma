@@ -397,6 +397,9 @@ pub fn drain_embeddings(
                         s.drained, s.failed
                     ));
                 }
+                if let Err(e) = stemma_ingest::derive_dense_geometry(db) {
+                    notes.push(format!("dense geometry derivation failed: {e}"));
+                }
                 return;
             }
             Ok(_) => {}
