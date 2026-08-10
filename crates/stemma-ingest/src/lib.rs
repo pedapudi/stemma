@@ -387,7 +387,11 @@ fn write_receipt(
 
 /// Fingerprint of the whole ingested corpus: the per-table receipts folded
 /// through a content hash. Cheap, and exactly as fresh as the receipts.
-fn corpus_fingerprint(conn: &stemmadb::rusqlite::Connection) -> Result<String> {
+///
+/// Public because derived state that must die with the index — the knowledge
+/// store's probe-verified co-occurrence cache — stamps itself with this value
+/// as its generation and treats any other generation as absent.
+pub fn corpus_fingerprint(conn: &stemmadb::rusqlite::Connection) -> Result<String> {
     let joined: Option<String> = conn.query_row(
         "SELECT group_concat(artifact || '=' || input_fingerprint, ';')
          FROM (SELECT artifact, input_fingerprint FROM derivations

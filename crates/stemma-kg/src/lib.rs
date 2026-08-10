@@ -331,6 +331,130 @@ impl KnowledgeStore for SqliteKnowledgeStore<'_> {
     }
 }
 
+// ---- probe-verified co-occurrence (the write-back cache) -------------------
+//
+// Collective disambiguation verifies that two value readings co-occur by
+// joining the user database. Each verified POSITIVE link is persisted here as
+// a `cooccurs` edge between the two readings' value nodes, so a repeat query
+// is a lookup instead of a join. Two laws govern the cache:
+//
+// - CACHE, NEVER FILTER: only verified positives are stored. A miss means
+//   "probe", never "no link" — a negative is cheap to recompute and lethal to
+//   cache stale, so this structure may propose but never exclude.
+// - Generation-stamped: every edge carries the lexical index's corpus
+//   fingerprint. Edges from any other generation are treated as absent and
+//   deleted lazily at consult time; a rebuilt index never serves stale
+//   co-occurrence evidence.
+
+/// Node key of one value reading — the same scheme the head-value profiler
+/// uses, so a write-back node and a compiled frequent-value node for the same
+/// reading are one node.
+pub fn value_node_key(table: &str, column: &str, value: &str) -> String {
+    format!("value:{table}.{column}:{}", value.to_lowercase())
+}
+
+/// One probe-verified co-occurrence link, as stored: the two citing rowids
+/// and the rendered evidence the original probe produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLink {
+    pub src_rowid: i64,
+    pub dst_rowid: i64,
+    pub evidence: String,
+}
+
+impl SqliteKnowledgeStore<'_> {
+    /// The generation probe-verified `cooccurs` edges are valid for: the
+    /// corpus fingerprint of the lexical index receipts. Rebuilding the index
+    /// over changed data moves this value, orphaning every cached link at
+    /// once.
+    pub fn cooccurrence_generation(&self) -> Result<String> {
+        Ok(stemma_ingest::corpus_fingerprint(self.db.conn())?)
+    }
+
+    /// Drops probe-verified `cooccurs` edges stamped by any other generation.
+    /// Called lazily at consult time; profiled (term) co-occurrence edges are
+    /// compiler-owned and untouched. Returns how many edges died.
+    pub fn sweep_stale_cooccurrence(&self, generation: &str) -> Result<usize> {
+        Ok(self.db.conn().execute(
+            "DELETE FROM kg_edges
+             WHERE kind = 'cooccurs'
+               AND json_extract(props, '$.method') = 'probe_verified'
+               AND json_extract(props, '$.generation') IS NOT ?1",
+            [generation],
+        )?)
+    }
+
+    /// Looks up a verified link between two readings, in either orientation.
+    /// Only a current-generation edge answers; anything else is a miss, and a
+    /// miss means "probe", never "no link".
+    pub fn cached_cooccurrence(
+        &self,
+        generation: &str,
+        a_key: &str,
+        b_key: &str,
+    ) -> Result<Option<VerifiedLink>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT json_extract(e.props, '$.src_rowid'),
+                    json_extract(e.props, '$.dst_rowid'),
+                    json_extract(e.props, '$.evidence')
+             FROM kg_edges e
+             JOIN kg_nodes a ON a.key = ?1
+             JOIN kg_nodes b ON b.key = ?2
+             WHERE e.kind = 'cooccurs'
+               AND ((e.src = a.id AND e.dst = b.id) OR (e.src = b.id AND e.dst = a.id))
+               AND json_extract(e.props, '$.method') = 'probe_verified'
+               AND json_extract(e.props, '$.generation') = ?3",
+        )?;
+        let mut rows = stmt.query(stemmadb::rusqlite::params![a_key, b_key, generation])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(VerifiedLink {
+                src_rowid: r.get(0)?,
+                dst_rowid: r.get(1)?,
+                evidence: r.get(2)?,
+            }),
+            None => None,
+        })
+    }
+
+    /// Persists one verified positive link: value nodes for the two readings
+    /// (created only when absent — a compiled frequent-value node keeps its
+    /// props) and a `cooccurs` edge carrying the citing rowids, the rendered
+    /// evidence, and the generation stamp. `src`/`dst` are
+    /// ([`value_node_key`], stored value) pairs, in probe orientation.
+    pub fn record_cooccurrence(
+        &self,
+        generation: &str,
+        src: (&str, &str),
+        dst: (&str, &str),
+        src_rowid: i64,
+        dst_rowid: i64,
+        evidence: &str,
+    ) -> Result<()> {
+        let conn = self.db.conn();
+        for (key, label) in [src, dst] {
+            conn.execute(
+                "INSERT INTO kg_nodes (key, kind, label, props)
+                 VALUES (?1, 'value', ?2, '{}')
+                 ON CONFLICT(key) DO NOTHING",
+                stemmadb::rusqlite::params![key, label],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO kg_edges (src, dst, kind, label, props)
+             SELECT a.id, b.id, 'cooccurs', 'verified',
+                    json_object('method', 'probe_verified', 'generation', ?3,
+                                'src_rowid', ?4, 'dst_rowid', ?5, 'evidence', ?6)
+             FROM kg_nodes a JOIN kg_nodes b
+             WHERE a.key = ?1 AND b.key = ?2
+             ON CONFLICT(src, dst, kind) DO UPDATE SET
+                 label = excluded.label, props = excluded.props",
+            stemmadb::rusqlite::params![src.0, dst.0, generation, src_rowid, dst_rowid, evidence],
+        )?;
+        Ok(())
+    }
+}
+
 // ---- compilation parameters ----
 
 /// Frequent-value nodes per column, at most this many.
@@ -582,7 +706,7 @@ fn compile_value_profile(
         )?
         .collect::<std::result::Result<_, _>>()?;
     for (t, c, v, n) in rows {
-        let key = format!("value:{t}.{c}:{}", v.to_lowercase());
+        let key = value_node_key(&t, &c, &v);
         store.upsert_node(&Node {
             key: key.clone(),
             kind: KIND_VALUE.into(),
@@ -1377,6 +1501,51 @@ mod tests {
         assert!(store.table_paths("people", "teams", 0, 8).unwrap().is_empty());
         assert!(store.table_paths("people", "people", 2, 8).unwrap().is_empty());
         assert_eq!(store.table_paths("people", "teams", 2, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn probe_verified_cooccurrence_round_trip() {
+        let db = ingested_mini("cooccur");
+        compile(&db, false).unwrap();
+        let store = SqliteKnowledgeStore::new(&db).unwrap();
+        let g = store.cooccurrence_generation().unwrap();
+        let a = value_node_key("offices", "city", "Seattle");
+        let b = value_node_key("people", "name", "Wei Chen");
+        let evidence = "offices #3 ←office_id— people #7";
+        // Nodes need not pre-exist: record creates value-level nodes on
+        // demand ("Wei Chen" is not a head value, so no compiled node).
+        store
+            .record_cooccurrence(&g, (&a, "Seattle"), (&b, "Wei Chen"), 3, 7, evidence)
+            .unwrap();
+        let hit = store.cached_cooccurrence(&g, &a, &b).unwrap().expect("hit");
+        assert_eq!((hit.src_rowid, hit.dst_rowid), (3, 7));
+        assert_eq!(hit.evidence, evidence);
+        // Orientation-agnostic lookup, generation-exact answering.
+        assert!(store.cached_cooccurrence(&g, &b, &a).unwrap().is_some());
+        assert!(store
+            .cached_cooccurrence("elsewhen", &a, &b)
+            .unwrap()
+            .is_none());
+        // Provenance discipline holds for write-back edges too.
+        let bare: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM kg_edges WHERE props NOT LIKE '%method%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bare, 0);
+        // A different generation sweeps the edge; nothing else dies.
+        let (nodes_before, edges_before) = {
+            let s = store.stats().unwrap();
+            (s.nodes, s.edges)
+        };
+        assert_eq!(store.sweep_stale_cooccurrence("elsewhen").unwrap(), 1);
+        assert!(store.cached_cooccurrence(&g, &a, &b).unwrap().is_none());
+        let after = store.stats().unwrap();
+        assert_eq!(after.edges, edges_before - 1);
+        assert_eq!(after.nodes, nodes_before);
     }
 
     #[test]

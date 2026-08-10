@@ -1229,6 +1229,13 @@ fn apply_context_coherence(
     Ok(())
 }
 
+/// Appended to a coherence annotation served from the knowledge store's
+/// write-back cache instead of a fresh instance probe, so a reviewer reading
+/// the trace (or the adjudication prompt) can tell stored evidence from
+/// just-verified evidence. The citation preceding it is byte-identical to
+/// what the original probe rendered.
+const COHERENCE_CACHED_MARKER: &str = " [cached]";
+
 /// Collective disambiguation (AIDA-lineage joint tuple scoring): the
 /// associative mention — "Chen's team" — is unresolvable span by span when
 /// there are two Chens, but the *pair* is: the right Chen is the one with a
@@ -1238,6 +1245,16 @@ fn apply_context_coherence(
 /// path recorded as evidence. Coherence between two candidates requires a
 /// schema path between their tables (fk/inferred_fk, ≤ MAX_PATH_HOPS) AND
 /// an instance probe showing the two rows actually connect along it.
+///
+/// Verified links compound: every positive probe result is persisted in the
+/// knowledge store as a generation-stamped `cooccurs` edge between the two
+/// readings' value nodes (see stemma-kg's write-back helpers), and the cache
+/// is consulted before probing — a hit re-serves the stored citation, marked
+/// [`COHERENCE_CACHED_MARKER`]; a miss probes exactly as before. Only
+/// positives are ever written (a miss means "probe", never "no link"), and
+/// edges stamped by any other lexical index generation are treated as absent
+/// and swept lazily at consult time. Cache failures degrade to probing:
+/// the cache may accelerate resolution, never gate or break it.
 fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
     use stemma_kg::KnowledgeStore;
     let has_kg: i64 = db
@@ -1272,6 +1289,25 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
     winners.sort_by_key(|&i| spans[i].start); // evidence reads in query order
 
     let store = stemma_kg::SqliteKnowledgeStore::new(db)?;
+    // The write-back cache's generation: the lexical index's corpus
+    // fingerprint. Without one (no receipts, unreadable store) the cache is
+    // simply off and probing proceeds exactly as before.
+    let generation = match store.cooccurrence_generation() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!(error = %e, "cooccurrence cache off: no generation");
+            None
+        }
+    };
+    if let Some(g) = &generation {
+        // Lazy invalidation at consult time: edges stamped by any other
+        // index build are dead evidence and must never answer.
+        match store.sweep_stale_cooccurrence(g) {
+            Ok(n) if n > 0 => tracing::info!(swept = n, "stale cooccurrence edges dropped"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cooccurrence sweep failed"),
+        }
+    }
     let ks: Vec<usize> = winners
         .iter()
         .map(|&i| spans[i].candidates.len().min(MAX_TUPLE_K))
@@ -1313,6 +1349,41 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
                     if ta == tb {
                         continue;
                     }
+                    // Cache first: a link verified by an earlier resolve
+                    // answers from the store with its stored citation, marked
+                    // so the trace shows which evidence was cached. A miss
+                    // only ever means "probe" — negatives are recomputed,
+                    // never cached — and a read failure is just a miss.
+                    if let Some(g) = &generation {
+                        for (ai, av) in va {
+                            for (bi, bv) in vb {
+                                if verified.contains_key(&(p, q, *ai, *bi)) {
+                                    continue;
+                                }
+                                let ka = stemma_kg::value_node_key(ta, cola, av);
+                                let kb = stemma_kg::value_node_key(tb, colb, bv);
+                                match store.cached_cooccurrence(g, &ka, &kb) {
+                                    Ok(Some(link)) => {
+                                        verified.insert(
+                                            (p, q, *ai, *bi),
+                                            format!("{}{COHERENCE_CACHED_MARKER}", link.evidence),
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "cooccurrence cache read failed");
+                                    }
+                                }
+                            }
+                        }
+                        // Every pair answered from the cache: no probe at all.
+                        if va.iter().all(|(ai, _)| {
+                            vb.iter()
+                                .all(|(bi, _)| verified.contains_key(&(p, q, *ai, *bi)))
+                        }) {
+                            continue;
+                        }
+                    }
                     let key = (ta.clone(), tb.clone());
                     if !path_cache.contains_key(&key) {
                         let paths =
@@ -1322,8 +1393,7 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
                     let vals_a: Vec<String> = va.iter().map(|(_, v)| v.clone()).collect();
                     let vals_b: Vec<String> = vb.iter().map(|(_, v)| v.clone()).collect();
                     for path in &path_cache[&key] {
-                        let links =
-                            probe_value_links(db, path, cola, &vals_a, colb, &vals_b)?;
+                        let links = probe_value_links(db, path, cola, &vals_a, colb, &vals_b)?;
                         for (ai, av) in va {
                             for (bi, bv) in vb {
                                 if verified.contains_key(&(p, q, *ai, *bi)) {
@@ -1331,16 +1401,31 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
                                 }
                                 let lk = (av.to_lowercase(), bv.to_lowercase());
                                 if let Some(&(ar, br)) = links.get(&lk) {
-                                    verified.insert(
-                                        (p, q, *ai, *bi),
-                                        render_kg_path(path, ta, ar, br),
-                                    );
+                                    let evidence = render_kg_path(path, ta, ar, br);
+                                    // The part that compounds: persist the
+                                    // verified link so the next resolve is a
+                                    // lookup. Best-effort — a write failure
+                                    // costs a future probe, nothing else.
+                                    if let Some(g) = &generation {
+                                        if let Err(e) = store.record_cooccurrence(
+                                            g,
+                                            (&stemma_kg::value_node_key(ta, cola, av), av),
+                                            (&stemma_kg::value_node_key(tb, colb, bv), bv),
+                                            ar,
+                                            br,
+                                            &evidence,
+                                        ) {
+                                            tracing::warn!(error = %e, "cooccurrence write-back failed");
+                                        }
+                                    }
+                                    verified.insert((p, q, *ai, *bi), evidence);
                                 }
                             }
                         }
                         // Later paths can only add pairs this one missed.
                         if va.iter().all(|(ai, _)| {
-                            vb.iter().all(|(bi, _)| verified.contains_key(&(p, q, *ai, *bi)))
+                            vb.iter()
+                                .all(|(bi, _)| verified.contains_key(&(p, q, *ai, *bi)))
                         }) {
                             break;
                         }
@@ -3338,6 +3423,174 @@ mod tests {
         let state = &mention("Calderon").candidates[0];
         assert_eq!((state.table.as_str(), state.column.as_str()), ("buyers", "state"));
         assert_eq!(state.coherence.as_deref(), Some(evidence));
+    }
+
+    /// The winning candidate's coherence annotation for one mention, from a
+    /// finished trace — the string reviewers see in the trajectory.
+    fn coherence_of(trace: &Trace, text: &str) -> Option<String> {
+        trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == text)
+            .and_then(|s| s.candidates[0].coherence.clone())
+    }
+
+    /// The part that compounds: the first resolve probes the user database
+    /// and persists each verified link as a generation-stamped `cooccurs`
+    /// edge; the second resolve answers from the store. The user-side join
+    /// table is dropped between the two, so any attempt to re-probe would
+    /// error — the cached edge alone must carry the evidence, byte-identical
+    /// to the fresh citation apart from the marker that tells reviewers it
+    /// came from the cache.
+    #[test]
+    fn verified_links_write_back_and_answer_without_reprobing() {
+        let db = wide_value_db("cachewb");
+        stemma_kg::compile(&db, false).unwrap();
+        let query = "shipments from Fairview to Calderon";
+        let trace = resolve_lexical(&db, query).unwrap();
+        let fresh = coherence_of(&trace, "Fairview").expect("fresh probe evidence");
+        assert!(
+            !fresh.contains(COHERENCE_CACHED_MARKER),
+            "a fresh probe must not be marked cached: {fresh:?}"
+        );
+
+        // The verified link is persisted: value-level nodes joined by a
+        // cooccurs edge citing the rows that carry the link, stamped with
+        // the current generation.
+        let store = stemma_kg::SqliteKnowledgeStore::new(&db).unwrap();
+        let generation = store.cooccurrence_generation().unwrap();
+        let link = store
+            .cached_cooccurrence(
+                &generation,
+                &stemma_kg::value_node_key("warehouses", "city", "Fairview"),
+                &stemma_kg::value_node_key("buyers", "state", "Calderon"),
+            )
+            .unwrap()
+            .expect("the verified link must be written back");
+        assert_eq!((link.src_rowid, link.dst_rowid), (40, 40));
+        assert_eq!(link.evidence, fresh);
+        drop(store);
+        drop(db);
+
+        // Re-probing is now impossible: the join table is gone.
+        let dir =
+            std::env::temp_dir().join(format!("stemma-resolve-{}-cachewb", std::process::id()));
+        stemmadb::rusqlite::Connection::open(dir.join("user.db"))
+            .unwrap()
+            .execute("DROP TABLE shipments", [])
+            .unwrap();
+        let db = StemmaDb::open(&dir.join("user.stemmadb"), &dir.join("user.db")).unwrap();
+        let trace = resolve_lexical(&db, query).unwrap();
+        let cached = coherence_of(&trace, "Fairview").expect("cache-served evidence");
+        assert_eq!(cached, format!("{fresh}{COHERENCE_CACHED_MARKER}"));
+        // Both partners of the pair carry the same cached citation.
+        assert_eq!(coherence_of(&trace, "Calderon"), Some(cached));
+    }
+
+    /// Invalidation law: cached edges are tied to the lexical index
+    /// generation. After the underlying data changes and the index is
+    /// rebuilt, the old edge is treated as absent and swept lazily — serving
+    /// it would fabricate coherence for a link the data no longer contains.
+    #[test]
+    fn rebuilt_index_never_serves_stale_cooccurrence() {
+        let db = wide_value_db("cachegen");
+        stemma_kg::compile(&db, false).unwrap();
+        let query = "shipments from Fairview to Calderon";
+        let trace = resolve_lexical(&db, query).unwrap();
+        assert!(coherence_of(&trace, "Fairview").is_some());
+        let g1 = stemma_kg::SqliteKnowledgeStore::new(&db)
+            .unwrap()
+            .cooccurrence_generation()
+            .unwrap();
+        drop(db);
+
+        // The linking shipment disappears, and a text-bearing table changes
+        // so the rebuilt index carries a new corpus fingerprint.
+        let dir =
+            std::env::temp_dir().join(format!("stemma-resolve-{}-cachegen", std::process::id()));
+        stemmadb::rusqlite::Connection::open(dir.join("user.db"))
+            .unwrap()
+            .execute_batch(
+                "DELETE FROM shipments;
+                 INSERT INTO warehouses (id, city) VALUES (41, 'Elmwood');",
+            )
+            .unwrap();
+        let db = StemmaDb::open(&dir.join("user.stemmadb"), &dir.join("user.db")).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        let store = stemma_kg::SqliteKnowledgeStore::new(&db).unwrap();
+        let g2 = store.cooccurrence_generation().unwrap();
+        assert_ne!(g1, g2, "changed data must move the generation");
+        // The old-generation edge never answers under the new generation...
+        assert!(store
+            .cached_cooccurrence(
+                &g2,
+                &stemma_kg::value_node_key("warehouses", "city", "Fairview"),
+                &stemma_kg::value_node_key("buyers", "state", "Calderon"),
+            )
+            .unwrap()
+            .is_none());
+
+        let trace = resolve_lexical(&db, query).unwrap();
+        // ...the probe honestly finds nothing (the link is gone)...
+        assert!(
+            coherence_of(&trace, "Fairview").is_none(),
+            "stale co-occurrence evidence must never be served"
+        );
+        // ...and consulting the cache swept the stale edge.
+        let stale: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM kg_edges
+                 WHERE kind = 'cooccurs'
+                   AND json_extract(props, '$.method') = 'probe_verified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "mismatched-generation edges are deleted lazily");
+    }
+
+    /// Negative results are never written: a "no" is cheap to recompute and
+    /// lethal to cache — the store may propose links, never exclude them.
+    #[test]
+    fn negative_probe_results_are_not_written_back() {
+        let mut ddl = String::from(
+            "CREATE TABLE warehouses (id INTEGER PRIMARY KEY, city TEXT);
+             CREATE TABLE buyers (id INTEGER PRIMARY KEY, state TEXT);
+             CREATE TABLE shipments (
+                 id INTEGER PRIMARY KEY,
+                 warehouse_id INTEGER REFERENCES warehouses(id),
+                 buyer_id INTEGER REFERENCES buyers(id));",
+        );
+        for i in 1..=40 {
+            ddl.push_str(&format!(
+                "INSERT INTO warehouses (id, city) VALUES ({i}, 'Fairview');
+                 INSERT INTO buyers (id, state) VALUES ({i}, 'Calderon');"
+            ));
+        }
+        // No shipment joins the readings: the probe runs and finds nothing.
+        let db = custom_db("cacheneg", &ddl);
+        stemma_kg::compile(&db, false).unwrap();
+        let trace = resolve_lexical(&db, "shipments from Fairview to Calderon").unwrap();
+        let fairview = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Fairview")
+            .expect("Fairview mention");
+        assert!(fairview.candidates[0].coherence.is_none());
+        let written: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM kg_edges
+                 WHERE kind = 'cooccurs'
+                   AND json_extract(props, '$.method') = 'probe_verified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(written, 0, "negatives must not be cached");
     }
 
     /// Two readings of one value that are tied on score and far apart in
