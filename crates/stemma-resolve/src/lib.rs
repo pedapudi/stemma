@@ -30,9 +30,14 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Spans shorter than this (in chars) are not looked up: the trigram index
-/// needs 3+ chars, and 1–2 char mentions are noise.
-const MIN_SPAN_CHARS: usize = 3;
+/// The trigram channel needs 3+ chars to form a single trigram — a fact
+/// about that index, not about mentions. It used to be enforced at span
+/// enumeration (as MIN_SPAN_CHARS), which silently made it a mention-
+/// admission rule: `CA` was dropped before ANY channel could run, though
+/// exact and bm25 handle two-char strings fine (issue #12). The floor now
+/// lives where the constraint does — the trigram channel self-skips
+/// shorter spans; enumeration admits them.
+const TRIGRAM_MIN_CHARS: usize = 3;
 /// Longest mention considered, in tokens.
 const MAX_SPAN_TOKENS: usize = 4;
 /// Candidates fetched per channel per span.
@@ -254,9 +259,11 @@ pub fn resolve(
     resolve_full(db, query, embedder, None)
 }
 
-/// Resolve `query` with every available channel plus the LM adjudication
-/// band. Like the embedder, the LM is optional and fallible: absent or down,
-/// the trace is exactly what [`resolve`] would have produced.
+/// Resolve `query` with every available channel plus the LM bands: the
+/// alias pass (decoder-proposed surface forms for spans the index could not
+/// reach, index-verified) and the adjudication band. Like the embedder, the
+/// LM is optional and fallible: absent or down, the trace is exactly what
+/// [`resolve`] would have produced.
 pub fn resolve_full(
     db: &StemmaDb,
     query: &str,
@@ -407,6 +414,15 @@ pub fn resolve_full(
         } else if span.candidates[0].score < SELECT_THRESHOLD {
             span.status = "weak".into();
         }
+    }
+
+    // Phase 3b: the alias pass — for spans every channel failed, the decoder
+    // proposes alternative surface forms and the index verifies them through
+    // the same lexical channels. Runs before the coherence/affinity passes
+    // and selection so verified alias readings compete like any candidate.
+    // Absent LM = pass silently absent, exactly like dense without embedder.
+    if let Some(lm) = lm {
+        apply_alias_pass(db, lm, query, &mut spans, full_span_id);
     }
 
     // Phase 4: collective disambiguation — candidates of the provisional
@@ -660,8 +676,11 @@ fn make_token(query: &str, start: usize, end: usize) -> Token {
     }
 }
 
-/// All n-grams up to MAX_SPAN_TOKENS. Spans that are stopword-only or too
-/// short are kept in the trace as "skipped" so the UI can show them greyed.
+/// All n-grams up to MAX_SPAN_TOKENS. Spans that are stopword-only are kept
+/// in the trace as "skipped" so the UI can show them greyed. Length is NOT
+/// an admission criterion: short spans (`CA`) enumerate and run through
+/// every channel that can handle them — only trigram self-skips (see
+/// [`TRIGRAM_MIN_CHARS`]).
 fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
     let mut spans = Vec::new();
     for i in 0..tokens.len() {
@@ -670,7 +689,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
             let end = tokens[i + n - 1].end;
             let text = query[start..end].to_string();
             let all_stop = tokens[i..i + n].iter().all(|t| t.stopword);
-            let status = if all_stop || text.chars().count() < MIN_SPAN_CHARS {
+            let status = if all_stop {
                 "skipped"
             } else {
                 "selected" // provisional; refined after candidate gathering
@@ -784,9 +803,14 @@ fn gather_lexical_hits(
 
     // Jobs in span order, bm25 before trigram within a span, so extending
     // per-span hit lists in job order reproduces the serial channel order.
+    // Trigram self-skips spans too short to form a trigram — the channel's
+    // own constraint, applied by the channel (see [`TRIGRAM_MIN_CHARS`]).
     let mut jobs: Vec<FtsJob> = Vec::new();
     for s in &live {
         for (channel, fts_table) in [("bm25", "lex_fts"), ("trigram", "lex_trigram")] {
+            if channel == "trigram" && s.text.chars().count() < TRIGRAM_MIN_CHARS {
+                continue;
+            }
             jobs.push(FtsJob {
                 span_id: s.id,
                 text: s.text.clone(),
@@ -1015,8 +1039,8 @@ fn fts_channel_hits(
         );
         let rows = match rows {
             Ok(rows) => rows,
-            // Spans under 3 chars (or odd tokenizations) can make a trigram
-            // query legitimately unmatchable — treat as zero hits.
+            // Odd tokenizations can make an FTS query legitimately
+            // unmatchable — treat as zero hits.
             Err(_) => return Ok(hits),
         };
         // Competition ranking on the channel-native score: entries with an
@@ -1323,7 +1347,7 @@ fn apply_context_coherence(
     let mut context: Vec<String> = tokens
         .iter()
         .filter(|t| t.end <= span_start || t.start >= span_end)
-        .filter(|t| !t.stopword && t.text.chars().count() >= MIN_SPAN_CHARS)
+        .filter(|t| !t.stopword && t.text.chars().count() >= 3)
         .map(|t| t.text.to_lowercase())
         .collect();
     context.sort();
@@ -1989,6 +2013,303 @@ fn render_kg_path(
 }
 
 // ===========================================================================
+// The alias pass — the decoder proposes surface forms, the index verifies.
+// Self-contained.
+//
+// Every lexical channel requires overlap with the stored value: exact needs
+// equality, bm25 a shared token, trigram a shared substring. A mention that
+// names a real value by a different surface form — `CA` for 'California',
+// `NYC` for 'New York' — is unreachable no matter how good the ranking
+// downstream is (issue #12). The decoder already configured for adjudication
+// knows these equivalences without being asked; what keeps using it safe is
+// the discipline stemma already has: nothing becomes a candidate without
+// being grounded in a real stored value. So the decoder never introduces a
+// value — it proposes STRINGS TO LOOK UP, and each proposal re-enters the
+// existing channels (exact/bm25/trigram) against the store. A hallucinated
+// proposal matches nothing in lex_values and is discarded silently.
+//
+// Bounds, all structural: the pass fires only on spans the index failed
+// (status no_candidates/weak after the lexical+dense phases — spans that
+// resolved cost nothing); one LM call per failing span, no retries beyond
+// the LM client's own; at most TOP_K proposals per call (the same cap that
+// bounds selected readings and the adjudication listing).
+//
+// Scoring law: alias-derived candidates are decoder-proposed and
+// index-verified — they enter and rank by the verified lexical evidence,
+// scored by fuse's own non-exact law over the PROPOSAL (RRF base over the
+// channels that verified it, length affinity of proposal against value),
+// and capped at COHERENCE_CAP: the exact channel's 0.9 saturation floor is
+// for mentions that exactly matched, and this mention did not — the alias
+// did. A fully corroborated alias (exact+bm25+trigram at rank 0) reaches
+// the cap and is selectable on an otherwise empty span; on a span with
+// direct evidence it competes by score like every other candidate, and an
+// expansion verifying against two real values is the ambiguity machinery's
+// case, not this pass's.
+//
+// Provenance: every verified hit is recorded on the ORIGINAL span's
+// candidate as a channel entry named "alias:{proposed form}", rank/raw
+// mirroring how the underlying channel scored the proposal — the trace
+// shows exactly what the decoder contributed (users.state = 'California'
+// arrived via `CA` proposing "California"), and nothing here ever counts
+// as the "exact" channel downstream (is_ambiguous, fuse's has_exact).
+// ===========================================================================
+
+/// Prefix of the channel entries carrying decoder-proposed, index-verified
+/// evidence; the proposed surface form follows the colon.
+const ALIAS_CHANNEL_PREFIX: &str = "alias:";
+
+/// Span statuses the alias pass fires on: the index failed here.
+fn alias_pass_fires(status: &str) -> bool {
+    status == "no_candidates" || status == "weak"
+}
+
+/// The alias pass. Infallible by design: LM failure, an unusable reply, or
+/// a proposal that matches nothing all degrade to a no-op for that span.
+fn apply_alias_pass(
+    db: &StemmaDb,
+    lm: &dyn stemma_lm::LmBackend,
+    query: &str,
+    spans: &mut [Span],
+    full_span_id: Option<usize>,
+) {
+    for span in spans.iter_mut() {
+        // The synthetic full-query span is the dense channel's probe unit,
+        // not a mention; aliasing an entire query is not a lookup.
+        if Some(span.id) == full_span_id || !alias_pass_fires(&span.status) {
+            continue;
+        }
+        let (messages, schema) = alias_prompt(query, &span.text);
+        // ONE call per failing span; the only retries are the LM client's.
+        let reply = match lm.chat(&messages, Some(&schema)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, span = %span.text, "alias pass degraded");
+                continue;
+            }
+        };
+        let Some(proposals) = parse_aliases(&reply, &span.text) else {
+            tracing::warn!(span = %span.text, "alias reply unusable; ignored");
+            continue;
+        };
+        let mut touched = false;
+        for proposal in proposals {
+            let hits = match alias_verify(db, &proposal) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(error = %e, proposal = %proposal, "alias lookup failed");
+                    continue;
+                }
+            };
+            // A proposal matching nothing vanishes silently — the index is
+            // the referee, and it said no.
+            if hits.is_empty() {
+                continue;
+            }
+            merge_alias_hits(span, &proposal, hits);
+            touched = true;
+        }
+        if touched {
+            span.candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+            // Re-judge the span on what verification added; selection later
+            // arbitrates overlap exactly as for any provisionally selected
+            // span.
+            span.status = if span.candidates[0].score >= SELECT_THRESHOLD {
+                "selected".into()
+            } else {
+                "weak".into()
+            };
+        }
+    }
+}
+
+/// Terse, deterministic prompt in the adjudication band's mold: the mention
+/// in its query, and a schema that bounds the reply to at most [`TOP_K`]
+/// strings. The system prompt states the contract — propose strings to look
+/// up, never answers; everything is verified against the store.
+fn alias_prompt(query: &str, span: &str) -> (Vec<stemma_lm::ChatMessage>, serde_json::Value) {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "aliases": {
+                "type": "array",
+                "items": { "type": "string" },
+                "maxItems": TOP_K,
+            }
+        },
+        "required": ["aliases"],
+        "additionalProperties": false,
+    });
+    let messages = vec![
+        stemma_lm::ChatMessage::system(
+            "You expand database mentions into alternative surface forms. \
+             Given a mention from a query over a database, propose surface \
+             forms the same referent might be stored under — expansions of \
+             abbreviations, full names, official names, exonyms. Propose \
+             strings to look up, not answers: every proposal is checked \
+             against the stored data and silently discarded if absent. Do \
+             not repeat the mention itself; reply with an empty list for a \
+             mention you do not recognize.",
+        ),
+        stemma_lm::ChatMessage::user(format!(
+            "Query: {query}\nMention: {span:?}\nPropose up to {TOP_K} surface forms."
+        )),
+    ];
+    (messages, schema)
+}
+
+/// Parse `{"aliases": [...]}`; normalize (trim, drop empties), drop
+/// proposals that are the mention itself (nothing new to look up), dedup
+/// case-insensitively, and bound at [`TOP_K`] whether or not the backend
+/// honored `maxItems`.
+fn parse_aliases(reply: &str, span: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
+    let arr = v.get("aliases")?.as_array()?;
+    let norm = |s: &str| s.trim().to_lowercase();
+    let span_norm = norm(span);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for x in arr {
+        let Some(s) = x.as_str() else { continue };
+        let s = s.trim();
+        if s.is_empty() || norm(s) == span_norm || !seen.insert(norm(s)) {
+            continue;
+        }
+        out.push(s.to_string());
+        if out.len() == TOP_K {
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// One proposal through the existing lexical channels, unchanged: exact and
+/// bm25 always, trigram when the proposal can form a trigram. Returns the
+/// raw hits exactly as a direct span lookup would.
+fn alias_verify(db: &StemmaDb, proposal: &str) -> Result<Vec<RawHit>> {
+    let conn = db.conn();
+    let mut samples = std::collections::HashMap::new();
+    let mut hits = exact_channel_hits(conn, proposal, &mut samples)?;
+    hits.extend(fts_channel_hits(
+        conn,
+        proposal,
+        "bm25",
+        "lex_fts",
+        &mut samples,
+    )?);
+    if proposal.chars().count() >= TRIGRAM_MIN_CHARS {
+        hits.extend(fts_channel_hits(
+            conn,
+            proposal,
+            "trigram",
+            "lex_trigram",
+            &mut samples,
+        )?);
+    }
+    Ok(hits)
+}
+
+/// Folds one proposal's verified hits into the span's candidates. Hits are
+/// grouped by interpretation exactly as fuse groups them; each group scores
+/// by fuse's non-exact law over the proposal and is capped at
+/// [`COHERENCE_CAP`] — never the exact band. An existing candidate (direct
+/// evidence, or an earlier proposal reaching the same reading) keeps its
+/// identity: alias evidence is appended and the score takes the max.
+fn merge_alias_hits(span: &mut Span, proposal: &str, hits: Vec<RawHit>) {
+    use std::collections::BTreeMap;
+    struct Group {
+        channels: Vec<ChannelScore>,
+        value: String,
+        is_doc: bool,
+        snippet: Option<String>,
+        row_count: u32,
+        sample_rowids: Vec<i64>,
+        rrf: f64,
+    }
+    let mut grouped: BTreeMap<(String, String, i64), Group> = BTreeMap::new();
+    for h in hits {
+        let entry = grouped
+            .entry((h.table.clone(), h.column.clone(), h.rowid))
+            .or_insert_with(|| Group {
+                channels: Vec::new(),
+                value: h.value.clone(),
+                is_doc: h.is_doc,
+                snippet: None,
+                row_count: h.row_count,
+                sample_rowids: h.sample_rowids.clone(),
+                rrf: 0.0,
+            });
+        entry.is_doc |= h.is_doc;
+        if entry.snippet.is_none() {
+            entry.snippet = h.snippet.clone();
+        }
+        entry.row_count = entry.row_count.max(h.row_count);
+        if h.sample_rowids.len() > entry.sample_rowids.len() {
+            entry.sample_rowids = h.sample_rowids.clone();
+        }
+        entry.rrf += 1.0 / (RRF_K + h.rank as f64);
+        // The provenance-carrying entry: named for the alias channel and the
+        // proposed form, rank/raw mirroring the underlying channel's scoring
+        // of the proposal. Never named "exact" — nothing downstream may
+        // treat an alias-verified match as the user typing the stored value.
+        entry.channels.push(ChannelScore {
+            channel: format!("{ALIAS_CHANNEL_PREFIX}{proposal}"),
+            rank: h.rank,
+            raw: h.raw,
+        });
+    }
+
+    let prop_len = proposal.chars().count() as f64;
+    for ((table, column, rowid), g) in grouped {
+        let base = (g.rrf / (3.0 / RRF_K)).min(1.0);
+        let lexical = if g.is_doc {
+            (base * 0.85).min(0.85)
+        } else {
+            let affinity = (prop_len / (g.value.chars().count() as f64).max(prop_len)).sqrt();
+            (base * (0.4 + 0.6 * affinity)).min(1.0)
+        };
+        // Verified or not, the mention itself matched nothing exactly:
+        // alias evidence never enters the exact band.
+        let score = lexical.min(COHERENCE_CAP);
+
+        if let Some(c) = span
+            .candidates
+            .iter_mut()
+            .find(|c| c.table == table && c.column == column && c.rowid == rowid)
+        {
+            c.channels.extend(g.channels);
+            c.score = c.score.max(score);
+            continue;
+        }
+        let (value, value_truncated) = truncate_value(&g.value);
+        span.candidates.push(Candidate {
+            table,
+            column,
+            rowid,
+            value,
+            value_truncated,
+            score,
+            channels: g.channels,
+            selected: false,
+            reject_reason: None,
+            is_doc: g.is_doc,
+            snippet: g.snippet,
+            adjudicated: false,
+            coherence: None,
+            row_count: g.row_count.max(1),
+            dense_confidence: None,
+            sample_rowids: if g.sample_rowids.is_empty() {
+                vec![rowid]
+            } else {
+                g.sample_rowids
+            },
+            reach: 0,
+        });
+    }
+}
+
+// ========================== end alias-pass section =========================
+
+// ===========================================================================
 // Context affinity over interpretation cards (vec_interp) — self-contained.
 //
 // Motivation: on relational corpora the dense channel is inert (no column
@@ -2421,9 +2742,12 @@ fn dense_geometry(db: &StemmaDb) -> Option<(f64, f64)> {
     }
 }
 
+/// Reciprocal-rank fusion constant, shared by [`fuse`] and the alias pass
+/// (which mirrors fuse's non-exact scoring law over verified alias hits).
+const RRF_K: f64 = 4.0;
+
 fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Candidate> {
     use std::collections::BTreeMap;
-    const RRF_K: f64 = 4.0;
 
     struct Group {
         channels: Vec<ChannelScore>,
@@ -4225,6 +4549,418 @@ mod tests {
         adjudicate(&mut trace, &lm);
         assert_eq!(trace.spans[0].candidates[0].rowid, 1);
         assert_eq!(trace.spans[0].status, "selected");
+    }
+
+    // ---------------------- alias-pass section tests ----------------------
+
+    /// Fake decoder for the alias pass: replies to alias-schema calls with
+    /// the canned proposals for the mention named in the prompt (empty list
+    /// for unknown mentions — the honest "I don't recognize this"), and
+    /// fails every other call, so adjudication degrades to fusion's order.
+    /// Counts alias calls so the one-call-per-failing-span bound is
+    /// checkable.
+    struct SurfaceFormLm {
+        proposals: std::collections::HashMap<String, Vec<String>>,
+        alias_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SurfaceFormLm {
+        fn proposing(map: &[(&str, &[&str])]) -> Self {
+            Self {
+                proposals: map
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+                    .collect(),
+                alias_calls: 0.into(),
+            }
+        }
+        fn alias_calls(&self) -> usize {
+            self.alias_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn mention_of(messages: &[stemma_lm::ChatMessage]) -> Option<String> {
+            messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")?
+                .content
+                .lines()
+                .find_map(|l| l.strip_prefix("Mention: "))
+                .and_then(|quoted| serde_json::from_str::<String>(quoted).ok())
+        }
+    }
+
+    impl stemma_lm::LmBackend for SurfaceFormLm {
+        fn chat(
+            &self,
+            messages: &[stemma_lm::ChatMessage],
+            schema: Option<&serde_json::Value>,
+        ) -> stemma_lm::Result<String> {
+            let is_alias = schema
+                .and_then(|s| s.pointer("/properties/aliases"))
+                .is_some();
+            if !is_alias {
+                return Err(stemma_lm::Error::Http(
+                    "no adjudication in this fake".into(),
+                ));
+            }
+            self.alias_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let aliases = Self::mention_of(messages)
+                .and_then(|m| self.proposals.get(&m).cloned())
+                .unwrap_or_default();
+            Ok(serde_json::json!({ "aliases": aliases }).to_string())
+        }
+        fn native_structured_output(&self) -> bool {
+            true
+        }
+        fn identity(&self) -> stemma_lm::LmIdentity {
+            stemma_lm::LmIdentity {
+                backend: "fake".into(),
+                model: "surface-form".into(),
+            }
+        }
+    }
+
+    /// The issue-#12 `CA` corpus: the value the mention denotes exists only
+    /// under a different surface form.
+    fn ca_db(tag: &str, with_canada: bool) -> StemmaDb {
+        let mut ddl = String::from(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+                                 state TEXT NOT NULL);",
+        );
+        for name in ["Priya", "Marcus", "Elena", "Jordan"] {
+            ddl.push_str(&format!(
+                "INSERT INTO users (first_name, state) VALUES ('{name}', 'California');"
+            ));
+        }
+        ddl.push_str(
+            "INSERT INTO users (first_name, state) VALUES
+                 ('Tomas', 'Oregon'), ('Nadia', 'Texas');",
+        );
+        if with_canada {
+            ddl.push_str(
+                "CREATE TABLE suppliers (id INTEGER PRIMARY KEY, country TEXT NOT NULL);
+                 INSERT INTO suppliers (country) VALUES
+                     ('Canada'), ('Canada'), ('Canada'), ('Peru');",
+            );
+        }
+        custom_db(tag, &ddl)
+    }
+
+    /// The floor moved: a two-char span enumerates and reaches the channels
+    /// that can handle it — exact and bm25 fire, trigram self-skips — while
+    /// stopword-only spans stay skipped.
+    #[test]
+    fn short_span_survives_enumeration_and_reaches_exact_and_bm25() {
+        let db = custom_db(
+            "shortspan",
+            "CREATE TABLE codes (id INTEGER PRIMARY KEY, state_code TEXT NOT NULL);
+             INSERT INTO codes (state_code) VALUES ('CA'), ('NY'), ('TX');",
+        );
+        let trace = resolve_lexical(&db, "how many sites in CA").unwrap();
+        let span = trace
+            .spans
+            .iter()
+            .find(|s| s.text == "CA")
+            .expect("the two-char span must enumerate");
+        assert_ne!(span.status, "skipped", "length is not a mention criterion");
+        let top = &span.candidates[0];
+        assert_eq!((top.table.as_str(), top.value.as_str()), ("codes", "CA"));
+        assert!(
+            top.channels.iter().any(|ch| ch.channel == "exact"),
+            "exact handles two-char strings fine"
+        );
+        assert!(
+            top.channels.iter().any(|ch| ch.channel == "bm25"),
+            "so does bm25"
+        );
+        assert!(top.score >= 0.9, "a direct exact match keeps its floor");
+        assert!(
+            span.candidates
+                .iter()
+                .all(|c| c.channels.iter().all(|ch| ch.channel != "trigram")),
+            "trigram self-skips below {TRIGRAM_MIN_CHARS} chars"
+        );
+        // The stopword floor is untouched.
+        let in_span = trace.spans.iter().find(|s| s.text == "in").unwrap();
+        assert_eq!(in_span.status, "skipped");
+    }
+
+    /// Measured failure (1): "how many users in CA" — `CA` names 'California'
+    /// and no channel can reach it. The decoder proposes, the index
+    /// verifies, and the trace shows exactly what the decoder contributed.
+    #[test]
+    fn alias_pass_resolves_ca_to_california_with_provenance() {
+        let db = ca_db("aliasca", false);
+        let lm = SurfaceFormLm::proposing(&[("CA", &["California"])]);
+        let trace = resolve_full(&db, "how many users in CA", None, Some(&lm)).unwrap();
+        assert!(lm.alias_calls() >= 1);
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "CA")
+            .expect("the alias-resolved span must become a mention");
+        assert_eq!(span.status, "selected");
+        let top = &span.candidates[0];
+        assert_eq!(
+            (top.table.as_str(), top.column.as_str(), top.value.as_str()),
+            ("users", "state", "California")
+        );
+        assert!(top.selected);
+        assert_eq!(top.row_count, 4, "interpretation semantics carry over");
+        // Provenance: the alias channel names the proposed form, and the
+        // underlying exact verification is mirrored in its raw.
+        let alias: Vec<_> = top
+            .channels
+            .iter()
+            .filter(|ch| ch.channel == "alias:California")
+            .collect();
+        assert!(!alias.is_empty(), "got {:?}", top.channels);
+        assert!(
+            alias.iter().any(|ch| ch.raw == 1.0 && ch.rank == 0),
+            "the exact verification is mirrored: {alias:?}"
+        );
+        // Scoring law: verified lexical evidence ranks it, but the mention
+        // did NOT exactly match — no exact channel, no exact band.
+        assert!(top.channels.iter().all(|ch| ch.channel != "exact"));
+        assert!(top.score >= SELECT_THRESHOLD, "selectable as sole evidence");
+        assert!(
+            top.score <= COHERENCE_CAP + 1e-9,
+            "never the exact band: {}",
+            top.score
+        );
+        // The provenance survives into the Explain proto.
+        let explain = trace_to_explain_proto(&trace);
+        assert!(explain
+            .spans
+            .iter()
+            .flat_map(|s| &s.candidates)
+            .flat_map(|c| &c.channels)
+            .any(|ch| ch.channel == "alias:California"));
+    }
+
+    /// Measured failure (2): "customers from NYC" — the direct trigram hits
+    /// are wrong-brand junk, and the reading the user meant is not in the
+    /// candidate set at any rank. (The junk is stored solid, 'DKNYC'-style,
+    /// which is what lands the span in "weak"; a space-separated 'Tripp NYC'
+    /// also bm25-matches the NYC token and scores ~0.50 — "selected", i.e.
+    /// not an index failure by the pipeline's own law, so out of the pass's
+    /// firing set by design.) The alias pass adds the correct reading and
+    /// the evidence reorders the span.
+    #[test]
+    fn alias_pass_gains_the_new_york_reading_over_brand_junk() {
+        let ddl = "CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT NOT NULL,
+                                       state TEXT NOT NULL);
+             INSERT INTO users (first_name, state) VALUES
+                 ('Ada', 'New York'), ('Bea', 'New York'), ('Cal', 'New York'),
+                 ('Dev', 'New York'), ('Eli', 'Ohio');
+             CREATE TABLE inventory_items (id INTEGER PRIMARY KEY,
+                                           product_brand TEXT NOT NULL);
+             INSERT INTO inventory_items (product_brand) VALUES
+                 ('DKNYC'), ('DKNYC'), ('Zephyr');
+             CREATE TABLE products (id INTEGER PRIMARY KEY, brand TEXT NOT NULL);
+             INSERT INTO products (brand) VALUES ('DKNYC'), ('Zephyr');";
+
+        // Without the pass: confident junk, and the meant reading is
+        // unreachable at any rank — the measured failure shape.
+        let db = custom_db("aliasnycbase", ddl);
+        let trace = resolve_lexical(&db, "customers from NYC").unwrap();
+        let span = trace.spans.iter().find(|s| s.text == "NYC").unwrap();
+        assert_eq!(span.status, "weak");
+        assert!(span.candidates.iter().all(|c| c.table != "users"));
+        assert!(span.candidates[0].value.contains("DKNYC"));
+        assert!(span.candidates[0]
+            .channels
+            .iter()
+            .any(|ch| ch.channel == "trigram"));
+
+        // With it: the verified expansion enters and the evidence reorders.
+        let db = custom_db("aliasnyc", ddl);
+        let lm = SurfaceFormLm::proposing(&[("NYC", &["New York"])]);
+        let trace = resolve_full(&db, "customers from NYC", None, Some(&lm)).unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "NYC")
+            .expect("NYC must now be a mention");
+        let top = &span.candidates[0];
+        assert_eq!(
+            (top.table.as_str(), top.column.as_str(), top.value.as_str()),
+            ("users", "state", "New York")
+        );
+        assert!(top.selected);
+        assert!(top.channels.iter().any(|ch| ch.channel == "alias:New York"));
+        assert!(!span.ambiguous, "0.9 vs 0.29 junk is not a tie");
+        // The junk stays visible in the trace as honest near-misses.
+        let junk = span
+            .candidates
+            .iter()
+            .find(|c| c.value == "DKNYC")
+            .expect("direct trigram evidence stays in the trace");
+        assert!(!junk.selected);
+        assert_eq!(junk.reject_reason.as_deref(), Some("below_threshold"));
+    }
+
+    /// An expansion verifying against two real values is the CORRECT
+    /// outcome: both readings enter, and the ambiguity machinery — not the
+    /// alias pass — owns the question.
+    #[test]
+    fn ambiguous_alias_expansion_enters_both_readings_and_flags() {
+        let db = ca_db("aliasamb", true);
+        let lm = SurfaceFormLm::proposing(&[("CA", &["California", "Canada"])]);
+        let trace = resolve_full(&db, "how many users in CA", None, Some(&lm)).unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "CA")
+            .expect("CA mention");
+        let reading = |table: &str| {
+            span.candidates
+                .iter()
+                .find(|c| c.table == table)
+                .unwrap_or_else(|| panic!("{table} reading must enter"))
+        };
+        let (cal, can) = (reading("users"), reading("suppliers"));
+        assert_eq!(cal.value, "California");
+        assert_eq!(can.value, "Canada");
+        assert!(cal.selected && can.selected, "both verified readings enter");
+        assert!(
+            (cal.score - can.score).abs() < ADJUDICATION_MARGIN,
+            "equal verification, tied scores: {} vs {}",
+            cal.score,
+            can.score
+        );
+        // Each reading names the form that reached it.
+        assert!(cal
+            .channels
+            .iter()
+            .any(|ch| ch.channel == "alias:California"));
+        assert!(can.channels.iter().any(|ch| ch.channel == "alias:Canada"));
+        assert!(
+            span.ambiguous,
+            "distinct verified readings in a tie are the machinery's case"
+        );
+    }
+
+    /// A hallucinated proposal is not in lex_values and cannot survive: the
+    /// index is the referee, and silence is the whole of the failure mode.
+    #[test]
+    fn hallucinated_alias_proposals_vanish_silently() {
+        let db = ca_db("aliashalluc", false);
+        let lm = SurfaceFormLm::proposing(&[("CA", &["Gotham", "Metropolis"])]);
+        let trace = resolve_full(&db, "how many users in CA", None, Some(&lm)).unwrap();
+        assert!(lm.alias_calls() >= 1, "the pass did fire");
+        let span = trace.spans.iter().find(|s| s.text == "CA").unwrap();
+        assert_eq!(
+            span.status, "no_candidates",
+            "nothing verified, nothing enters"
+        );
+        assert!(span.candidates.is_empty());
+        assert!(
+            trace
+                .spans
+                .iter()
+                .flat_map(|s| &s.candidates)
+                .flat_map(|c| &c.channels)
+                .all(|ch| !ch.channel.starts_with(ALIAS_CHANNEL_PREFIX)),
+            "no alias evidence anywhere in the trace"
+        );
+    }
+
+    /// The bounds are structural: one call per failing span (statuses
+    /// no_candidates/weak), none for resolved, skipped, or the synthetic
+    /// full-query span, and an LM failure consumes the span's one call
+    /// without retry.
+    #[test]
+    fn alias_pass_calls_once_per_failing_span_and_skips_the_rest() {
+        let db = ca_db("aliascount", false);
+        let make_spans = || {
+            let mut resolved = span_at(0, 0, 4, "selected", vec![cand(1, "v", 0.9, &["exact"])]);
+            resolved.text = "ok".into();
+            let mut skipped = span_at(1, 5, 7, "skipped", Vec::new());
+            skipped.text = "in".into();
+            let mut empty = span_at(2, 8, 10, "no_candidates", Vec::new());
+            empty.text = "CA".into();
+            let mut weak = {
+                let mut c = cand(9, "junk", 0.2, &["trigram"]);
+                c.selected = false;
+                span_at(3, 11, 14, "weak", vec![c])
+            };
+            weak.text = "NYC".into();
+            vec![resolved, skipped, empty, weak]
+        };
+
+        let lm = SurfaceFormLm::proposing(&[("CA", &["California"])]);
+        let mut spans = make_spans();
+        apply_alias_pass(&db, &lm, "q", &mut spans, None);
+        assert_eq!(lm.alias_calls(), 2, "exactly the two failing spans");
+        assert_eq!(
+            spans[2].status, "selected",
+            "verified alias admits the span"
+        );
+        assert_eq!(spans[2].candidates[0].value, "California");
+        assert_eq!(
+            spans[3].status, "weak",
+            "empty proposal list changes nothing"
+        );
+
+        // The synthetic full-query span never fires.
+        let lm = SurfaceFormLm::proposing(&[("CA", &["California"])]);
+        let mut spans = make_spans();
+        apply_alias_pass(&db, &lm, "q", &mut spans, Some(2));
+        assert_eq!(
+            lm.alias_calls(),
+            1,
+            "span 2 excluded as the full-query span"
+        );
+
+        // A down LM: one attempt per failing span, no retries, no changes.
+        let lm = FakeLm::failing();
+        let mut spans = make_spans();
+        let before = serde_json::to_value(&spans).unwrap();
+        apply_alias_pass(&db, &lm, "q", &mut spans, None);
+        assert_eq!(lm.calls(), 2, "one attempt each, no retry of our own");
+        assert_eq!(serde_json::to_value(&spans).unwrap(), before);
+    }
+
+    /// Proposal hygiene: trimmed, deduped case-insensitively, never the
+    /// mention itself, bounded at TOP_K even when the backend ignores
+    /// maxItems.
+    #[test]
+    fn alias_proposals_are_normalized_and_bounded() {
+        let reply = r#"{"aliases": ["California", " california ", "CA", "",
+                        "Canada", "x1", "x2", "x3", "x4"]}"#;
+        assert_eq!(
+            parse_aliases(reply, "CA").unwrap(),
+            vec!["California", "Canada", "x1", "x2", "x3"],
+            "self and duplicates dropped, TOP_K bound enforced"
+        );
+        assert!(parse_aliases("not json", "CA").is_none());
+        assert!(parse_aliases(r#"{"other": []}"#, "CA").is_none());
+    }
+
+    /// Degradation law: no LM configured means the pass is silently absent —
+    /// exactly like the dense channel without an embedder — and a down LM
+    /// leaves the trace byte-identical to the no-LM trace.
+    #[test]
+    fn alias_pass_absent_without_lm_and_degrades_when_down() {
+        let db = ca_db("aliasdown", false);
+        let query = "how many users in CA";
+        let plain = resolve(&db, query, None).unwrap();
+        let span = plain.spans.iter().find(|s| s.text == "CA").unwrap();
+        assert_eq!(span.status, "no_candidates", "no LM, no pass, no reach");
+        let lm = FakeLm::failing();
+        let down = resolve_full(&db, query, None, Some(&lm)).unwrap();
+        assert!(lm.calls() > 0, "the pass tried");
+        assert_eq!(
+            serde_json::to_value(&plain.spans).unwrap(),
+            serde_json::to_value(&down.spans).unwrap(),
+            "a down LM must be a no-op"
+        );
+        assert_eq!(plain.mentions, down.mentions);
     }
 
     // ------------------- context-affinity section tests -------------------
