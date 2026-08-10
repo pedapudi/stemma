@@ -316,6 +316,195 @@ pub struct RunFile {
     pub notes: Vec<String>,
 }
 
+// --------------------------------------------------------- pass checkpoints --
+
+/// One completed ablation pass, persisted the moment its question loop
+/// finishes — the same receipts discipline the stores keep, applied to the
+/// run itself. A kill between passes costs at most one pass, not the sweep.
+/// Checkpoints are scaffolding, not artifacts: a completed run deletes its
+/// own, and the run JSON stays the record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PassCheckpoint {
+    pub corpus: String,
+    /// FNV-1a 64 of the dataset file bytes, first 8 hex chars.
+    pub dataset_hash: String,
+    pub git_rev: String,
+    pub ablation: String,
+    /// The user database evaluated (canonicalized when possible).
+    pub db_path: String,
+    pub outcomes: Vec<QueryOutcome>,
+    pub backend_cost: BackendCost,
+    /// Store-prep and drain notes recorded while this pass ran, replayed
+    /// into the run file on resume so the record reads the same either way.
+    pub notes: Vec<String>,
+}
+
+/// What one executed (or resumed) pass yields to the aggregation stage.
+pub struct PassOutput {
+    pub outcomes: Vec<QueryOutcome>,
+    pub backend_cost: BackendCost,
+}
+
+/// The identity a checkpoint must match to be resumable: same dataset
+/// bytes, same code, same corpus database. Anything else re-runs the pass.
+pub struct CheckpointCtx {
+    /// `<out_dir>/.passes` — under the (gitignored) runs directory.
+    pub dir: PathBuf,
+    pub corpus: String,
+    pub dataset_hash: String,
+    pub git_rev: String,
+    pub db_path: String,
+}
+
+/// FNV-1a 64 over the dataset file bytes, truncated to 8 hex chars —
+/// change detection, not cryptography; any byte edit re-runs every pass.
+pub fn dataset_hash8(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("hashing dataset {}", path.display()))?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in &bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(format!("{h:016x}")[..8].to_string())
+}
+
+impl CheckpointCtx {
+    pub fn path_for(&self, ablation: &str) -> PathBuf {
+        self.dir.join(format!(
+            "{}-{}-{}-{}.json",
+            self.corpus, self.dataset_hash, self.git_rev, ablation
+        ))
+    }
+
+    fn matches(&self, cp: &PassCheckpoint) -> bool {
+        cp.corpus == self.corpus
+            && cp.dataset_hash == self.dataset_hash
+            && cp.git_rev == self.git_rev
+            && cp.db_path == self.db_path
+    }
+
+    /// Removes checkpoints this run can never resume: same corpus but a
+    /// different dataset hash, git_rev or database — and unparseable
+    /// leftovers. Other corpora's checkpoints are left alone.
+    pub fn sweep_stale(&self, notes: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stale = match path.extension().and_then(|e| e.to_str()) {
+                Some("tmp") => true, // a kill mid-save; never trustworthy
+                Some("json") => match std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<PassCheckpoint>(&t).ok())
+                {
+                    Some(cp) => cp.corpus == self.corpus && !self.matches(&cp),
+                    None => true, // unparseable scaffolding
+                },
+                _ => false,
+            };
+            if stale && std::fs::remove_file(&path).is_ok() {
+                notes.push(format!(
+                    "removed stale checkpoint {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    /// Loads the checkpoint for one ablation when its full identity matches.
+    pub fn load(&self, ablation: &str) -> Option<PassCheckpoint> {
+        let text = std::fs::read_to_string(self.path_for(ablation)).ok()?;
+        let cp: PassCheckpoint = serde_json::from_str(&text).ok()?;
+        (self.matches(&cp) && cp.ablation == ablation).then_some(cp)
+    }
+
+    /// Persists one completed pass atomically (write + rename), so a kill
+    /// mid-save leaves no half-checkpoint to trust.
+    pub fn save(
+        &self,
+        ablation: &str,
+        outcomes: &[QueryOutcome],
+        backend_cost: &BackendCost,
+        notes: &[String],
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating {}", self.dir.display()))?;
+        let cp = PassCheckpoint {
+            corpus: self.corpus.clone(),
+            dataset_hash: self.dataset_hash.clone(),
+            git_rev: self.git_rev.clone(),
+            ablation: ablation.to_string(),
+            db_path: self.db_path.clone(),
+            outcomes: outcomes.to_vec(),
+            backend_cost: backend_cost.clone(),
+            notes: notes.to_vec(),
+        };
+        let path = self.path_for(ablation);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(&cp)?)
+            .with_context(|| format!("writing checkpoint {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("publishing checkpoint {}", path.display()))?;
+        Ok(())
+    }
+
+    /// A completed run deletes its own scaffolding; the run JSON is the
+    /// record. The directory itself goes only when nothing else is in it.
+    pub fn clear(&self, ablations: &[String]) {
+        for ab in ablations {
+            std::fs::remove_file(self.path_for(ab)).ok();
+        }
+        std::fs::remove_dir(&self.dir).ok();
+    }
+}
+
+/// The resumable pass loop: each ablation either loads its checkpoint (with
+/// a "resumed <ablation> from checkpoint" note) or executes and checkpoints
+/// itself before the next pass starts. `exec` gets a per-pass note sink so
+/// store-prep notes travel with the checkpoint they belong to.
+pub fn execute_passes<F>(
+    ckpt: &CheckpointCtx,
+    ablations: &[Ablation],
+    notes: &mut Vec<String>,
+    mut exec: F,
+) -> anyhow::Result<Vec<(String, PassOutput)>>
+where
+    F: FnMut(&Ablation, &mut Vec<String>) -> anyhow::Result<(Vec<QueryOutcome>, BackendCost)>,
+{
+    ckpt.sweep_stale(notes);
+    let mut out = Vec::with_capacity(ablations.len());
+    for ab in ablations {
+        if let Some(cp) = ckpt.load(&ab.name) {
+            notes.push(format!("resumed {} from checkpoint", ab.name));
+            notes.extend(cp.notes);
+            out.push((
+                ab.name.clone(),
+                PassOutput {
+                    outcomes: cp.outcomes,
+                    backend_cost: cp.backend_cost,
+                },
+            ));
+            continue;
+        }
+        let mut pass_notes = Vec::new();
+        let (outcomes, backend_cost) = exec(ab, &mut pass_notes)?;
+        ckpt.save(&ab.name, &outcomes, &backend_cost, &pass_notes)?;
+        notes.append(&mut pass_notes);
+        out.push((
+            ab.name.clone(),
+            PassOutput {
+                outcomes,
+                backend_cost,
+            },
+        ));
+    }
+    Ok(out)
+}
+
 // -------------------------------------------------------------- store prep --
 
 /// Prepares (or reuses) the evaluation store for one corpus variant. The
@@ -523,11 +712,31 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
         notes: Vec::new(),
     };
 
-    // Outcomes per ablation, in sweep order, for paired statistics.
-    let mut all_outcomes: Vec<(String, Vec<QueryOutcome>)> = Vec::new();
+    // Run artifacts (and pass checkpoints) land under one directory,
+    // resolved before the sweep so an interrupted run and its resume agree.
+    let out_dir = args
+        .out_dir
+        .clone()
+        .or_else(|| cfg.eval.runs_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("eval/runs"));
 
-    for ab in &ablations {
-        let store = prepare_store(&user_db, args.store_dir.as_deref(), ab.kg, args.fresh, &mut notes)?;
+    // Pass checkpoints: the receipts discipline the stores keep, applied to
+    // the run. One file per (dataset hash, git_rev, ablation) under
+    // <out_dir>/.passes; a mid-run kill costs one pass, not the sweep.
+    let ckpt = CheckpointCtx {
+        dir: out_dir.join(".passes"),
+        corpus: corpus.clone(),
+        dataset_hash: dataset_hash8(&args.dataset)?,
+        git_rev: run_file.git_rev.clone(),
+        db_path: user_db
+            .canonicalize()
+            .unwrap_or_else(|_| user_db.clone())
+            .display()
+            .to_string(),
+    };
+
+    let results = execute_passes(&ckpt, &ablations, &mut notes, |ab, pass_notes| {
+        let store = prepare_store(&user_db, args.store_dir.as_deref(), ab.kg, args.fresh, pass_notes)?;
         let db = StemmaDb::open(&store, &user_db)?;
 
         let embedder = match (&embed_cfg, ab.dense) {
@@ -560,7 +769,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
                 )))
             }
             (None, true) => {
-                notes.push(format!(
+                pass_notes.push(format!(
                     "{}: no embedder configured; dense channel absent",
                     ab.name
                 ));
@@ -569,7 +778,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
             _ => None,
         };
         if let Some(e) = &embedder {
-            drain_embeddings(&db, e, &mut notes);
+            drain_embeddings(&db, e, pass_notes);
         }
         let lm = match (&lm_cfg, ab.lm) {
             (Some(l), true) => Some(MeteredLm::new(stemma_lm::backend_for(
@@ -578,7 +787,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
                 l.extra_body.clone(),
             ))),
             (None, true) => {
-                notes.push(format!("{}: no LM configured; adjudication absent", ab.name));
+                pass_notes.push(format!("{}: no LM configured; adjudication absent", ab.name));
                 None
             }
             _ => None,
@@ -606,26 +815,30 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
             outcomes.push(metrics::score_query(q, &trace, &mut probe, &mut full_value));
         }
 
-        run_file.backend_cost.insert(
-            ab.name.clone(),
-            BackendCost {
-                embed_calls: embedder.as_ref().map_or(0, |e| e.calls.load(Ordering::Relaxed)),
-                embed_texts: embedder.as_ref().map_or(0, |e| e.texts.load(Ordering::Relaxed)),
-                embed_ms_total: embedder
-                    .as_ref()
-                    .map_or(0.0, |e| e.total_ms.load(Ordering::Relaxed) as f64),
-                lm_calls: lm.as_ref().map_or(0, |l| l.calls.load(Ordering::Relaxed)),
-                lm_ms_mean: lm.as_ref().map_or(0.0, |l| {
-                    let calls = l.calls.load(Ordering::Relaxed);
-                    if calls == 0 {
-                        0.0
-                    } else {
-                        l.total_ms.load(Ordering::Relaxed) as f64 / calls as f64
-                    }
-                }),
-            },
-        );
-        all_outcomes.push((ab.name.clone(), outcomes));
+        let backend_cost = BackendCost {
+            embed_calls: embedder.as_ref().map_or(0, |e| e.calls.load(Ordering::Relaxed)),
+            embed_texts: embedder.as_ref().map_or(0, |e| e.texts.load(Ordering::Relaxed)),
+            embed_ms_total: embedder
+                .as_ref()
+                .map_or(0.0, |e| e.total_ms.load(Ordering::Relaxed) as f64),
+            lm_calls: lm.as_ref().map_or(0, |l| l.calls.load(Ordering::Relaxed)),
+            lm_ms_mean: lm.as_ref().map_or(0.0, |l| {
+                let calls = l.calls.load(Ordering::Relaxed);
+                if calls == 0 {
+                    0.0
+                } else {
+                    l.total_ms.load(Ordering::Relaxed) as f64 / calls as f64
+                }
+            }),
+        };
+        Ok((outcomes, backend_cost))
+    })?;
+
+    // Outcomes per ablation, in sweep order, for paired statistics.
+    let mut all_outcomes: Vec<(String, Vec<QueryOutcome>)> = Vec::new();
+    for (name, po) in results {
+        run_file.backend_cost.insert(name.clone(), po.backend_cost);
+        all_outcomes.push((name, po.outcomes));
     }
 
     // ---- aggregate cells + paired deltas ----
@@ -784,10 +997,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     run_file.notes = notes;
 
     // ---- write artifacts ----
-    let out_dir = args
-        .out_dir
-        .or(cfg.eval.runs_dir)
-        .unwrap_or_else(|| PathBuf::from("eval/runs"));
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating {}", out_dir.display()))?;
     let json_path = out_dir.join(format!("{}.json", run_file.run_id));
@@ -795,6 +1004,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     let html_path = out_dir.join(format!("{}.html", run_file.run_id));
     let html = crate::report::render(&run_file, args.template.as_deref())?;
     std::fs::write(&html_path, html)?;
+    // The run completed: its pass checkpoints are spent scaffolding.
+    ckpt.clear(&names);
     println!("run written: {}", json_path.display());
     println!("report:      {}", html_path.display());
     print_matrix(&run_file);
@@ -1210,6 +1421,192 @@ mod tests {
         let (path, baseline) = loaded.expect("baseline under the run root must be found");
         assert_eq!(baseline.run_id, "r");
         assert_eq!(path, default_baseline_path(&root, "c"));
+    }
+
+    // ------------------------------------------------- pass checkpoints --
+
+    /// A fully populated outcome, so the roundtrip assertion exercises every
+    /// QueryOutcome field (including tuples and nested targets).
+    fn outcome(id: &str) -> QueryOutcome {
+        QueryOutcome {
+            id: id.into(),
+            tier: "join".into(),
+            question: "what shipped?".into(),
+            n_targets: 1,
+            r1_loose: 1.0,
+            r5_loose: 1.0,
+            rinf_loose: 1.0,
+            r1_strict: 0.0,
+            r5_strict: 1.0,
+            rinf_strict: 1.0,
+            mrr: 0.5,
+            grounded: true,
+            nil_outcome: false,
+            gold_spans: 1,
+            pred_spans: 2,
+            strict_gold_matched: 1,
+            weak_gold_matched: 1,
+            strict_pred_matched: 0,
+            weak_pred_matched: 1,
+            latency_ms: 12.5,
+            dense_probes: 0,
+            adjudicated_mentions: 0,
+            mentions: 1,
+            selected_candidates: 1,
+            calibration: vec![(0.9, true), (0.4, false)],
+            targets: vec![crate::metrics::TargetOutcome {
+                table: "shipments".into(),
+                column: "item".into(),
+                literal: "engine".into(),
+                loose_rank: Some(0),
+                strict_rank: None,
+                linked: true,
+                best_candidate: Some("shipments.item #200 — engine".into()),
+            }],
+        }
+    }
+
+    fn cost(embed_calls: usize) -> BackendCost {
+        BackendCost {
+            embed_calls,
+            embed_texts: embed_calls * 2,
+            embed_ms_total: embed_calls as f64,
+            lm_calls: 0,
+            lm_ms_mean: 0.0,
+        }
+    }
+
+    fn ckpt_ctx(root: &Path) -> CheckpointCtx {
+        CheckpointCtx {
+            dir: root.join(".passes"),
+            corpus: "mini".into(),
+            dataset_hash: "deadbeef".into(),
+            git_rev: "abc1234".into(),
+            db_path: "/data/mini.db".into(),
+        }
+    }
+
+    fn test_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "stemma-eval-ckpt-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn interrupted_run_resumes_completed_passes_from_checkpoints() {
+        let root = test_root("resume");
+        let ckpt = ckpt_ctx(&root);
+        let abs = vec![ablation("lex").unwrap(), ablation("+dense").unwrap()];
+
+        // First invocation is killed after pass 1 completes (the closure
+        // fails on pass 2 — same observable state as a process kill between
+        // passes, since each pass checkpoints before the next starts).
+        let mut ran = Vec::new();
+        let err = execute_passes(&ckpt, &abs, &mut Vec::new(), |ab, pass_notes| {
+            if ab.name == "+dense" {
+                anyhow::bail!("killed mid-run");
+            }
+            ran.push(ab.name.clone());
+            pass_notes.push("indexed nokg store: 5 values in 1 ms".into());
+            Ok((vec![outcome("q1"), outcome("q2")], cost(0)))
+        });
+        assert!(err.is_err());
+        assert_eq!(ran, vec!["lex"]);
+        assert!(ckpt.path_for("lex").exists(), "pass 1 must be checkpointed");
+
+        // Second invocation re-runs only the missing pass.
+        let mut notes = Vec::new();
+        let mut ran2 = Vec::new();
+        let results = execute_passes(&ckpt, &abs, &mut notes, |ab, _n| {
+            ran2.push(ab.name.clone());
+            Ok((vec![outcome("q1"), outcome("q2")], cost(7)))
+        })
+        .unwrap();
+        assert_eq!(ran2, vec!["+dense"], "pass 1 must not re-run");
+        assert!(notes.iter().any(|n| n == "resumed lex from checkpoint"));
+        assert!(
+            notes.iter().any(|n| n.starts_with("indexed nokg store")),
+            "pass notes must travel with the checkpoint"
+        );
+
+        // The resumed pass comes back losslessly: outcomes and cost equal
+        // what pass 1 measured, not what the second closure returned.
+        let (name, po) = &results[0];
+        assert_eq!(name, "lex");
+        assert_eq!(po.backend_cost.embed_calls, 0);
+        assert_eq!(
+            serde_json::to_value(&po.outcomes).unwrap(),
+            serde_json::to_value([outcome("q1"), outcome("q2")]).unwrap(),
+            "QueryOutcome must roundtrip through the checkpoint losslessly"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn stale_checkpoints_are_ignored_and_removed() {
+        let root = test_root("stale");
+        let one_pass = |c: &CheckpointCtx| {
+            c.save("lex", &[outcome("q1")], &cost(0), &[]).unwrap();
+        };
+        // Same corpus, older code / different dataset bytes / other db.
+        let old_rev = CheckpointCtx {
+            git_rev: "0ld0000".into(),
+            ..ckpt_ctx(&root)
+        };
+        let other_hash = CheckpointCtx {
+            dataset_hash: "feedface".into(),
+            ..ckpt_ctx(&root)
+        };
+        one_pass(&old_rev);
+        one_pass(&other_hash);
+        // A different corpus's checkpoint must survive the sweep.
+        let other_corpus = CheckpointCtx {
+            corpus: "legal".into(),
+            ..ckpt_ctx(&root)
+        };
+        one_pass(&other_corpus);
+
+        let ckpt = ckpt_ctx(&root);
+        let mut notes = Vec::new();
+        let mut ran = Vec::new();
+        execute_passes(
+            &ckpt,
+            &[ablation("lex").unwrap()],
+            &mut notes,
+            |ab, _n| {
+                ran.push(ab.name.clone());
+                Ok((vec![outcome("q1")], cost(0)))
+            },
+        )
+        .unwrap();
+        assert_eq!(ran, vec!["lex"], "stale checkpoints must not resume");
+        assert!(!old_rev.path_for("lex").exists(), "old git_rev swept");
+        assert!(!other_hash.path_for("lex").exists(), "old dataset hash swept");
+        assert!(other_corpus.path_for("lex").exists(), "other corpus kept");
+        assert!(notes.iter().filter(|n| n.starts_with("removed stale checkpoint")).count() == 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn completed_run_leaves_no_pass_files() {
+        let root = test_root("complete");
+        let ckpt = ckpt_ctx(&root);
+        let names = vec!["lex".to_string(), "+dense".to_string()];
+        let abs = vec![ablation("lex").unwrap(), ablation("+dense").unwrap()];
+        execute_passes(&ckpt, &abs, &mut Vec::new(), |_ab, _n| {
+            Ok((vec![outcome("q1")], cost(0)))
+        })
+        .unwrap();
+        assert!(ckpt.path_for("lex").exists() && ckpt.path_for("+dense").exists());
+        ckpt.clear(&names);
+        assert!(
+            !ckpt.dir.exists(),
+            "a completed run must delete its scaffolding (and the empty dir)"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
