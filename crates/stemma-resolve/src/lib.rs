@@ -171,6 +171,12 @@ pub struct Candidate {
     /// is a representative of that set (its smallest rowid). Always 1 for
     /// document candidates, which keep per-row identity.
     pub row_count: u32,
+    /// The dense channel's best cosine for this candidate, calibrated
+    /// against the corpus's derived geometry: 0.0 at the null-pair mean
+    /// (what unrelated rows score on THIS corpus), 1.0 at the
+    /// nearest-neighbor mean. `None` when the candidate has no dense
+    /// evidence or the corpus has no derived geometry.
+    pub dense_confidence: Option<f64>,
     /// Up to [`SAMPLE_ROWIDS`] concrete rowids carrying the interpretation,
     /// ascending; the first is `rowid`.
     pub sample_rowids: Vec<i64>,
@@ -212,6 +218,13 @@ pub struct Span {
     /// Computed only for ambiguous mentions, and only over the readings a
     /// consumer might actually pick — one grouped count per (table, column).
     pub divergence: f64,
+    /// Which rule, other than the fused-score threshold, admitted this span
+    /// into `mentions`. `None` for ordinary selection. "dense_geometry": the
+    /// span's only evidence is dense and its calibrated confidence sits
+    /// above the corpus's null-pair mean — surfaced as a nomination (status
+    /// stays "weak", candidates stay unselected) rather than a confident
+    /// mention, so NIL semantics are untouched.
+    pub admitted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +297,7 @@ pub fn resolve_full(
             kg_alias: false,
             ambiguous: false,
             divergence: 0.0,
+            admitted_by: None,
         });
     }
 
@@ -649,6 +663,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
                 kg_alias: false,
                 ambiguous: false,
                 divergence: 0.0,
+                admitted_by: None,
             });
         }
     }
@@ -2004,6 +2019,7 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
             // ((cos-0.30)/0.30 · 0.78) let dense-only documents displace
             // correct anchored candidates: legal L1 recall@5 fell 0.68→0.48
             // the day the dense index filled.
+            let mut dense_confidence = None;
             if let (Some((null_mean, nn_mean)), Some(best_cos)) = (
                 geometry,
                 g.channels
@@ -2016,6 +2032,7 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
                     ((best_cos - null_mean) / (nn_mean - null_mean)).clamp(0.0, 1.0);
                 let two_channel_doc = (2.0 / RRF_K) / (3.0 / RRF_K) * 0.85;
                 score = score.max(confidence * two_channel_doc);
+                dense_confidence = Some(confidence);
             }
             let (value, value_truncated) = truncate_value(&g.value);
             Candidate {
@@ -2033,6 +2050,7 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
                 adjudicated: false,
                 coherence: None,
                 row_count: g.row_count.max(1),
+                dense_confidence,
                 sample_rowids: if g.sample_rowids.is_empty() {
                     vec![rowid]
                 } else {
@@ -2110,8 +2128,59 @@ fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
             }
         }
     }
+    if let Some(i) = dense_nomination(spans) {
+        spans[i].admitted_by = Some("dense_geometry".into());
+        mentions.push(i);
+    }
     mentions.sort_by_key(|&i| spans[i].start);
     mentions
+}
+
+/// Dense nomination: the honest surfacing of dense-only evidence that the
+/// fused-score threshold cannot admit and must not certify.
+///
+/// SELECT_THRESHOLD arbitrates lexical evidence, and calibration bounds a
+/// dense-only candidate at confidence × 0.5667 (two lexical channels at
+/// rank 0 on a document) — so under the fused threshold a span whose only
+/// evidence is dense can never become a mention, and the paraphrase tier
+/// vanishes. Raising dense scores back is known-worse (the 0.78 floor let
+/// dense-only spans displace correct anchors: anchor recall@5 0.68 → 0.48).
+/// The measured geometry on the legal corpus also rules out a confidence
+/// bar that separates genuine paraphrases from nothing-matches queries:
+/// absent-tier best confidences (median 0.38) sit ON TOP of paraphrase-tier
+/// ones (median 0.31), because topically-adjacent NIL queries embed close
+/// to real documents.
+///
+/// So dense-only evidence is admitted as a *nomination*, not a mention
+/// claim: the longest weak span whose top candidate's evidence is entirely
+/// dense and whose calibrated confidence is positive — its best cosine is
+/// above the corpus's own null-pair mean, the one bar the geometry actually
+/// derives — joins `mentions` with status still "weak", candidates still
+/// unselected, and `admitted_by = "dense_geometry"` naming the rule. It
+/// claims no byte range (lexical selection is untouched), it grounds no
+/// answer, and it never flips a NIL: absence semantics key on selected
+/// spans/candidates, which a nomination has none of. One nomination per
+/// resolution — the dense probes embed whole spans against documents, so
+/// overlapping sub-span nominations are the same reading, and the longest
+/// span carries the most context (dense probing already targets longest
+/// first).
+fn dense_nomination(spans: &[Span]) -> Option<usize> {
+    spans
+        .iter()
+        .filter(|s| s.status == "weak")
+        .filter(|s| {
+            s.candidates.first().is_some_and(|c| {
+                !c.channels.is_empty()
+                    && c.channels.iter().all(|ch| ch.channel == "dense")
+                    && c.dense_confidence.is_some_and(|x| x > 0.0)
+            })
+        })
+        .max_by(|a, b| {
+            (a.end - a.start)
+                .cmp(&(b.end - b.start))
+                .then(a.candidates[0].score.total_cmp(&b.candidates[0].score))
+        })
+        .map(|s| s.id)
 }
 
 /// Convert a trace into the gRPC Resolve response (selected mentions only —
@@ -2121,14 +2190,21 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
     let mentions = trace
         .mentions
         .iter()
+        // Dense nominations are trace-level honesty, not resolution claims:
+        // they carry no selected candidates and would read here as NIL
+        // (status "weak"), which they are not — a nomination is "weak but
+        // present", not "affirmed absent". They stay visible in the Explain
+        // trace, marked by `admitted_by`.
+        .filter(|&&i| trace.spans[i].admitted_by.is_none())
         .map(|&i| {
             let s = &trace.spans[i];
             pb::Mention {
                 text: s.text.clone(),
                 start: s.start as u32,
                 end: s.end as u32,
-                // Selection only picks "selected" spans, so a weak span here
-                // can only mean the adjudication band answered NIL — the
+                // Ordinary selection only picks "selected" spans, and
+                // nominations are filtered above, so a weak span here can
+                // only mean the adjudication band answered NIL — the
                 // affirmative no-record-matches conclusion.
                 nil: s.status == "weak",
                 ambiguous: s.ambiguous,
@@ -2216,6 +2292,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                 kg_alias: s.kg_alias,
                 ambiguous: s.ambiguous,
                 divergence: s.divergence,
+                admitted_by: s.admitted_by.clone().unwrap_or_default(),
                 id: s.id as u32,
                 text: s.text.clone(),
                 start: s.start as u32,
@@ -2659,6 +2736,166 @@ mod tests {
         let out_mid = fuse("span", vec![hit("dense", 0, 0.45, 4)], geometry);
         let out_none = fuse("span", vec![hit("dense", 0, 0.45, 4)], None);
         assert!(out_mid[0].score > out_none[0].score);
+        // The calibrated confidence itself is carried on the candidate —
+        // the dense-nomination rule and the trace both read it.
+        assert!(
+            out_mid[0]
+                .dense_confidence
+                .is_some_and(|x| (x - 0.5).abs() < 1e-9),
+            "cos 0.45 between null 0.2 and nn 0.7 is confidence 0.5: {:?}",
+            out_mid[0].dense_confidence
+        );
+        assert_eq!(
+            out_none[0].dense_confidence, None,
+            "no geometry, no calibration — never a default constant"
+        );
+    }
+
+    /// A span for the dense-nomination tests: byte range + status + candidates.
+    fn span_at(id: usize, start: usize, end: usize, status: &str, cands: Vec<Candidate>) -> Span {
+        Span {
+            id,
+            text: "x".repeat(end - start),
+            start,
+            end,
+            status: status.into(),
+            candidates: cands,
+            kg_alias: false,
+            ambiguous: false,
+            divergence: 0.0,
+            admitted_by: None,
+        }
+    }
+
+    /// An unselected dense-only candidate at the given calibrated confidence,
+    /// scored exactly as fuse scores a dense-only document (conf × 0.5667).
+    fn dense_cand(rowid: i64, conf: f64) -> Candidate {
+        let mut c = cand(rowid, "a long stored document body", conf * 0.85 * 2.0 / 3.0, &["dense"]);
+        c.selected = false;
+        c.is_doc = true;
+        c.dense_confidence = Some(conf);
+        c
+    }
+
+    /// The paraphrase-tier mechanism: a span whose ONLY evidence is dense
+    /// cannot reach SELECT_THRESHOLD under calibration (ceiling 0.5667), so
+    /// it surfaces as a nomination — in `mentions`, status still "weak",
+    /// candidates unselected, the admitting rule named on the span — while
+    /// lexical selection is untouched.
+    #[test]
+    fn dense_only_span_is_nominated_at_positive_confidence() {
+        let lex = {
+            let mut c = cand(1, "docs", 0.5667, &["bm25", "trigram"]);
+            c.selected = false;
+            c
+        };
+        let mut spans = vec![
+            span_at(0, 0, 4, "selected", vec![lex]),
+            span_at(1, 0, 20, "weak", vec![dense_cand(2, 0.4)]),
+        ];
+        let mentions = select_mentions(&mut spans);
+        assert_eq!(mentions, vec![0, 1], "nomination joins the mentions");
+        // Lexical selection is exactly as before: the junk span keeps its
+        // range and its top candidate is selected.
+        assert_eq!(spans[0].status, "selected");
+        assert!(spans[0].candidates[0].selected);
+        assert!(spans[0].admitted_by.is_none());
+        // The nomination is honest about its weakness.
+        assert_eq!(spans[1].status, "weak", "a nomination is not a claim");
+        assert_eq!(spans[1].admitted_by.as_deref(), Some("dense_geometry"));
+        assert!(
+            spans[1].candidates.iter().all(|c| !c.selected),
+            "nominated candidates ground nothing"
+        );
+    }
+
+    /// At the corpus's null-pair mean the geometry says "unrelated": the
+    /// clamped confidence is 0.0 and the span stays out of mentions — this
+    /// is the absence-preserving side of the rule.
+    #[test]
+    fn dense_only_span_at_null_confidence_stays_weak_and_out() {
+        let mut spans = vec![span_at(0, 0, 20, "weak", vec![dense_cand(1, 0.0)])];
+        let mentions = select_mentions(&mut spans);
+        assert!(mentions.is_empty());
+        assert_eq!(spans[0].status, "weak");
+        assert!(spans[0].admitted_by.is_none());
+    }
+
+    /// Lexically-evidenced weak spans are governed by SELECT_THRESHOLD as
+    /// before: no lexical span is nominated, corroborated or not. Absent
+    /// geometry (dense_confidence None) dense spans are not nominated either.
+    #[test]
+    fn nomination_requires_dense_only_evidence_and_calibration() {
+        let weak_lex = {
+            let mut c = cand(1, "docs", 0.283, &["bm25"]);
+            c.selected = false;
+            c
+        };
+        let mixed = {
+            let mut c = cand(2, "docs", 0.3, &["trigram", "dense"]);
+            c.selected = false;
+            c.dense_confidence = Some(0.9);
+            c
+        };
+        let uncalibrated = {
+            let mut c = cand(3, "docs", 0.283, &["dense"]);
+            c.selected = false;
+            c.dense_confidence = None;
+            c
+        };
+        let mut spans = vec![
+            span_at(0, 0, 6, "weak", vec![weak_lex]),
+            span_at(1, 8, 14, "weak", vec![mixed]),
+            span_at(2, 16, 22, "weak", vec![uncalibrated]),
+        ];
+        let mentions = select_mentions(&mut spans);
+        assert!(mentions.is_empty(), "got {mentions:?}");
+        assert!(spans.iter().all(|s| s.admitted_by.is_none()));
+    }
+
+    /// One nomination per resolution, and the longest span carries it: the
+    /// dense probes embed whole spans against documents, so overlapping
+    /// sub-span readings are the same nomination with less context.
+    #[test]
+    fn longest_dense_only_span_carries_the_single_nomination() {
+        let mut spans = vec![
+            span_at(0, 0, 10, "weak", vec![dense_cand(1, 0.45)]),
+            span_at(1, 0, 40, "weak", vec![dense_cand(2, 0.35)]),
+        ];
+        let mentions = select_mentions(&mut spans);
+        assert_eq!(mentions, vec![1], "longest wins, even at lower confidence");
+        assert_eq!(spans[1].admitted_by.as_deref(), Some("dense_geometry"));
+        assert!(spans[0].admitted_by.is_none());
+    }
+
+    /// The Resolve RPC ships confident mentions and affirmed absences only:
+    /// a nomination must not appear there (it would read as NIL, which it is
+    /// not), while an adjudication-demoted weak span still does. The Explain
+    /// trace carries the nomination with its admitting rule.
+    #[test]
+    fn nomination_is_trace_visible_but_not_a_resolve_mention() {
+        let mut nominated = span_at(1, 0, 20, "weak", vec![dense_cand(2, 0.4)]);
+        nominated.admitted_by = Some("dense_geometry".into());
+        let demoted = {
+            // Adjudication answered NIL on a previously selected span.
+            let mut c = cand(1, "docs", 0.5667, &["bm25", "trigram"]);
+            c.selected = true;
+            span_at(0, 0, 4, "weak", vec![c])
+        };
+        let trace = Trace {
+            query: "irrelevant".into(),
+            tokens: Vec::new(),
+            spans: vec![demoted, nominated],
+            mentions: vec![0, 1],
+            elapsed_ms: 0.0,
+        };
+        let resp = trace_to_proto(&trace);
+        assert_eq!(resp.mentions.len(), 1, "nomination filtered from Resolve");
+        assert!(resp.mentions[0].nil, "demoted weak span is the NIL answer");
+        let explain = trace_to_explain_proto(&trace);
+        assert_eq!(explain.spans[1].admitted_by, "dense_geometry");
+        assert_eq!(explain.spans[0].admitted_by, "");
+        assert_eq!(explain.mentions, vec![0, 1], "trace keeps the nomination");
     }
 
     #[test]
@@ -3157,6 +3394,7 @@ mod tests {
             adjudicated: false,
             coherence: None,
             row_count: 1,
+            dense_confidence: None,
             sample_rowids: vec![rowid],
             reach: 0,
         }
@@ -3181,6 +3419,7 @@ mod tests {
                 kg_alias: false,
                 ambiguous: false,
                 divergence: 0.0,
+                admitted_by: None,
             }],
             mentions: vec![0],
             elapsed_ms: 0.0,
@@ -3421,6 +3660,7 @@ mod tests {
             adjudicated: false,
             coherence: None,
             row_count: 1,
+            dense_confidence: None,
             sample_rowids: vec![rowid],
             reach: 0,
         }
@@ -3437,6 +3677,7 @@ mod tests {
             status: "selected".into(),
             ambiguous: false,
             divergence: 0.0,
+            admitted_by: None,
             candidates: vec![
                 interp_cand("offices", "city", 1, 0.60),
                 interp_cand("products", "name", 1, 0.58),
