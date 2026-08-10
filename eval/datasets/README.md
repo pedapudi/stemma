@@ -112,3 +112,28 @@ Sampling is deterministic under `--seed` (stratified across CCR titles and
 CFR title/parts); LM output is sampled at temperature 0.8, so regeneration
 produces a *comparable* set, not a byte-identical one — which is exactly why
 regeneration is a reviewed change.
+
+## Known limitations of legal-synth-v1 / mini-join-v1 (frozen 2026-08-10)
+
+Found in freeze review; documented rather than silently regenerated. The
+v2 tracking issue carries the fixes.
+
+- **anchor**: the generator originally wrapped every anchor phrase in
+  quotation marks (no real user does; quotes also hand the span detector
+  free segmentation). Stripped and mechanically re-verified before the
+  freeze — records carry `quotes_stripped: true`.
+- **paraphrase**: the zero-overlap verifier checks non-overlap but never
+  *discriminability*. Some questions no longer uniquely identify their
+  record ("How long does this permit stay active?") and may be
+  unresolvable by any retriever; the tier's ceiling is partly the set's,
+  not the channel's.
+- **join**: 44 records collapse to 11 distinct join cases (up to 4 LM
+  phrasings per case). Variants succeed or fail together, so treat the
+  tier's effective n as the case count; paired statistics over records
+  overstate confidence.
+- **cross-record**: 40/50 anchored on the sections (federal) side, 2/50 on
+  regulations, 8 unanchored — the tier mostly measures one direction of
+  the pairing.
+- **absent**: register uniformity leaks the label (most questions phrase
+  as "Do I need a permit to…"), and all topics are comfortably off-domain;
+  hard near-domain absences are underrepresented.
