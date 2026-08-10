@@ -360,6 +360,18 @@ fn pending_embed_work(db: &StemmaDb) -> bool {
 /// interpretation pass. The drain routes each item by kind: documents into
 /// vec_dense, cards into vec_interp.
 fn embed_pass(name: &str, db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) {
+    // Column cards first: a schema's worth of embeddings, receipted so an
+    // unchanged schema costs one fingerprint check — and the column-affinity
+    // pass lights up before any queue drains.
+    match stemma_ingest::build_column_cards(db, embedder) {
+        Ok(s) if s.rebuilt => {
+            tracing::info!(name, cards = s.cards, model = %s.model, "column cards rebuilt")
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(name, error = %e, "column card build failed; column affinity degraded")
+        }
+    }
     let start = std::time::Instant::now();
     let queued_docs = match stemma_ingest::enqueue_missing_embeddings(db) {
         Ok(n) => n,
