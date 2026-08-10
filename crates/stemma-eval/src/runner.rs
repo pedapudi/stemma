@@ -91,10 +91,11 @@ pub struct EndpointSection {
     pub endpoint: String,
     pub model: String,
     /// Query-side template ("{query}" placeholder); embedder only, ignored
-    /// for the LM. Absent, the default is looked up by model family
-    /// (`stemma_embed::default_query_template`) — the same resolution the
-    /// server applies, so an eval run embeds queries the way the deployment
-    /// would.
+    /// for the LM. The corpus store's model_registry outranks it (and a
+    /// disagreement refuses); absent both, the default is looked up by
+    /// model family (`stemma_embed::default_query_template`) — the same
+    /// resolution the server applies, so an eval run embeds queries the way
+    /// the deployment would.
     #[serde(default)]
     pub query_template: Option<String>,
     /// Extra request-body JSON merged into every LM call (LM only) — the
@@ -518,13 +519,34 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
         let db = StemmaDb::open(&store, &user_db)?;
 
         let embedder = match (&embed_cfg, ab.dense) {
-            (Some(e), true) => Some(MeteredEmbedder::new(stemma_embed::OpenAiEmbedder::new(
-                &e.endpoint,
-                &e.model,
-                e.query_template
-                    .clone()
-                    .or_else(|| stemma_embed::default_query_template(&e.model)),
-            ))),
+            (Some(e), true) => {
+                // The store's registry outranks config and the name-family
+                // guess: a staged corpus recorded the convention its anchors
+                // must be queried under (prepare_store promoted it just
+                // above), and a config that disagrees is refused — the same
+                // resolution the server applies, so an eval run embeds
+                // queries the way the deployment would.
+                let registered: Option<String> = db
+                    .conn()
+                    .query_row(
+                        "SELECT query_template FROM model_registry
+                         WHERE vector_table = 'vec_dense'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let template = stemma_embed::resolve_query_template(
+                    e.query_template.as_deref(),
+                    registered.as_deref(),
+                    &e.model,
+                )
+                .context("query template for vec_dense")?;
+                Some(MeteredEmbedder::new(stemma_embed::OpenAiEmbedder::new(
+                    &e.endpoint,
+                    &e.model,
+                    template,
+                )))
+            }
             (None, true) => {
                 notes.push(format!(
                     "{}: no embedder configured; dense channel absent",

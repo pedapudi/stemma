@@ -46,7 +46,9 @@ struct Args {
     /// Query-side template for the embedder, with a "{query}" placeholder
     /// (e.g. "Instruct: ...\nQuery: {query}"). Endpoint, model and template
     /// must agree, so all three are configurable together; overrides
-    /// server.embedder.query_template in the config file. Unset, the
+    /// server.embedder.query_template in the config file — but a template a
+    /// served store's model_registry has on record outranks both, and a
+    /// disagreement with it refuses at startup. Unset (and unrecorded), the
     /// template is chosen by model family (Qwen3-Embedding models get their
     /// published retrieval instruction, anything else embeds queries bare);
     /// pass "{query}" to force bare on any model.
@@ -461,6 +463,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:50051".parse().unwrap());
 
     let mut dbs = HashMap::new();
+    // Query templates the served stores have on record, as (origin, template)
+    // — the vector-space identity each registry stored at registration.
+    // Rows predating the column store '' and constrain nothing.
+    let mut registered_templates: Vec<(String, String)> = Vec::new();
     for (name, user_db) in &args.dbs {
         let store = user_db.with_extension("stemmadb");
         let db = StemmaDb::open(&store, user_db)
@@ -477,9 +483,23 @@ async fn main() -> anyhow::Result<()> {
                 vectors = d.vectors,
                 dim = d.dimension,
                 model = %d.model,
+                query_template = %d.query_template,
                 promoted = d.promoted,
                 "dense index"
             );
+        }
+        for table in ["vec_dense", "vec_interp"] {
+            let stored: Option<String> = db
+                .conn()
+                .query_row(
+                    "SELECT query_template FROM model_registry WHERE vector_table = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(t) = stored.filter(|t| !t.is_empty()) {
+                registered_templates.push((format!("{name}/{table}"), t));
+            }
         }
         tracing::info!(
             name,
@@ -496,17 +516,43 @@ async fn main() -> anyhow::Result<()> {
         dbs.insert(name.clone(), Mutex::new(db));
     }
 
-    // The query template is part of the model identity: explicit config
-    // (flag over file) wins, otherwise it is looked up by model family —
-    // Qwen3-Embedding gets its published instruction, anything else embeds
-    // queries bare.
-    let embed_template = args.embed_query_template.clone().or_else(|| {
-        args.embed_model
-            .as_deref()
-            .and_then(stemma_embed::default_query_template)
-    });
+    // The query template is part of the model identity, and the registry is
+    // its record: a template a served store registered its vectors under
+    // wins; explicit config (flag over file) must agree with it — a
+    // disagreement means the configured embedder would send one convention's
+    // queries into another convention's space, the same corruption as mixing
+    // models, so it refuses at startup; the model-family lookup is only the
+    // fallback for stores that predate the column and configs that state
+    // nothing.
     let embedder = match (&args.embed_endpoint, &args.embed_model) {
         (Some(ep), Some(m)) => {
+            let mut registered: Option<&(String, String)> = None;
+            for pair in &registered_templates {
+                match registered {
+                    Some((origin, t)) if !stemma_embed::query_templates_agree(t, &pair.1) => {
+                        anyhow::bail!(
+                            "served stores register conflicting query templates: \
+                             {origin} stores {t:?}, {} stores {:?}; one embedder \
+                             cannot query both conventions",
+                            pair.0,
+                            pair.1
+                        );
+                    }
+                    Some(_) => {}
+                    None => registered = Some(pair),
+                }
+            }
+            let embed_template = stemma_embed::resolve_query_template(
+                args.embed_query_template.as_deref(),
+                registered.map(|(_, t)| t.as_str()),
+                m,
+            )
+            .with_context(|| {
+                format!(
+                    "query template for {}",
+                    registered.map(|(o, _)| o.as_str()).unwrap_or("embedder")
+                )
+            })?;
             tracing::info!(
                 endpoint = %ep,
                 model = %m,
@@ -514,7 +560,7 @@ async fn main() -> anyhow::Result<()> {
                 "dense channel enabled"
             );
             Some(std::sync::Arc::new(stemma_embed::CooldownEmbedder::new(
-                stemma_embed::OpenAiEmbedder::new(ep, m, embed_template.clone()),
+                stemma_embed::OpenAiEmbedder::new(ep, m, embed_template),
                 // Down-marker refresh window; the background task owns the
                 // recovery probe, so user queries always short-circuit.
                 std::time::Duration::from_secs(60),
