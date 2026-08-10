@@ -96,7 +96,9 @@ enum Cmd {
         #[arg(long)]
         out_dir: Option<PathBuf>,
         /// Baseline to grade against. Default: eval/baseline/<corpus>.json
-        /// when present; otherwise the run is ungraded.
+        /// (resolved against the config file's directory, or the invocation
+        /// directory without one) when present; otherwise the run is
+        /// ungraded and says so in its notes.
         #[arg(long)]
         baseline: Option<PathBuf>,
         /// Permutations / resamples for the paired statistics.
