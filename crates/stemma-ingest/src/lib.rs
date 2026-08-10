@@ -103,6 +103,13 @@ CREATE TABLE IF NOT EXISTS lex_values (
 CREATE INDEX IF NOT EXISTS lex_values_norm ON lex_values(value_norm);
 CREATE INDEX IF NOT EXISTS lex_values_src ON lex_values(src_table, src_rowid);
 CREATE INDEX IF NOT EXISTS lex_values_col ON lex_values(src_table, src_column);
+-- Covers the interpretation-member lookup
+-- (src_table, src_column, value_norm → src_rowids, ordered): without it the
+-- planner answers that shape through lex_values_col and filters every row of
+-- the column per candidate — measured at 6.8s of a 6.9s resolve on a
+-- value-repeating corpus, ~0.7ms with this index (48× end to end).
+CREATE INDEX IF NOT EXISTS lex_values_interp
+    ON lex_values(src_table, src_column, value_norm, src_rowid);
 
 -- Column measurements: one row per indexed (table, column), derived from
 -- lex_values by profile_columns(). Measurements only — no classifications.
