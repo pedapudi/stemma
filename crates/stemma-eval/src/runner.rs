@@ -380,6 +380,15 @@ pub fn drain_embeddings(
     embedder: &dyn stemma_embed::Embedder,
     notes: &mut Vec<String>,
 ) {
+    drain_embeddings_batched(db, embedder, stemma_ingest::EMBED_BATCH, notes)
+}
+
+fn drain_embeddings_batched(
+    db: &StemmaDb,
+    embedder: &dyn stemma_embed::Embedder,
+    batch: usize,
+    notes: &mut Vec<String>,
+) {
     match stemma_ingest::enqueue_missing_embeddings(db) {
         Ok(0) => {}
         Ok(n) => notes.push(format!("embed queue: {n} document cells enqueued")),
@@ -388,23 +397,29 @@ pub fn drain_embeddings(
             return;
         }
     }
+    let (mut drained, mut failed) = (0usize, 0usize);
     loop {
-        match stemma_ingest::drain_embed_queue(db, embedder, stemma_ingest::EMBED_BATCH) {
-            Ok(s) if s.remaining == 0 => {
-                if s.drained > 0 || s.failed > 0 {
-                    notes.push(format!(
-                        "embed drain: {} embedded, {} failed",
-                        s.drained, s.failed
-                    ));
+        match stemma_ingest::drain_embed_queue(db, embedder, batch) {
+            Ok(s) => {
+                drained += s.drained;
+                failed += s.failed;
+                if s.remaining == 0 {
+                    if drained > 0 || failed > 0 {
+                        notes.push(format!(
+                            "embed drain: {drained} embedded, {failed} failed"
+                        ));
+                    }
+                    if let Err(e) = stemma_ingest::derive_dense_geometry(db) {
+                        notes.push(format!("dense geometry derivation failed: {e}"));
+                    }
+                    return;
                 }
-                if let Err(e) = stemma_ingest::derive_dense_geometry(db) {
-                    notes.push(format!("dense geometry derivation failed: {e}"));
-                }
-                return;
             }
-            Ok(_) => {}
             Err(e) => {
-                notes.push(format!("embed drain stopped: {e} (dense channel degraded)"));
+                notes.push(format!(
+                    "embed drain stopped after {drained} embedded, {failed} failed: \
+                     {e} (dense channel degraded)"
+                ));
                 return;
             }
         }
@@ -580,7 +595,18 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     }
 
     // ---- aggregate cells + paired deltas ----
-    let baseline = load_baseline(args.baseline.as_deref(), &corpus)?;
+    // The default baseline anchors where every other harness default
+    // anchors: the config file's directory, falling back to the invocation
+    // directory when no config was given — never the ambient CWD alone, so
+    // a launch outside the repo root cannot silently skip grading.
+    let baseline_root = args
+        .config
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let baseline = load_baseline(args.baseline.as_deref(), &baseline_root, &corpus)?;
     for (i, (name, outcomes)) in all_outcomes.iter().enumerate() {
         let mut tier_cells = BTreeMap::new();
         for tier in &run_file.tiers {
@@ -613,7 +639,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
                     n: diffs.len(),
                 }
             });
-            let delta_baseline = baseline.as_ref().and_then(|b| {
+            let delta_baseline = baseline.as_ref().and_then(|(_, b)| {
                 let bcell = b.cells.get(name)?.get(tier)?;
                 let diffs: Vec<f64> = subset
                     .iter()
@@ -703,10 +729,22 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     }
 
     // ---- grade against the baseline, if one exists ----
-    if let Some(b) = &baseline {
-        let failures = crate::grade::check(&run_file, b, args.permutations);
-        run_file.pass = Some(failures.is_empty());
-        run_file.failures = failures;
+    // Either way the run file says so: a run is never silently ungraded.
+    match &baseline {
+        Some((bpath, b)) => {
+            let failures = crate::grade::check(&run_file, b, args.permutations);
+            run_file.pass = Some(failures.is_empty());
+            run_file.failures = failures;
+            notes.push(format!(
+                "graded against baseline {} (accepted from {})",
+                bpath.display(),
+                b.run_id
+            ));
+        }
+        None => notes.push(format!(
+            "ungraded: no baseline at {}",
+            default_baseline_path(&baseline_root, &corpus).display()
+        )),
     }
 
     run_file.notes = notes;
@@ -949,18 +987,41 @@ pub struct Baseline {
     pub budgets: Budgets,
 }
 
-pub fn load_baseline(path: Option<&Path>, corpus: &str) -> anyhow::Result<Option<Baseline>> {
-    let default = PathBuf::from(format!("eval/baseline/{corpus}.json"));
+/// Where the accepted baseline for `corpus` lives under a repository root.
+pub fn default_baseline_path(root: &Path, corpus: &str) -> PathBuf {
+    root.join("eval")
+        .join("baseline")
+        .join(format!("{corpus}.json"))
+}
+
+/// Loads the baseline that grades a run. An explicit `--baseline` path wins
+/// (and must exist); otherwise the accepted default
+/// `eval/baseline/<corpus>.json` is resolved against `root` — the config
+/// file's directory when a config was given, the invocation directory
+/// otherwise — the same anchor every other harness default resolves
+/// against, so a run is graded identically no matter where it is launched
+/// from. Returns the path actually loaded, so the run file can record what
+/// graded it; `None` means no baseline exists yet (an ungraded run).
+pub fn load_baseline(
+    path: Option<&Path>,
+    root: &Path,
+    corpus: &str,
+) -> anyhow::Result<Option<(PathBuf, Baseline)>> {
     let path = match path {
         Some(p) => p.to_path_buf(),
-        None if default.exists() => default,
-        None => return Ok(None),
+        None => {
+            let default = default_baseline_path(root, corpus);
+            if !default.exists() {
+                return Ok(None);
+            }
+            default
+        }
     };
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading baseline {}", path.display()))?;
     let b: Baseline = serde_json::from_str(&text)
         .with_context(|| format!("parsing baseline {}", path.display()))?;
-    Ok(Some(b))
+    Ok(Some((path, b)))
 }
 
 /// The `accept` subcommand: distill a run into the reviewed baseline.
@@ -1011,4 +1072,121 @@ pub fn accept(run_path: &Path, out: &Path) -> anyhow::Result<()> {
     std::fs::write(out, serde_json::to_string_pretty(&baseline)?)?;
     println!("baseline written: {}", out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic embedder: unit vectors, fixed dimension — enough for
+    /// the drain plumbing, which only needs consistent dimensions.
+    struct FakeEmbedder;
+
+    impl stemma_embed::Embedder for FakeEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0, 0.0, 0.0, 0.0])
+                .collect())
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                backend: "fake".into(),
+                model: "fake-embedder".into(),
+                dimension: 4,
+                query_template: String::new(),
+            }
+        }
+    }
+
+    /// A corpus with five document cells (long bodies past the document
+    /// threshold) so a small drain batch takes several loop iterations.
+    fn doc_db() -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let body = |topic: &str| {
+            format!(
+                "Article concerning {topic}. This body exists to cross the document \
+                 threshold, so it repeats itself with modest dignity: {topic}, again \
+                 {topic}, considered from every angle a regulation writer can afford, \
+                 until the two-hundred character mark is safely behind it and the \
+                 classifier files it as a document rather than a value."
+            )
+        };
+        db.conn()
+            .execute_batch(&format!(
+                "CREATE TABLE src.articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+                 CREATE TABLE src.tags(id INTEGER PRIMARY KEY, label TEXT);
+                 INSERT INTO src.tags VALUES
+                    (1, 'Coastal permits'), (2, 'Archived'), (3, 'Pending review'),
+                    (4, 'Superseded'), (5, 'Draft');
+                 INSERT INTO src.articles VALUES
+                    (1, 'Coastal permits', '{a}'),
+                    (2, 'Insurance filings', '{b}'),
+                    (3, 'Water rights', '{c}'),
+                    (4, 'Grazing leases', '{d}'),
+                    (5, 'Timber harvest plans', '{e}');",
+                a = body("coastal development permits"),
+                b = body("insurance filing deadlines"),
+                c = body("appropriative water rights"),
+                d = body("federal grazing leases"),
+                e = body("timber harvest review"),
+            ))
+            .unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn embed_drain_note_totals_all_batches_not_the_last() {
+        let db = doc_db();
+        let mut notes = Vec::new();
+        // Batch of 2 over 5 documents: three drain iterations (2 + 2 + 1).
+        drain_embeddings_batched(&db, &FakeEmbedder, 2, &mut notes);
+        let drain_note = notes
+            .iter()
+            .find(|n| n.starts_with("embed drain:"))
+            .expect("a drain note must be recorded");
+        assert_eq!(
+            drain_note, "embed drain: 5 embedded, 0 failed",
+            "the note must total every batch, not report the final partial one"
+        );
+    }
+
+    /// Reproduces the ungraded-run failure class: the accepted baseline
+    /// exists under the run's root, the process CWD is elsewhere (as under
+    /// `cargo test`, or any launch outside the repo root) — the loader must
+    /// still find it, or the run silently comes out ungraded.
+    #[test]
+    fn default_baseline_resolves_against_the_run_root_not_the_process_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "stemma-eval-baseline-test-{}",
+            std::process::id()
+        ));
+        let dir = root.join("eval").join("baseline");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("c.json"),
+            r#"{"corpus":"c","dataset":"d","run_id":"r","git_rev":"g","date":"now",
+                "cells":{},"nil_precision":{},
+                "budgets":{"p95_latency_ms":{},"adjudication_rate_max":0.5}}"#,
+        )
+        .unwrap();
+        let loaded = load_baseline(None, &root, "c").unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        let (path, baseline) = loaded.expect("baseline under the run root must be found");
+        assert_eq!(baseline.run_id, "r");
+        assert_eq!(path, default_baseline_path(&root, "c"));
+    }
+
+    #[test]
+    fn absent_default_baseline_is_not_an_error() {
+        let root = std::env::temp_dir().join(format!(
+            "stemma-eval-no-baseline-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let loaded = load_baseline(None, &root, "nothing-here").unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert!(loaded.is_none());
+    }
 }
