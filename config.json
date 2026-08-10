@@ -11,7 +11,10 @@
     },
     "lm": {
       "endpoint": "http://kossel.lan:8080/v1",
-      "model": "gemma-4-26B-A4B-it-FP8"
+      "model": "gemma-4-26B-A4B-it-FP8",
+      "extra_body": {
+        "chat_template_kwargs": { "enable_thinking": false }
+      }
     }
   },
   "console": {
@@ -25,6 +28,14 @@
   },
   "eval": {
     "bird_dir": "eval/bird/data/dev_20240627",
-    "runs_dir": "eval/runs"
+    "runs_dir": "eval/runs",
+    "lm": {
+      "endpoint": "http://kossel.lan:8080/v1",
+      "model": "gemma-4-26B-A4B-it-FP8",
+      "api_key": "",
+      "extra_body": {
+        "chat_template_kwargs": { "enable_thinking": false }
+      }
+    }
   }
 }
