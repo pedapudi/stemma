@@ -84,6 +84,63 @@ pub fn default_query_template(model: &str) -> Option<String> {
     }
 }
 
+/// Bare queries have two spellings: the empty template and the explicit
+/// identity template `"{query}"`. Identity comparisons must treat them as
+/// one convention — they produce byte-identical query text.
+pub fn is_bare_query_template(template: &str) -> bool {
+    template.is_empty() || template == "{query}"
+}
+
+/// True when two template spellings denote the same query-side convention.
+pub fn query_templates_agree(a: &str, b: &str) -> bool {
+    a == b || (is_bare_query_template(a) && is_bare_query_template(b))
+}
+
+/// A configured query template disagreeing with the one the store's
+/// registry recorded for the vector space. Appending queries of one
+/// convention into another convention's space is the same corruption as
+/// mixing models (a fine-tuned checkpoint served under a name the family
+/// lookup misses measured paraphrase recall@5 halved, 0.18 → 0.08, when
+/// queries went out bare against templated anchors), so the disagreement
+/// is an error, never a preference.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "registry stores query template {registered:?} but {configured:?} is \
+     configured; endpoint, model and template must agree with the space \
+     they query — refusing, like a model mismatch"
+)]
+pub struct QueryTemplateMismatch {
+    pub registered: String,
+    pub configured: String,
+}
+
+/// Picks the query template for a vector space, in identity order:
+///
+/// 1. the registry's stored template (`registered`) is the space's recorded
+///    convention and wins whenever present — `''`/`None` means the row
+///    predates the column and recorded nothing;
+/// 2. an explicitly `configured` template must AGREE with a stored one
+///    (see [`QueryTemplateMismatch`]) and wins only when nothing is stored;
+/// 3. the model-family default ([`default_query_template`]) is the fallback
+///    for spaces that never recorded a convention — a name-based guess,
+///    which is exactly why the registry outranks it.
+pub fn resolve_query_template(
+    configured: Option<&str>,
+    registered: Option<&str>,
+    model: &str,
+) -> std::result::Result<Option<String>, QueryTemplateMismatch> {
+    let registered = registered.filter(|t| !t.is_empty());
+    match (configured, registered) {
+        (Some(c), Some(r)) if !query_templates_agree(c, r) => Err(QueryTemplateMismatch {
+            registered: r.to_string(),
+            configured: c.to_string(),
+        }),
+        (_, Some(r)) => Ok(Some(r.to_string())),
+        (Some(c), None) => Ok(Some(c.to_string())),
+        (None, None) => Ok(default_query_template(model)),
+    }
+}
+
 /// An OpenAI-compatible `/v1/embeddings` client.
 pub struct OpenAiEmbedder {
     endpoint: String,
@@ -229,6 +286,79 @@ mod tests {
         );
         assert_eq!(default_query_template("text-embedding-3-small"), None);
         assert_eq!(default_query_template("bge-m3"), None);
+    }
+
+    #[test]
+    fn bare_spellings_are_one_convention() {
+        assert!(query_templates_agree("", "{query}"));
+        assert!(query_templates_agree("{query}", ""));
+        assert!(query_templates_agree(QWEN3_QUERY_TEMPLATE, QWEN3_QUERY_TEMPLATE));
+        assert!(!query_templates_agree("", QWEN3_QUERY_TEMPLATE));
+        assert!(!query_templates_agree("{query}", QWEN3_QUERY_TEMPLATE));
+    }
+
+    #[test]
+    fn registry_template_outranks_the_family_guess() {
+        // A fine-tuned checkpoint whose serving name misses the family
+        // substring: bare by name-lookup, but the registry recorded the
+        // convention its vectors were staged under — the registry wins.
+        assert_eq!(
+            resolve_query_template(None, Some(QWEN3_QUERY_TEMPLATE), "qwen3-emb-legal-v3")
+                .unwrap()
+                .as_deref(),
+            Some(QWEN3_QUERY_TEMPLATE)
+        );
+        // The inverse: a registry that recorded explicit bare beats the
+        // family template the model name would have guessed.
+        assert_eq!(
+            resolve_query_template(None, Some("{query}"), "Qwen3-Embedding-0.6B")
+                .unwrap()
+                .as_deref(),
+            Some("{query}")
+        );
+    }
+
+    #[test]
+    fn family_fallback_only_covers_an_unrecorded_registry() {
+        // '' and absent both mean "the row predates the column".
+        for registered in [None, Some("")] {
+            assert_eq!(
+                resolve_query_template(None, registered, "Qwen3-Embedding-0.6B")
+                    .unwrap()
+                    .as_deref(),
+                Some(QWEN3_QUERY_TEMPLATE)
+            );
+            assert_eq!(
+                resolve_query_template(None, registered, "qwen3-emb-legal-v3").unwrap(),
+                None
+            );
+        }
+        // Configured wins when nothing is stored.
+        assert_eq!(
+            resolve_query_template(Some("Doc: {query}"), Some(""), "bge-m3")
+                .unwrap()
+                .as_deref(),
+            Some("Doc: {query}")
+        );
+    }
+
+    #[test]
+    fn configured_template_disagreeing_with_registry_is_an_error() {
+        let err = resolve_query_template(
+            Some("{query}"),
+            Some(QWEN3_QUERY_TEMPLATE),
+            "Qwen3-Embedding-0.6B",
+        )
+        .unwrap_err();
+        assert_eq!(err.registered, QWEN3_QUERY_TEMPLATE);
+        assert_eq!(err.configured, "{query}");
+        // Agreement across bare spellings is not a mismatch.
+        assert_eq!(
+            resolve_query_template(Some("{query}"), Some("{query}"), "bge-m3")
+                .unwrap()
+                .as_deref(),
+            Some("{query}")
+        );
     }
 }
 

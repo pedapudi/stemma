@@ -43,6 +43,16 @@ pub enum Error {
         registered: String,
         offered: String,
     },
+    #[error(
+        "{table} is registered with query template {registered:?} but the \
+         embedder offers {offered:?}; one convention's queries in another \
+         convention's space is the same corruption as mixing models — refusing"
+    )]
+    QueryTemplateMismatch {
+        table: String,
+        registered: String,
+        offered: String,
+    },
     #[error("{table} exists with no model_registry row; provenance unknown, refusing to append")]
     UnregisteredVectorTable { table: String },
 }
@@ -945,6 +955,10 @@ pub struct DenseStats {
     pub vectors: usize,
     pub dimension: usize,
     pub model: String,
+    /// Query-side convention recorded for the space (`''` = the registry
+    /// row predates the column and recorded nothing; `"{query}"` = stated
+    /// bare).
+    pub query_template: String,
     pub promoted: bool,
 }
 
@@ -954,8 +968,11 @@ pub struct DenseStats {
 /// — a plain table, writable without the sqlite-vec extension — and this
 /// pass, running inside the extension-bearing process, creates the `vec0`
 /// virtual table, moves the vectors in, records the model identity in
-/// `model_registry`, and drops the staging table. One model per dense
-/// table, always: mixed identities in staging are a hard error.
+/// `model_registry` — model, dimension AND the query template the staged
+/// vectors were produced to be queried under, so the space's convention is
+/// stored fact rather than a name-based guess at query time — and drops the
+/// staging table. One model per dense table, always: mixed identities in
+/// staging are a hard error.
 pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
     let conn = db.conn();
     let staged: i64 = conn
@@ -967,17 +984,18 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         .unwrap_or(0);
     if staged == 0 {
         // No staging: report the existing dense index if one is registered.
-        let existing: Option<(String, i64)> = conn
+        let existing: Option<(String, i64, String)> = conn
             .query_row(
-                "SELECT model, dimension FROM model_registry WHERE vector_table = 'vec_dense'",
+                "SELECT model, dimension, query_template FROM model_registry
+                 WHERE vector_table = 'vec_dense'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok();
         if existing.is_some() {
             let _ = derive_dense_geometry(db);
         }
-        return Ok(existing.map(|(model, dim)| {
+        return Ok(existing.map(|(model, dim, template)| {
             let vectors: i64 = conn
                 .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -985,16 +1003,33 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
                 vectors: vectors as usize,
                 dimension: dim as usize,
                 model,
+                query_template: template,
                 promoted: false,
             }
         }));
     }
 
-    let identities: Vec<(String, i64)> = conn
-        .prepare("SELECT DISTINCT model, dim FROM vec_staging")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<std::result::Result<_, _>>()?;
-    let (model, dim) = match identities.as_slice() {
+    // The staged query template is part of the model identity (endpoint,
+    // model and template must agree), so it rides the same DISTINCT that
+    // enforces one-model-per-table. Staging written by loaders that predate
+    // the column carries no template: '' lands in the registry, and query
+    // time falls back to the model-family guess — the state this column
+    // exists to retire, so new loaders always stage one.
+    let staging_has_template: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('vec_staging') WHERE name = 'query_template'",
+        [],
+        |r| r.get(0),
+    )?;
+    let identities: Vec<(String, i64, String)> = if staging_has_template > 0 {
+        conn.prepare("SELECT DISTINCT model, dim, query_template FROM vec_staging")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?
+    } else {
+        conn.prepare("SELECT DISTINCT model, dim FROM vec_staging")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, String::new())))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let (model, dim, template) = match identities.as_slice() {
         [one] => one.clone(),
         _ => panic!("vec_staging holds mixed model identities: {identities:?}"),
     };
@@ -1014,10 +1049,12 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         [],
     )?;
     conn.execute(
-        "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
-         VALUES ('vec_dense', 'staged', ?1, ?2, 'f32')
-         ON CONFLICT(vector_table) DO UPDATE SET model = ?1, dimension = ?2",
-        stemmadb::rusqlite::params![model, dim],
+        "INSERT INTO model_registry (vector_table, backend, model, dimension, quantization,
+                                     query_template)
+         VALUES ('vec_dense', 'staged', ?1, ?2, 'f32', ?3)
+         ON CONFLICT(vector_table) DO UPDATE
+             SET model = ?1, dimension = ?2, query_template = ?3",
+        stemmadb::rusqlite::params![model, dim, template],
     )?;
     conn.execute_batch("DROP TABLE vec_staging;")?;
     let _ = derive_dense_geometry(db);
@@ -1026,6 +1063,7 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         vectors: moved,
         dimension: dim as usize,
         model,
+        query_template: template,
         promoted: true,
     }))
 }
@@ -1784,8 +1822,15 @@ pub fn drain_embed_queue(
     // Model identity discipline, checked before any embedding work, for both
     // vector tables the queue can feed. The `model` string is the
     // vector-space identity; `backend` records how vectors arrived ('staged'
-    // loaders and a live embedder of the same model share a space).
-    let offered = embedder.identity().model;
+    // loaders and a live embedder of the same model share a space). The
+    // query template is the identity's third leg: a registered convention
+    // the embedder does not share means its queries would land in a foreign
+    // convention's space — refused like a model mismatch. An empty
+    // registered template is a row that predates the column, not a stated
+    // convention, so it constrains nothing.
+    let identity = embedder.identity();
+    let offered = identity.model;
+    let offered_template = identity.query_template;
     let mut has_dense = false;
     let mut has_interp = false;
     let mut refusal: Option<Error> = None;
@@ -1799,19 +1844,29 @@ pub fn drain_embed_queue(
             "vec_dense" => has_dense = exists > 0,
             _ => has_interp = exists > 0,
         }
-        let registered: Option<String> = conn
+        let registered: Option<(String, String)> = conn
             .query_row(
-                "SELECT model FROM model_registry WHERE vector_table = ?1",
+                "SELECT model, query_template FROM model_registry WHERE vector_table = ?1",
                 [table],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
         refusal = match &registered {
-            Some(m) if *m != offered => Some(Error::ModelMismatch {
+            Some((m, _)) if *m != offered => Some(Error::ModelMismatch {
                 table: table.to_string(),
                 registered: m.clone(),
                 offered: offered.clone(),
             }),
+            Some((_, t))
+                if !t.is_empty()
+                    && !stemma_embed::query_templates_agree(t, &offered_template) =>
+            {
+                Some(Error::QueryTemplateMismatch {
+                    table: table.to_string(),
+                    registered: t.clone(),
+                    offered: offered_template.clone(),
+                })
+            }
             None if exists > 0 => Some(Error::UnregisteredVectorTable {
                 table: table.to_string(),
             }),
@@ -2847,6 +2902,162 @@ mod tests {
             note.contains("some-other-model"),
             "error note names the model: {note}"
         );
+    }
+
+    /// Writes a vec_staging table the way a loader would. `template`:
+    /// `Some` = the loader's shape (query_template column), `None` = a
+    /// loader that predates the column.
+    fn stage_vectors(db: &StemmaDb, model: &str, dim: usize, template: Option<&str>) {
+        let conn = db.conn();
+        let template_col = if template.is_some() {
+            ",\n query_template TEXT NOT NULL"
+        } else {
+            ""
+        };
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS vec_staging;
+             CREATE TABLE vec_staging (
+                 src_table  TEXT NOT NULL,
+                 src_column TEXT NOT NULL,
+                 src_rowid  INTEGER NOT NULL,
+                 dim        INTEGER NOT NULL,
+                 model      TEXT NOT NULL,
+                 embedding  BLOB NOT NULL{template_col}
+             );"
+        ))
+        .unwrap();
+        for rowid in 1..=3i64 {
+            let blob: Vec<u8> = (0..dim)
+                .flat_map(|i| ((rowid as f32) + i as f32).to_le_bytes())
+                .collect();
+            match template {
+                Some(t) => conn
+                    .execute(
+                        "INSERT INTO vec_staging VALUES ('articles', 'body', ?1, ?2, ?3, ?4, ?5)",
+                        stemmadb::rusqlite::params![rowid, dim as i64, model, blob, t],
+                    )
+                    .unwrap(),
+                None => conn
+                    .execute(
+                        "INSERT INTO vec_staging VALUES ('articles', 'body', ?1, ?2, ?3, ?4)",
+                        stemmadb::rusqlite::params![rowid, dim as i64, model, blob],
+                    )
+                    .unwrap(),
+            };
+        }
+    }
+
+    #[test]
+    fn staged_promotion_carries_the_query_template_into_the_registry() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        stage_vectors(
+            &db,
+            "qwen3-emb-legal-v3",
+            4,
+            Some(stemma_embed::QWEN3_QUERY_TEMPLATE),
+        );
+        let stats = build_dense_index(&db).unwrap().unwrap();
+        assert!(stats.promoted);
+        assert_eq!(stats.query_template, stemma_embed::QWEN3_QUERY_TEMPLATE);
+        // The registry row is the space's identity: model, dimension AND the
+        // convention its queries must use — no name-family guess survives.
+        let (model, dim, template): (String, i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT model, dimension, query_template FROM model_registry
+                 WHERE vector_table = 'vec_dense'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "qwen3-emb-legal-v3");
+        assert_eq!(dim, 4);
+        assert_eq!(template, stemma_embed::QWEN3_QUERY_TEMPLATE);
+        // Re-promotion (blue-green restage) updates the stored template.
+        stage_vectors(&db, "qwen3-emb-legal-v3", 4, Some("{query}"));
+        let stats = build_dense_index(&db).unwrap().unwrap();
+        assert_eq!(stats.query_template, "{query}");
+        let template: String = db
+            .conn()
+            .query_row(
+                "SELECT query_template FROM model_registry WHERE vector_table = 'vec_dense'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(template, "{query}");
+    }
+
+    #[test]
+    fn prelegacy_staging_promotes_with_no_recorded_template() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        stage_vectors(&db, "some-encoder", 4, None);
+        let stats = build_dense_index(&db).unwrap().unwrap();
+        assert!(stats.promoted);
+        assert_eq!(
+            stats.query_template, "",
+            "a loader without the column records nothing, not a guess"
+        );
+        let template: String = db
+            .conn()
+            .query_row(
+                "SELECT query_template FROM model_registry WHERE vector_table = 'vec_dense'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(template, "");
+    }
+
+    #[test]
+    fn mismatched_registry_template_refuses_and_fails_items() {
+        let db = doc_db();
+        // Same model, but the space is registered under the instruction
+        // convention while the embedder would query it bare: the third leg
+        // of the identity disagrees, and appending is refused exactly like
+        // a model mismatch.
+        db.conn()
+            .execute(
+                "INSERT INTO model_registry (vector_table, backend, model, dimension,
+                                             query_template)
+                 VALUES ('vec_dense', 'staged', 'fake-embedder', 8, ?1)",
+                [stemma_embed::QWEN3_QUERY_TEMPLATE],
+            )
+            .unwrap();
+        enqueue_missing_embeddings(&db).unwrap();
+        let err = drain_embed_queue(&db, &FakeEmbedder::new(8), EMBED_BATCH).unwrap_err();
+        assert!(matches!(err, Error::QueryTemplateMismatch { .. }), "got {err}");
+        assert_eq!(queue_counts(&db), (0, 0, 3));
+    }
+
+    #[test]
+    fn bare_template_spellings_do_not_refuse_the_drain() {
+        let db = doc_db();
+        // Explicitly-bare registration ("{query}") and a bare embedder ("")
+        // are one convention spelled two ways, not a mismatch. An empty
+        // registered template would not constrain at all — but this row
+        // states bare, and the bare embedder agrees.
+        db.conn()
+            .execute(
+                "INSERT INTO model_registry (vector_table, backend, model, dimension,
+                                             query_template)
+                 VALUES ('vec_dense', 'staged', 'fake-embedder', 8, '{query}')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE VIRTUAL TABLE vec_dense USING vec0(
+                     embedding float[8],
+                     src_table text,
+                     src_column text,
+                     src_rowid integer
+                 );",
+            )
+            .unwrap();
+        enqueue_missing_embeddings(&db).unwrap();
+        let stats = drain_embed_queue(&db, &FakeEmbedder::new(8), EMBED_BATCH).unwrap();
+        assert_eq!((stats.drained, stats.failed), (3, 0));
     }
 
     #[test]
