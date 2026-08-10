@@ -107,6 +107,13 @@ message TraceSpan {
   // human over. 1.0 means the choice barely moves the answer; 100.0 means two
   // orders of magnitude. 0.0 when not computed.
   double divergence = 9;
+  // Which rule, other than the fused-score threshold, admitted this span
+  // into the trace's mentions. Empty for ordinary selection.
+  // "dense_geometry": the span's only evidence is dense and its calibrated
+  // confidence sits above the corpus's null-pair mean — a nomination
+  // (status stays "weak", no selected candidates), not a confident mention;
+  // it is excluded from ResolveResponse.mentions.
+  string admitted_by = 10;
 }
 
 message ResolveRequest {

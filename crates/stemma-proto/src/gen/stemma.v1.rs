@@ -123,6 +123,14 @@ pub struct TraceSpan {
     /// orders of magnitude. 0.0 when not computed.
     #[prost(double, tag = "9")]
     pub divergence: f64,
+    /// Which rule, other than the fused-score threshold, admitted this span
+    /// into the trace's mentions. Empty for ordinary selection.
+    /// "dense_geometry": the span's only evidence is dense and its calibrated
+    /// confidence sits above the corpus's null-pair mean — a nomination
+    /// (status stays "weak", no selected candidates), not a confident mention;
+    /// it is excluded from ResolveResponse.mentions.
+    #[prost(string, tag = "10")]
+    pub admitted_by: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveRequest {
