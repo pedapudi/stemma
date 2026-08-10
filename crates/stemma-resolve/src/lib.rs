@@ -174,6 +174,11 @@ pub struct Candidate {
     /// Up to [`SAMPLE_ROWIDS`] concrete rowids carrying the interpretation,
     /// ascending; the first is `rowid`.
     pub sample_rowids: Vec<i64>,
+    /// Exact count of grain-table rows this reading reaches, joined through
+    /// the schema. `row_count` counts the cells holding the value; `reach`
+    /// counts the facts they account for, which is what a query over this
+    /// reading would aggregate. 0 when not computed — see [`Span::divergence`].
+    pub reach: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +199,19 @@ pub struct Span {
     /// context coherence, encoder affinity, adjudication. The honest
     /// resolution is a question; consumers should ask, not guess.
     pub ambiguous: bool,
+    /// How far apart the viable readings are in what they would return:
+    /// `max(reach) / min(reach)`, 0.0 when not computed.
+    ///
+    /// Detecting ambiguity is cheap; acting on it is not. Against a large
+    /// corpus almost every mention has more than one reading, so a consumer
+    /// that asks whenever `ambiguous` is set asks constantly and gets muted.
+    /// This is the number that says whether asking is worth it: 1.0 means the
+    /// choice barely moves the answer, 100.0 means picking wrong moves it two
+    /// orders of magnitude.
+    ///
+    /// Computed only for ambiguous mentions, and only over the readings a
+    /// consumer might actually pick — one grouped count per (table, column).
+    pub divergence: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,6 +283,7 @@ pub fn resolve_full(
             candidates: Vec::new(),
             kg_alias: false,
             ambiguous: false,
+            divergence: 0.0,
         });
     }
 
@@ -380,6 +399,10 @@ pub fn resolve_full(
         trace.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
     mark_ambiguous(&mut trace);
+    // Last, because it only runs where `ambiguous` was set.
+    if let Err(e) = annotate_divergence(db, &mut trace) {
+        tracing::warn!(error = %e, "divergence estimation skipped");
+    }
     Ok(trace)
 }
 
@@ -621,6 +644,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
                 candidates: Vec::new(),
                 kg_alias: false,
                 ambiguous: false,
+                divergence: 0.0,
             });
         }
     }
@@ -1346,6 +1370,208 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
     Ok(())
 }
 
+/// The grain table: the join hub, i.e. the table with the most outgoing
+/// foreign keys, ties broken by row count. In a star or snowflake schema that
+/// is the fact table — the grain analytical questions aggregate over — and it
+/// is the natural common denominator for comparing readings that live in
+/// different dimension tables.
+fn grain_table(db: &StemmaDb) -> Result<Option<String>> {
+    let conn = db.conn();
+    let has_kg: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_kg == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT ns.label, count(*) AS fks,
+                coalesce(json_extract(ns.props, '$.rows'), 0) AS rows
+         FROM kg_edges e
+         JOIN kg_nodes ns ON ns.id = e.src AND ns.kind = 'table'
+         WHERE e.kind IN ('fk', 'inferred_fk')
+         GROUP BY ns.label
+         ORDER BY fks DESC, rows DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    Ok(match rows.next()? {
+        Some(r) => Some(r.get::<_, String>(0)?),
+        None => None,
+    })
+}
+
+/// Exact count of distinct grain rows each of `values` reaches, joined along
+/// `path`. One grouped query answers every value in the bucket.
+///
+/// `path` may be empty, meaning the reading already lives on the grain table;
+/// then this is a plain count of matching rows.
+fn reach_counts(
+    db: &StemmaDb,
+    path: &[stemma_kg::PathHop],
+    table: &str,
+    column: &str,
+    values: &[String],
+) -> Result<std::collections::HashMap<String, u64>> {
+    let mut out = std::collections::HashMap::new();
+    if values.is_empty() {
+        return Ok(out);
+    }
+    let mut sql = match path.first() {
+        None => format!(
+            "SELECT j0.\"{column}\", count(*) FROM {}.\"{table}\" j0",
+            stemmadb::SRC_SCHEMA
+        ),
+        Some(first) => {
+            let start = if first.forward {
+                &first.src_table
+            } else {
+                &first.dst_table
+            };
+            format!(
+                "SELECT j0.\"{column}\", count(DISTINCT j{}.rowid) FROM {}.\"{start}\" j0",
+                path.len(),
+                stemmadb::SRC_SCHEMA
+            )
+        }
+    };
+    for (i, hop) in path.iter().enumerate() {
+        let (next, cond) = if hop.forward {
+            (
+                &hop.dst_table,
+                format!("j{i}.\"{}\" = j{}.\"{}\"", hop.src_column, i + 1, hop.dst_column),
+            )
+        } else {
+            (
+                &hop.src_table,
+                format!("j{}.\"{}\" = j{i}.\"{}\"", i + 1, hop.src_column, hop.dst_column),
+            )
+        };
+        sql.push_str(&format!(
+            " JOIN {}.\"{next}\" j{} ON {cond}",
+            stemmadb::SRC_SCHEMA,
+            i + 1
+        ));
+    }
+    let ph = (0..values.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(
+        " WHERE j0.\"{column}\" IN ({ph}) GROUP BY 1"
+    ));
+    let params: Vec<&dyn stemmadb::rusqlite::ToSql> = values
+        .iter()
+        .map(|v| v as &dyn stemmadb::rusqlite::ToSql)
+        .collect();
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (v, n) = row?;
+        out.insert(v.to_lowercase(), n.max(0) as u64);
+    }
+    Ok(out)
+}
+
+/// Fills in `Candidate::reach` and `Span::divergence` for ambiguous mentions.
+///
+/// The point of the pass: `ambiguous` says the readings are tied, which is a
+/// statement about the evidence. It says nothing about whether the choice
+/// matters. Two readings of a surname that both reach a handful of rows are a
+/// tie worth ignoring; two that reach 3,984 and 23 rows are a tie worth
+/// interrupting a human over. Only the second deserves a question, and
+/// nothing upstream of here can tell them apart.
+///
+/// Bounded deliberately: ambiguous mentions only, viable readings only, one
+/// grouped query per (table, column). Readings that cannot reach the grain
+/// table are left at 0 and excluded from the ratio rather than counted as
+/// zero, which would report a spurious infinity.
+fn annotate_divergence(db: &StemmaDb, trace: &mut Trace) -> Result<()> {
+    let Some(grain) = grain_table(db)? else {
+        tracing::warn!("divergence: no grain table in the compiled graph");
+        return Ok(());
+    };
+    use stemma_kg::KnowledgeStore as _;
+    let store = stemma_kg::SqliteKnowledgeStore::new(db)?;
+    let mut path_cache: std::collections::HashMap<String, Option<Vec<stemma_kg::PathHop>>> =
+        std::collections::HashMap::new();
+
+    for i in trace.mentions.clone() {
+        if !trace.spans[i].ambiguous {
+            continue;
+        }
+        // The readings actually in contention: tied with the best by the
+        // same margin the ambiguity itself was judged on. A lower-ranked
+        // near-miss must not set the spread — on a mention whose two tied
+        // readings both reach 5,413 rows, an also-ran scoring 0.37 and
+        // reaching 4 would report 1353x for a choice that changes nothing.
+        let best = trace.spans[i]
+            .candidates
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.score)
+            .fold(f64::MIN, f64::max);
+        let mut buckets: std::collections::BTreeMap<(String, String), Vec<(usize, String)>> =
+            std::collections::BTreeMap::new();
+        for (ci, c) in trace.spans[i].candidates.iter().enumerate() {
+            if best - c.score >= CONTEXT_TIE_GAP {
+                continue;
+            }
+            // Exactly the set mark_ambiguous reasons over.
+            if c.is_doc || !c.selected {
+                continue;
+            }
+            buckets
+                .entry((c.table.clone(), c.column.clone()))
+                .or_default()
+                .push((ci, c.value.clone()));
+        }
+        for ((table, column), items) in &buckets {
+            if !path_cache.contains_key(table) {
+                let p = if table == &grain {
+                    Some(Vec::new())
+                } else {
+                    store
+                        .table_paths(table, &grain, MAX_PATH_HOPS, 1)?
+                        .into_iter()
+                        .next()
+                };
+                path_cache.insert(table.clone(), p);
+            }
+            let Some(path) = path_cache[table].clone() else {
+                continue;
+            };
+            let values: Vec<String> = items.iter().map(|(_, v)| v.clone()).collect();
+            let counts = reach_counts(db, &path, table, column, &values)?;
+            for (ci, v) in items {
+                if let Some(&n) = counts.get(&v.to_lowercase()) {
+                    trace.spans[i].candidates[*ci].reach = n;
+                }
+            }
+        }
+        let reaches: Vec<u64> = trace.spans[i]
+            .candidates
+            .iter()
+            .filter(|c| c.reach > 0)
+            .map(|c| c.reach)
+            .collect();
+        if reaches.len() >= 2 {
+            let (hi, lo) = (
+                *reaches.iter().max().unwrap_or(&0),
+                *reaches.iter().min().unwrap_or(&1),
+            );
+            trace.spans[i].divergence = hi as f64 / lo.max(1) as f64;
+        }
+    }
+    Ok(())
+}
+
 /// Which of `from_values` connect to which of `to_values` along `path` in the
 /// user database, and by which rows — one grouped join, fk columns taken from
 /// the compiled graph's edges. Returns `(from_value, to_value) -> (from_rowid,
@@ -1774,6 +2000,7 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 } else {
                     g.sample_rowids
                 },
+                reach: 0,
             }
         })
         .collect();
@@ -1867,6 +2094,7 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                 // affirmative no-record-matches conclusion.
                 nil: s.status == "weak",
                 ambiguous: s.ambiguous,
+                divergence: s.divergence,
                 readings: if s.ambiguous {
                     let top_score = s
                         .candidates
@@ -1883,6 +2111,7 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                             column: c.column.clone(),
                             value: c.value.clone(),
                             row_count: c.row_count,
+                            reach: c.reach,
                             rowid: c.rowid,
                         })
                         .collect()
@@ -1948,6 +2177,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
             .map(|s| pb::TraceSpan {
                 kg_alias: s.kg_alias,
                 ambiguous: s.ambiguous,
+                divergence: s.divergence,
                 id: s.id as u32,
                 text: s.text.clone(),
                 start: s.start as u32,
@@ -1970,6 +2200,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                         adjudicated: c.adjudicated,
                         coherence: c.coherence.clone().unwrap_or_default(),
                         row_count: c.row_count,
+                        reach: c.reach,
                         sample_rowids: c.sample_rowids.clone(),
                         channels: c
                             .channels
@@ -2535,6 +2766,77 @@ mod tests {
         assert_eq!(state.coherence.as_deref(), Some(evidence));
     }
 
+    /// Two readings of one value that are tied on score and far apart in
+    /// consequence: `Ellis` names one brand behind 2 sales, and 20 people
+    /// behind all 40.
+    fn skewed_reading_db(tag: &str) -> StemmaDb {
+        let dir = std::env::temp_dir().join(format!("stemma-resolve-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(
+                "CREATE TABLE brands (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE people (id INTEGER PRIMARY KEY, surname TEXT);
+                 CREATE TABLE sales (
+                     id INTEGER PRIMARY KEY,
+                     brand_id INTEGER REFERENCES brands(id),
+                     person_id INTEGER REFERENCES people(id));
+                 INSERT INTO brands VALUES (1, 'Ellis'), (2, 'Kestrel');",
+            )
+            .unwrap();
+            for i in 1..=20i64 {
+                c.execute("INSERT INTO people VALUES (?1, 'Ellis')", [i]).unwrap();
+            }
+            // Every sale touches an Ellis person; only two touch the brand.
+            for i in 1..=40i64 {
+                let brand = if i <= 2 { 1 } else { 2 };
+                c.execute(
+                    "INSERT INTO sales VALUES (?1, ?2, ?3)",
+                    [i, brand, (i - 1) % 20 + 1],
+                )
+                .unwrap();
+            }
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn divergence_measures_what_the_choice_costs() {
+        let db = skewed_reading_db("divergence");
+        stemma_kg::compile(&db, false).unwrap();
+        let mut trace = resolve_lexical(&db, "what about Ellis").unwrap();
+        annotate_divergence(&db, &mut trace).unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Ellis")
+            .expect("Ellis mention");
+        assert!(span.ambiguous, "brand and surname are distinct readings");
+
+        let reach = |table: &str| {
+            span.candidates
+                .iter()
+                .find(|c| c.table == table && c.selected)
+                .unwrap_or_else(|| panic!("{table} reading"))
+                .reach
+        };
+        // Exact counts of grain rows, not estimates: sales is the grain
+        // (most outgoing foreign keys), and the two readings reach 2 and 40.
+        assert_eq!((reach("brands"), reach("people")), (2, 40));
+        assert!(
+            (span.divergence - 20.0).abs() < 1e-9,
+            "divergence should be 40/2, got {}",
+            span.divergence
+        );
+    }
+
     /// The context-coherence fixture: the value 'Atlas Freight' lives in
     /// two columns, and a document corpus gives the compiler a term
     /// ("cargo") whose content affinity points at exactly one of them
@@ -2767,6 +3069,7 @@ mod tests {
             coherence: None,
             row_count: 1,
             sample_rowids: vec![rowid],
+            reach: 0,
         }
     }
 
@@ -2788,6 +3091,7 @@ mod tests {
                 ],
                 kg_alias: false,
                 ambiguous: false,
+                divergence: 0.0,
             }],
             mentions: vec![0],
             elapsed_ms: 0.0,
@@ -3029,6 +3333,7 @@ mod tests {
             coherence: None,
             row_count: 1,
             sample_rowids: vec![rowid],
+            reach: 0,
         }
     }
 
@@ -3042,6 +3347,7 @@ mod tests {
             end: 7,
             status: "selected".into(),
             ambiguous: false,
+            divergence: 0.0,
             candidates: vec![
                 interp_cand("offices", "city", 1, 0.60),
                 interp_cand("products", "name", 1, 0.58),
