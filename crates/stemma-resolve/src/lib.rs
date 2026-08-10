@@ -272,8 +272,10 @@ pub fn resolve_full(
     // greedy selection arbitrate — strong lexical anchors (exact ≈ 0.9)
     // outrank it and mark it overlapped; anchor-free semantic queries are
     // won by it, which also suppresses incidental substring junk.
+    let mut full_span_id: Option<usize> = None;
     if embedder.is_some() && tokens.len() > MAX_SPAN_TOKENS {
         let (start, end) = (tokens[0].start, tokens[tokens.len() - 1].end);
+        full_span_id = Some(spans.len());
         spans.push(Span {
             id: spans.len(),
             text: query[start..end].to_string(),
@@ -286,6 +288,16 @@ pub fn resolve_full(
             divergence: 0.0,
         });
     }
+
+    // The token-bearing extent of the query: the text the full-query span
+    // embeds, and the text the affinity passes condition on. One canonical
+    // string means the whole query is embedded AT MOST ONCE per resolution —
+    // the dense phase's vector, when it exists, is reused below.
+    let whole_query: String = match (tokens.first(), tokens.last()) {
+        (Some(f), Some(l)) => query[f.start..l.end].to_string(),
+        _ => query.to_string(),
+    };
+    let mut query_vec: Option<Vec<f32>> = None;
 
     // KG-assisted mention detection: spans matching a compiled phrase/term
     // entity are marked and favored in selection — multi-word entities like
@@ -349,6 +361,12 @@ pub fn resolve_full(
             match embedder.embed(&texts) {
                 Ok(vecs) => {
                     for (id, v) in ids.into_iter().zip(vecs) {
+                        // The full-query span's vector doubles as THE query
+                        // embedding for the affinity passes — paid for once
+                        // here, never re-requested.
+                        if Some(id) == full_span_id {
+                            query_vec = Some(v.clone());
+                        }
                         let hits = dense_hits(db, &v)?;
                         raw.entry(id).or_default().extend(hits);
                     }
@@ -387,7 +405,13 @@ pub fn resolve_full(
     // Phase 4b: context affinity — tied value interpretations (same value in
     // two columns) separated by conditioning the interpretation cards on the
     // full query. Self-contained section below; degrades silently.
-    apply_context_affinity(db, embedder, query, &mut spans);
+    apply_context_affinity(db, embedder, &whole_query, &mut spans, &mut query_vec);
+
+    // Phase 4c: column affinity — the whole query scored against the
+    // schema-derived column cards; within the ambiguity margin it reorders,
+    // beyond it it can only flag contention. Self-contained section below;
+    // degrades silently.
+    apply_column_affinity(db, embedder, &whole_query, &mut spans, &mut query_vec);
 
     let mentions = select_mentions(&mut spans);
 
@@ -1758,11 +1782,16 @@ const CONTEXT_CAP: f64 = 0.9;
 /// (table, column) — by cosine between the full query's embedding and each
 /// interpretation's card vector. Infallible by design: every missing signal
 /// degrades to a no-op.
+///
+/// `query_vec` is the resolution-wide cache of the whole query's embedding —
+/// possibly already paid for by the dense channel, shared with column
+/// affinity — so the query is embedded at most once per resolution.
 fn apply_context_affinity(
     db: &StemmaDb,
     embedder: Option<&dyn stemma_embed::Embedder>,
     query: &str,
     spans: &mut [Span],
+    query_vec: &mut Option<Vec<f32>>,
 ) {
     let Some(embedder) = embedder else { return };
     let conn = db.conn();
@@ -1789,9 +1818,9 @@ fn apply_context_affinity(
         return;
     }
 
-    // The query embedding is shared by every tied span; computed lazily so a
-    // resolution with no ties costs no embedding call.
-    let mut query_vec: Option<Vec<f32>> = None;
+    // The query embedding is shared by every tied span (and by column
+    // affinity); computed lazily so a resolution with no ties costs no
+    // embedding call.
     for span in spans.iter_mut() {
         if span.status != "selected" || span.candidates.len() < 2 {
             continue;
@@ -1816,7 +1845,7 @@ fn apply_context_affinity(
         };
         if query_vec.is_none() {
             match embedder.embed(&[embedder.format_query(query)]) {
-                Ok(mut v) if !v.is_empty() => query_vec = Some(v.remove(0)),
+                Ok(mut v) if !v.is_empty() => *query_vec = Some(v.remove(0)),
                 _ => return, // embedder down: the whole pass degrades
             }
         }
@@ -1897,6 +1926,225 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
 }
 
 // ======================= end context-affinity section ======================
+
+// ===========================================================================
+// Column affinity over schema-derived column cards (col_cards) — the
+// span-independent signal. Self-contained.
+//
+// Every lexical channel needs a span that matches a stored value; the
+// decisive evidence for a reading can live in a DIFFERENT part of the query.
+// "items from the Chicago warehouse": the span "Chicago" matches users.city
+// exactly and distribution_centers.name fuzzily, and the word that settles
+// it — "warehouse" — appears nowhere in the data. The relation is between a
+// CONCEPT and a COLUMN, not between two strings in the corpus, so only the
+// column's own identity can carry it. Ingest embeds one card per (table,
+// column) straight from the schema (stemma_ingest::build_column_cards); this
+// pass scores the WHOLE query against all of them — a linear scan over a
+// schema's worth of vectors (dozens, which is why no index is needed),
+// reusing the query embedding the dense channel may already have paid for.
+//
+// What the affinity may do is bounded by the ambiguity margin:
+// - within a top-2 tie (gap under CONTEXT_TIE_GAP) it reorders exactly as
+//   context affinity does: CONTEXT_BOOST to the cosine winner when the gap
+//   clears CONTEXT_COS_GAP, capped at CONTEXT_CAP. The boost is half the
+//   tie gap, so a lexical ordering decisive by more than the margin can
+//   never be flipped — structurally, not by a check;
+// - beyond the margin it never reorders. When the schema-wide best-affinity
+//   column belongs to a candidate the lexical channels left behind — and by
+//   more than CONTEXT_COS_GAP over the leader's own column — the span is
+//   marked `ambiguous`: column affinity is context evidence, not a match,
+//   and the honest resolution of a contradiction between the two is a
+//   question, never a manufactured winner.
+//
+// Every candidate the pass examined carries a "col_affinity" ChannelScore
+// (rank = the column's affinity rank over ALL cards, raw = the cosine), so a
+// trace reader sees exactly why a reading was reordered or flagged.
+//
+// This is the schema-sourced replacement for the mined col_affinity edges
+// (issue #8): it keys on the compiled graph's presence like the other
+// knowledge-layer context passes, and degrades silently without an
+// embedder, without cards, or on a registry model mismatch.
+// ===========================================================================
+
+/// Reweights (within the margin) or flags (beyond it) candidates by cosine
+/// between the whole query and each candidate column's schema card.
+/// Infallible by design: every missing signal degrades to a no-op.
+fn apply_column_affinity(
+    db: &StemmaDb,
+    embedder: Option<&dyn stemma_embed::Embedder>,
+    query: &str,
+    spans: &mut [Span],
+    query_vec: &mut Option<Vec<f32>>,
+) {
+    let Some(embedder) = embedder else { return };
+    let conn = db.conn();
+    let present: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges')
+                    * (SELECT count(*) FROM sqlite_master WHERE name = 'col_cards')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if present == 0 {
+        return;
+    }
+    // Same-space discipline as every vector consumer: a registry row naming
+    // a different model makes the cosine meaningless — refuse, don't guess.
+    let registered: Option<String> = conn
+        .query_row(
+            "SELECT model FROM model_registry WHERE vector_table = 'col_cards'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if registered.as_deref() != Some(embedder.identity().model.as_str()) {
+        return;
+    }
+
+    // A span qualifies when there is something to weigh: distinct readings.
+    let qualifies = |s: &Span| {
+        s.status == "selected"
+            && s.candidates.len() >= 2
+            && s.candidates.iter().any(|c| !c.is_doc)
+    };
+    if !spans.iter().any(|s| qualifies(s)) {
+        return;
+    }
+
+    if query_vec.is_none() {
+        match embedder.embed(&[embedder.format_query(query)]) {
+            Ok(mut v) if !v.is_empty() => *query_vec = Some(v.remove(0)),
+            _ => return, // embedder down: the whole pass degrades
+        }
+    }
+    let q = query_vec.as_ref().unwrap();
+
+    // Query-conditioned affinity of every column card — computed once per
+    // resolution, the full linear scan.
+    let mut affinity: std::collections::HashMap<(String, String), f64> =
+        std::collections::HashMap::new();
+    let loaded: Result<()> = (|| {
+        let mut stmt =
+            conn.prepare("SELECT src_table, src_column, embedding FROM col_cards")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (t, c, blob) = row?;
+            if blob.is_empty() || blob.len() % 4 != 0 {
+                continue;
+            }
+            let v: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            if let Some(cos) = cosine(q, &v) {
+                affinity.insert((t, c), cos);
+            }
+        }
+        Ok(())
+    })();
+    if loaded.is_err() || affinity.is_empty() {
+        return;
+    }
+    let max_cos = affinity.values().fold(f64::MIN, |m, &x| m.max(x));
+    let rank_of = |cos: f64| affinity.values().filter(|&&x| x > cos + 1e-12).count();
+
+    for span in spans.iter_mut() {
+        if !qualifies(span) {
+            continue;
+        }
+        let cos_of = |c: &Candidate| {
+            affinity
+                .get(&(c.table.clone(), c.column.clone()))
+                .copied()
+                .filter(|_| !c.is_doc)
+        };
+        // The span's best-affinity value reading — the one the schema says
+        // this query is most about.
+        let best = span
+            .candidates
+            .iter()
+            .filter_map(|c| cos_of(c).map(|cos| ((c.table.clone(), c.column.clone()), cos)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((best_key, best_cos)) = best else {
+            continue;
+        };
+
+        // Evidence first: the candidates the pass weighs — the top two and
+        // the best-affinity reading — carry the affinity as a channel entry
+        // whether or not anything moves.
+        for i in 0..span.candidates.len() {
+            let key = (
+                span.candidates[i].table.clone(),
+                span.candidates[i].column.clone(),
+            );
+            if i > 1 && key != best_key {
+                continue;
+            }
+            let Some(cos) = cos_of(&span.candidates[i]) else {
+                continue;
+            };
+            let c = &mut span.candidates[i];
+            if !c.channels.iter().any(|ch| ch.channel == "col_affinity") {
+                c.channels.push(ChannelScore {
+                    channel: "col_affinity".into(),
+                    rank: rank_of(cos),
+                    raw: cos,
+                });
+            }
+        }
+
+        // Within the margin: reorder, exactly as context affinity does.
+        let tied = {
+            let (a, b) = (&span.candidates[0], &span.candidates[1]);
+            !a.is_doc
+                && !b.is_doc
+                && (a.table != b.table || a.column != b.column)
+                && a.score - b.score < CONTEXT_TIE_GAP
+        };
+        if tied {
+            if let (Some(cos_a), Some(cos_b)) = (
+                cos_of(&span.candidates[0]),
+                cos_of(&span.candidates[1]),
+            ) {
+                if (cos_a - cos_b).abs() > CONTEXT_COS_GAP {
+                    let winner = if cos_a >= cos_b { 0 } else { 1 };
+                    let c = &mut span.candidates[winner];
+                    c.score = c.score.max((c.score + CONTEXT_BOOST).min(CONTEXT_CAP));
+                    span.candidates.sort_by(|x, y| y.score.total_cmp(&x.score));
+                }
+            }
+        }
+
+        // Beyond the margin: never reorder — flag. The schema-wide argmax
+        // column belonging to a non-leading reading, decisively (over
+        // CONTEXT_COS_GAP) above the leader's own column, is a contradiction
+        // between context evidence and lexical evidence; the honest answer
+        // is a question.
+        if span.ambiguous {
+            continue;
+        }
+        let top = &span.candidates[0];
+        let (Some(top_cos), top_key) = (cos_of(top), (top.table.clone(), top.column.clone()))
+        else {
+            continue;
+        };
+        if best_cos + 1e-12 >= max_cos
+            && best_key != top_key
+            && best_cos - top_cos > CONTEXT_COS_GAP
+        {
+            span.ambiguous = true;
+        }
+    }
+}
+
+// ======================= end column-affinity section =======================
 
 /// Reciprocal-rank fusion across channels, with a length-affinity factor so
 /// short stored values that closely match the span outrank long documents
@@ -3456,6 +3704,7 @@ mod tests {
             Some(&MarkerEmbedder),
             "which product sku is Mercury",
             &mut spans,
+            &mut None,
         );
         let span = &spans[0];
         assert_eq!(
@@ -3492,7 +3741,7 @@ mod tests {
         // No embedder.
         let db = interp_db(true);
         let mut spans = tied_spans();
-        apply_context_affinity(&db, None, "which product sku is Mercury", &mut spans);
+        apply_context_affinity(&db, None, "which product sku is Mercury", &mut spans, &mut None);
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
 
         // No vec_interp (queue never drained).
@@ -3503,6 +3752,7 @@ mod tests {
             Some(&MarkerEmbedder),
             "which product sku is Mercury",
             &mut spans,
+            &mut None,
         );
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
 
@@ -3522,6 +3772,7 @@ mod tests {
             Some(&MarkerEmbedder),
             "which product sku is Mercury",
             &mut spans,
+            &mut None,
         );
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
 
@@ -3535,6 +3786,7 @@ mod tests {
             Some(&MarkerEmbedder),
             "which product sku is Mercury",
             &mut spans,
+            &mut None,
         );
         assert!(spans[0]
             .candidates
@@ -3556,6 +3808,7 @@ mod tests {
             Some(&MarkerEmbedder),
             "office product Mercury",
             &mut spans,
+            &mut None,
         );
         let span = &spans[0];
         assert_eq!(span.candidates[0].table, "offices", "order unchanged");
@@ -3576,5 +3829,269 @@ mod tests {
             (raws[0] - raws[1]).abs() < 1e-6,
             "symmetric by design: {raws:?}"
         );
+    }
+
+    // ------------------- column-affinity section tests --------------------
+
+    /// Marker embedder for the concept-to-column gap: one axis ties the
+    /// query concept "warehouse" to the distribution_centers cards (schema
+    /// identity, not any stored value), one names users.city, one carries
+    /// the shared literal "chicago" that appears in BOTH columns' example
+    /// vocabularies — so the geometry reproduces the issue-#8 failure in
+    /// miniature. Counts embedding calls to prove the whole-query vector is
+    /// requested at most once per resolution.
+    struct WarehouseEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    const WAREHOUSE_AXES: &[&[&str]] = &[
+        &["warehouse", "distribution_centers"],
+        &["users.city"],
+        &["chicago"],
+    ];
+
+    impl WarehouseEmbedder {
+        fn new() -> Self {
+            Self { calls: 0.into() }
+        }
+        fn vector(text: &str) -> Vec<f32> {
+            let t = text.to_lowercase();
+            let mut v: Vec<f32> = WAREHOUSE_AXES
+                .iter()
+                .map(|words| {
+                    if words.iter().any(|w| t.contains(w)) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            v.push(0.25); // bias axis: zero-marker texts stay embeddable
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+            v
+        }
+    }
+
+    impl stemma_embed::Embedder for WarehouseEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                backend: "fake".into(),
+                model: "warehouse-embedder".into(),
+                dimension: WAREHOUSE_AXES.len() + 1,
+                query_template: String::new(),
+            }
+        }
+    }
+
+    /// The issue-#8 fixture in miniature: users.city holds the exact,
+    /// saturating reading of "Chicago"; distribution_centers.name holds the
+    /// fuzzy one that the query's OTHER words are actually about.
+    fn warehouse_db(cards: bool, kg: bool) -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.distribution_centers(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO src.distribution_centers VALUES
+                    (1, 'Memphis TN'), (2, 'Chicago IL'), (3, 'Houston TX');
+                 CREATE TABLE src.users(id INTEGER PRIMARY KEY, first_name TEXT,
+                     last_name TEXT, city TEXT, state TEXT);
+                 INSERT INTO src.users VALUES
+                    (1, 'Michael', 'Smith', 'Chicago', 'Illinois'),
+                    (2, 'Jennifer', 'Lee', 'Houston', 'Texas'),
+                    (3, 'Jordan', 'Walker', 'Memphis', 'Tennessee');
+                 CREATE TABLE src.order_items(id INTEGER PRIMARY KEY,
+                     user_id INTEGER, status TEXT, sale_price REAL);
+                 INSERT INTO src.order_items VALUES
+                    (1, 1, 'Complete', 12.5), (2, 2, 'Shipped', 20.0),
+                    (3, 3, 'Returned', 7.25);",
+            )
+            .unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        if kg {
+            stemma_kg::compile(&db, false).unwrap();
+        }
+        if cards {
+            stemma_ingest::build_column_cards(&db, &WarehouseEmbedder::new()).unwrap();
+        }
+        db
+    }
+
+    fn wh_cand(table: &str, column: &str, value: &str, score: f64) -> Candidate {
+        Candidate {
+            value: value.into(),
+            ..interp_cand(table, column, 1, score)
+        }
+    }
+
+    fn wh_span(candidates: Vec<Candidate>) -> Vec<Span> {
+        vec![Span {
+            id: 0,
+            text: "Chicago".into(),
+            start: 0,
+            end: 7,
+            status: "selected".into(),
+            ambiguous: false,
+            divergence: 0.0,
+            candidates,
+            kg_alias: false,
+        }]
+    }
+
+    /// The acceptance case, end to end: the exact users.city hit saturates
+    /// and stays on top — affinity is context evidence, not a match — but
+    /// the word "warehouse" lifts the distribution_centers reading into
+    /// contention: the span is flagged ambiguous and both readings carry the
+    /// col_affinity evidence, the warehouse column at schema-wide rank 0.
+    #[test]
+    fn column_affinity_lifts_the_warehouse_reading_into_contention() {
+        let db = warehouse_db(true, true);
+        let embedder = WarehouseEmbedder::new();
+        let trace =
+            resolve_full(&db, "items from the Chicago warehouse", Some(&embedder), None)
+                .unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Chicago")
+            .expect("Chicago mention");
+        let top = &span.candidates[0];
+        assert_eq!(
+            (top.table.as_str(), top.column.as_str()),
+            ("users", "city"),
+            "the exact reading must not be dethroned beyond the margin"
+        );
+        assert!(
+            span.ambiguous,
+            "the warehouse reading must be lifted into contention: {:?}",
+            span.candidates
+                .iter()
+                .map(|c| (c.table.as_str(), c.score))
+                .collect::<Vec<_>>()
+        );
+        let dc = span
+            .candidates
+            .iter()
+            .find(|c| c.table == "distribution_centers" && c.column == "name")
+            .expect("distribution_centers.name candidate");
+        let aff = dc
+            .channels
+            .iter()
+            .find(|ch| ch.channel == "col_affinity")
+            .expect("affinity evidence on the lifted reading");
+        assert_eq!(aff.rank, 0, "warehouse column is the schema-wide argmax");
+        let top_aff = top
+            .channels
+            .iter()
+            .find(|ch| ch.channel == "col_affinity")
+            .expect("affinity evidence on the leader too");
+        assert!(aff.raw > top_aff.raw + CONTEXT_COS_GAP);
+        // The whole query was embedded exactly once, shared across passes.
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one embedding call for the whole query, reused"
+        );
+    }
+
+    #[test]
+    fn column_affinity_reorders_within_the_margin_and_only_flags_beyond_it() {
+        let db = warehouse_db(true, true);
+        // A genuine tie (gap 0.02 < CONTEXT_TIE_GAP): affinity may order it.
+        let mut spans = wh_span(vec![
+            wh_cand("users", "city", "Chicago", 0.60),
+            wh_cand("distribution_centers", "name", "Chicago IL", 0.58),
+        ]);
+        apply_column_affinity(
+            &db,
+            Some(&WarehouseEmbedder::new()),
+            "items from the Chicago warehouse",
+            &mut spans,
+            &mut None,
+        );
+        let span = &spans[0];
+        assert_eq!(span.candidates[0].table, "distribution_centers");
+        assert!((span.candidates[0].score - 0.62).abs() < 1e-9, "0.58 + CONTEXT_BOOST");
+        assert!((span.candidates[1].score - 0.60).abs() < 1e-9, "loser untouched");
+        assert!(span.candidates[0].score <= CONTEXT_CAP);
+        assert!(
+            !span.ambiguous,
+            "no contradiction once the affinity winner leads"
+        );
+
+        // Decisive lexical evidence (gap 0.44 >> CONTEXT_TIE_GAP): the order
+        // must stand untouched; the contradiction is flagged, not resolved.
+        let mut spans = wh_span(vec![
+            wh_cand("users", "city", "Chicago", 0.92),
+            wh_cand("distribution_centers", "name", "Chicago IL", 0.48),
+        ]);
+        apply_column_affinity(
+            &db,
+            Some(&WarehouseEmbedder::new()),
+            "items from the Chicago warehouse",
+            &mut spans,
+            &mut None,
+        );
+        let span = &spans[0];
+        assert_eq!(span.candidates[0].table, "users", "no manufactured winner");
+        assert!((span.candidates[0].score - 0.92).abs() < 1e-9, "scores untouched");
+        assert!((span.candidates[1].score - 0.48).abs() < 1e-9);
+        assert!(span.ambiguous, "beyond the margin, contention is a flag");
+        for c in &span.candidates {
+            assert!(
+                c.channels.iter().any(|ch| ch.channel == "col_affinity"),
+                "both examined readings carry the evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn column_affinity_is_a_noop_without_signals() {
+        let spans_fixture = || {
+            wh_span(vec![
+                wh_cand("users", "city", "Chicago", 0.60),
+                wh_cand("distribution_centers", "name", "Chicago IL", 0.58),
+            ])
+        };
+        let baseline = serde_json::to_value(spans_fixture()).unwrap();
+        let query = "items from the Chicago warehouse";
+
+        // No embedder.
+        let db = warehouse_db(true, true);
+        let mut spans = spans_fixture();
+        apply_column_affinity(&db, None, query, &mut spans, &mut None);
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+
+        // No cards built.
+        let db = warehouse_db(false, true);
+        let mut spans = spans_fixture();
+        apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+
+        // No compiled graph: the knowledge-layer axis is off.
+        let db = warehouse_db(true, false);
+        let mut spans = spans_fixture();
+        apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
+
+        // Cards registered to a different model: mixing spaces would be
+        // worse than skipping, so the pass refuses silently.
+        let db = warehouse_db(true, true);
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET model = 'some-other-model'
+                 WHERE vector_table = 'col_cards'",
+                [],
+            )
+            .unwrap();
+        let mut spans = spans_fixture();
+        apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
+        assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
     }
 }

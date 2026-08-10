@@ -389,6 +389,18 @@ fn drain_embeddings_batched(
     batch: usize,
     notes: &mut Vec<String>,
 ) {
+    // Column cards: schema-derived, receipted, dozens of embeddings — built
+    // before the queues so column affinity works even when a drain degrades.
+    match stemma_ingest::build_column_cards(db, embedder) {
+        Ok(s) if s.rebuilt => notes.push(format!(
+            "column cards: {} embedded ({})",
+            s.cards, s.model
+        )),
+        Ok(_) => {}
+        Err(e) => notes.push(format!(
+            "column card build failed: {e} (column affinity degraded)"
+        )),
+    }
     match stemma_ingest::enqueue_missing_embeddings(db) {
         Ok(0) => {}
         Ok(n) => notes.push(format!("embed queue: {n} document cells enqueued")),
