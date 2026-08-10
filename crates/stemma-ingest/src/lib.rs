@@ -1189,6 +1189,220 @@ pub fn derive_dense_geometry(db: &StemmaDb) -> Result<Option<(f64, f64)>> {
     Ok(Some((null_mean, nn_mean)))
 }
 
+// --- Column cards: the schema's own identity, embedded ---------------------
+//
+// One card per (table, column), built from PRAGMA table_info over the USER
+// schema — never from the lexical index. Measure columns (prices, quantities,
+// timestamps) are exactly what aggregate questions target and they never
+// appear in any value index; sourcing from the schema gives them cards too.
+// The card text is the column's identity plus its value vocabulary:
+//
+//     distribution_centers.name · 10 distinct values · e.g. Memphis TN, …
+//
+// A schema's worth of cards is dozens of vectors, not millions, so they live
+// in a plain table with embedding blobs and are scanned linearly at resolve
+// time — no vec0 index, no queue, no drain (issue #8: 35 embeddings against
+// the 846,989 of the interpretation path, and fixed against data growth).
+
+/// Names the column-card serialization in force; folded into the `col_cards`
+/// derivation fingerprint so a format change rebuilds every card — the same
+/// discipline as [`INTERP_CARD_FORMAT`], enforced through the receipt
+/// instead of a registry probe because rebuilds here are cheap.
+pub const COL_CARD_FORMAT: &str = "schema-columns-v1";
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ColCardStats {
+    pub cards: usize,
+    pub model: String,
+    pub dimension: usize,
+    /// False when the receipt matched and nothing was embedded.
+    pub rebuilt: bool,
+}
+
+/// Builds — or verifies — the embedded column cards.
+///
+/// Refresh law: the derivation is receipted in `derivations` under
+/// `col_cards`, fingerprinted on the model identity plus every card's full
+/// text (which folds in the schema shape, the per-column distinct counts and
+/// the example vocabulary — the exact encoder input). Cards rebuild when any
+/// of that changes and never otherwise; a model change rebuilds wholesale
+/// (drop + re-embed), so vectors from two models are never mixed in the
+/// table — the same one-model-per-table discipline the drain enforces by
+/// refusal, met here by reconstruction.
+///
+/// Bounds, stated because they are cost bounds: each example value is
+/// truncated at [`EXACT_MAX_LEN`] chars (where "being a value" operationally
+/// ends) and examples are appended — most frequent first — only while the
+/// card stays within [`INTERP_CARD_MAX_CHARS`], the one card budget every
+/// encoder-facing serialization shares. Both bounds are recorded in the
+/// receipt's `value_json`.
+///
+/// Cards are documents in the asymmetric retrieval scheme: embedded raw,
+/// never through the query template. Requires the lexical schema (the
+/// `derivations` table); call after [`build_lexical_index`], as every
+/// registration path already does.
+pub fn build_column_cards(db: &StemmaDb, embedder: &dyn Embedder) -> Result<ColCardStats> {
+    let conn = db.conn();
+
+    // Card texts, one per (table, column) of the user schema.
+    let mut cards: Vec<(String, String, String)> = Vec::new();
+    for table in db.src_tables()? {
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT name FROM pragma_table_info(?1, '{SRC_SCHEMA}')"
+            ))?;
+            let rows = stmt.query_map([&table], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for col in cols {
+            let n_distinct: i64 = conn.query_row(
+                &format!("SELECT count(DISTINCT \"{col}\") FROM {SRC_SCHEMA}.\"{table}\""),
+                [],
+                |r| r.get(0),
+            )?;
+            let mut card = format!("{table}.{col} · {n_distinct} distinct values");
+            // Most frequent values first ("frequent_value" semantics: for a
+            // 26-value vocabulary column the values ARE the semantics), with
+            // a deterministic text tiebreak. The statement streams; example
+            // consumption stops as soon as the card budget is full.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT CAST(\"{col}\" AS TEXT) FROM {SRC_SCHEMA}.\"{table}\"
+                 WHERE \"{col}\" IS NOT NULL AND typeof(\"{col}\") != 'blob'
+                 GROUP BY \"{col}\" ORDER BY count(*) DESC, 1"
+            ))?;
+            let mut rows = stmt.query([])?;
+            let mut first = true;
+            while let Some(row) = rows.next()? {
+                let example: String = row.get(0)?;
+                let example: String = example.trim().chars().take(EXACT_MAX_LEN).collect();
+                if example.is_empty() {
+                    continue;
+                }
+                let frag = if first {
+                    format!(" · e.g. {example}")
+                } else {
+                    format!(", {example}")
+                };
+                if card.chars().count() + frag.chars().count() > INTERP_CARD_MAX_CHARS {
+                    break;
+                }
+                card.push_str(&frag);
+                first = false;
+            }
+            cards.push((table.clone(), col, card));
+        }
+    }
+
+    let identity = embedder.identity();
+    let joined: String = cards
+        .iter()
+        .map(|(_, _, c)| c.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fingerprint = content_hash(&format!(
+        "{}|{COL_CARD_FORMAT}|{joined}",
+        identity.model
+    ));
+
+    let existing: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'col_cards'",
+        [],
+        |r| r.get(0),
+    )?;
+    let registered: Option<String> = conn
+        .query_row(
+            "SELECT model FROM model_registry WHERE vector_table = 'col_cards'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if existing > 0
+        && registered.as_deref() == Some(identity.model.as_str())
+        && read_receipt(conn, "col_cards")?.as_deref() == Some(fingerprint.as_str())
+    {
+        let dim: i64 = conn
+            .query_row(
+                "SELECT dimension FROM model_registry WHERE vector_table = 'col_cards'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        return Ok(ColCardStats {
+            cards: cards.len(),
+            model: identity.model,
+            dimension: dim as usize,
+            rebuilt: false,
+        });
+    }
+
+    // Embed every card — one bounded pass, chunked only to keep any single
+    // request inside the drain's proven payload size.
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(cards.len());
+    for chunk in cards.chunks(EMBED_BATCH) {
+        let texts: Vec<String> = chunk.iter().map(|(_, _, c)| c.clone()).collect();
+        vectors.extend(embedder.embed(&texts)?);
+    }
+    let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+
+    let tx = conn.unchecked_transaction()?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS col_cards;
+         CREATE TABLE col_cards (
+             src_table  TEXT NOT NULL,
+             src_column TEXT NOT NULL,
+             card       TEXT NOT NULL,
+             embedding  BLOB NOT NULL,
+             PRIMARY KEY (src_table, src_column)
+         ) STRICT;",
+    )?;
+    {
+        let mut ins = conn.prepare(
+            "INSERT INTO col_cards (src_table, src_column, card, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for ((t, c, card), v) in cards.iter().zip(&vectors) {
+            let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            ins.execute(stemmadb::rusqlite::params![t, c, card, blob])?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO model_registry
+             (vector_table, backend, model, dimension, quantization, query_template, card_format)
+         VALUES ('col_cards', ?1, ?2, ?3, 'f32', ?4, ?5)
+         ON CONFLICT(vector_table) DO UPDATE SET backend = ?1, model = ?2,
+             dimension = ?3, query_template = ?4, card_format = ?5",
+        stemmadb::rusqlite::params![
+            identity.backend,
+            identity.model,
+            dim as i64,
+            identity.query_template,
+            COL_CARD_FORMAT
+        ],
+    )?;
+    write_receipt(
+        conn,
+        "col_cards",
+        &fingerprint,
+        &format!(
+            "{{\"cards\":{},\"card_max_chars\":{INTERP_CARD_MAX_CHARS},\
+             \"example_max_chars\":{EXACT_MAX_LEN}}}",
+            cards.len()
+        ),
+    )?;
+    tx.commit()?;
+    tracing::info!(
+        cards = cards.len(),
+        model = %identity.model,
+        "column cards rebuilt (examples bounded to the card budget)"
+    );
+    Ok(ColCardStats {
+        cards: cards.len(),
+        model: identity.model,
+        dimension: dim,
+        rebuilt: true,
+    })
+}
+
 /// Items per drain cycle: claimed together, embedded as [`EMBED_CONCURRENCY`]
 /// concurrent requests, written back in one transaction. Sized so each
 /// request carries EMBED_BATCH / EMBED_CONCURRENCY documents — wide enough
@@ -3588,5 +3802,142 @@ mod tests {
                 "distinct docs must not collapse: {rowid} at {cos}"
             );
         }
+    }
+
+    // ----------------------- column-card tests ----------------------------
+
+    /// [`FakeEmbedder`] with an observable call count and a nameable model,
+    /// so tests can assert the receipt short-circuits re-embedding and that
+    /// a model change rebuilds wholesale.
+    struct CountingEmbedder {
+        inner: FakeEmbedder,
+        model: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn new(model: &str) -> Self {
+            Self {
+                inner: FakeEmbedder::new(8),
+                model: model.into(),
+                calls: 0.into(),
+            }
+        }
+    }
+
+    impl stemma_embed::Embedder for CountingEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.embed(texts)
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            stemma_embed::ModelIdentity {
+                model: self.model.clone(),
+                ..self.inner.identity()
+            }
+        }
+    }
+
+    /// A relational fixture with a measure column: `sale_price` is REAL,
+    /// never lexically indexed, and must still get a card — measure columns
+    /// are what aggregate questions target (issue #8's eighth probe).
+    fn card_db() -> StemmaDb {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.order_items(
+                     id INTEGER PRIMARY KEY, status TEXT, sale_price REAL);
+                 INSERT INTO src.order_items VALUES
+                    (1, 'Complete', 12.5), (2, 'Shipped', 20.0), (3, 'Complete', 7.25);",
+            )
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn column_cards_cover_measure_columns_and_rebuild_only_on_change() {
+        let db = card_db();
+        let e = CountingEmbedder::new("card-model");
+        let stats = build_column_cards(&db, &e).unwrap();
+        assert!(stats.rebuilt);
+        assert_eq!(stats.cards, 3, "id, status, sale_price all get cards");
+        assert_eq!(e.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let conn = db.conn();
+        // The measure column's card exists and carries schema-level identity
+        // plus vocabulary, straight from the data.
+        let price_card: String = conn
+            .query_row(
+                "SELECT card FROM col_cards
+                 WHERE src_table = 'order_items' AND src_column = 'sale_price'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            price_card.starts_with("order_items.sale_price · 3 distinct values · e.g. "),
+            "unexpected card text: {price_card}"
+        );
+        let status_card: String = conn
+            .query_row(
+                "SELECT card FROM col_cards
+                 WHERE src_table = 'order_items' AND src_column = 'status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Most frequent example first.
+        assert_eq!(
+            status_card,
+            "order_items.status · 2 distinct values · e.g. Complete, Shipped"
+        );
+        // Model identity recorded; derivation receipted.
+        let (model, receipts): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT model FROM model_registry WHERE vector_table = 'col_cards'),
+                        (SELECT count(*) FROM derivations WHERE artifact = 'col_cards')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((model.as_str(), receipts), ("card-model", 1));
+
+        // Unchanged corpus: the receipt short-circuits — no embedding call.
+        let again = build_column_cards(&db, &e).unwrap();
+        assert!(!again.rebuilt);
+        assert_eq!(e.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // A data change that moves a distinct count rebuilds.
+        conn.execute(
+            "INSERT INTO src.order_items VALUES (4, 'Returned', 99.0)",
+            [],
+        )
+        .unwrap();
+        let after = build_column_cards(&db, &e).unwrap();
+        assert!(after.rebuilt);
+        assert_eq!(e.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn column_cards_rebuild_wholesale_on_model_change() {
+        let db = card_db();
+        build_column_cards(&db, &CountingEmbedder::new("model-a")).unwrap();
+        // A different model may not mix vectors into the same table: the
+        // fingerprint carries the identity, so the build reconstructs
+        // everything under the new model instead of appending.
+        let stats = build_column_cards(&db, &CountingEmbedder::new("model-b")).unwrap();
+        assert!(stats.rebuilt);
+        let (model, cards): (String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT model FROM model_registry WHERE vector_table = 'col_cards'),
+                        (SELECT count(*) FROM col_cards)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((model.as_str(), cards), ("model-b", 3));
     }
 }
