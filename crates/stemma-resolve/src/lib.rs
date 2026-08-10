@@ -4179,6 +4179,7 @@ mod tests {
             status: "selected".into(),
             ambiguous: false,
             divergence: 0.0,
+            admitted_by: None,
             candidates,
             kg_alias: false,
         }]
