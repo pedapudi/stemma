@@ -22,6 +22,8 @@ pub enum Error {
     Sqlite(#[from] stemmadb::rusqlite::Error),
     #[error("knowledge store error: {0}")]
     Kg(#[from] stemma_kg::Error),
+    #[error("store error: {0}")]
+    Store(#[from] stemmadb::Error),
     #[error("lexical index missing — run ingest first")]
     IndexMissing,
 }
@@ -334,14 +336,10 @@ pub fn resolve_full(
         }
     }
 
-    // Phase 1: lexical raw hits for every live span.
-    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> = std::collections::HashMap::new();
-    for span in spans.iter() {
-        if span.status == "skipped" {
-            continue;
-        }
-        raw.insert(span.id, gather_lexical_hits(db, &span.text)?);
-    }
+    // Phase 1: lexical raw hits for every live span — exact first (serial
+    // point lookups), then the FTS channels each span still owes after
+    // self-selection, run concurrently. See [`gather_lexical_hits`].
+    let mut raw = gather_lexical_hits(db, &spans)?;
 
     // Phase 2: the dense channel, targeted. KNN over vec0 is a full scan of
     // the vector table per probe, so it is spent only where lexical evidence
@@ -740,17 +738,160 @@ fn interpretation_samples(
     Ok(rowids)
 }
 
-fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
+/// Lexical candidate gathering for every live span.
+///
+/// The exact channel runs serially — per span it is a point lookup against
+/// the value_norm index, microseconds against any corpus. The FTS queries
+/// it leaves are independent read-only statements over a WAL store and run
+/// across a bounded thread scope, one sibling read connection per worker
+/// (a SQLite connection is not Sync). Results are reassembled per span in
+/// fixed channel order — exact, bm25, trigram — so the output is
+/// byte-identical to the serial gather. Measured on the legal corpus
+/// (1.37M lex values, ~35 live spans/query): 5.0s → 1.4s median.
+///
+/// Two prunings were tried here and rejected by the referees — recorded so
+/// they are not re-proposed without new evidence:
+///
+/// - *Trigram self-selection* (skip trigram when the exact channel matched
+///   the span verbatim). It changes results: trigram-only fuzz candidates
+///   on exact-matched spans vanish from the selected set (california lex
+///   `selected_per_mention` 2.478 → 2.409). And it saves nothing where
+///   trigram is actually expensive: on the legal profile set 0 of 345 live
+///   spans have an exact match — document corpora store prose, not the
+///   query's substrings — so the skip never fires there.
+/// - *Dominance pruning* (skip channels for a span contained in an
+///   exact-matched longer span). A contained span's channel evidence is
+///   its own: "Chen" inside an exact "Wei Chen" fuses bm25+trigram into
+///   the near-miss scores its overlapped span keeps in the trace, and
+///   skipping either channel drops those candidates below the selection
+///   threshold, changing statuses the trace contract pins
+///   (overlapped_spans_keep_near_misses).
+fn gather_lexical_hits(
+    db: &StemmaDb,
+    spans: &[Span],
+) -> Result<std::collections::HashMap<usize, Vec<RawHit>>> {
     let conn = db.conn();
-    let mut hits: Vec<RawHit> = Vec::new();
-    let mut samples = std::collections::HashMap::new();
+    let live: Vec<&Span> = spans.iter().filter(|s| s.status != "skipped").collect();
 
-    // Channel 1: exact (case/whitespace-normalized), short values only.
-    // Aggregated per interpretation — (table, column, normalized value) —
-    // so 40 rows sharing one value spend one candidate slot, not eight, and
-    // every distinct reading of the span surfaces. Every exact hit is equal
-    // evidence about the value, so every interpretation enters at rank 0:
-    // no fabricated decay across identical values.
+    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> =
+        std::collections::HashMap::new();
+    {
+        let mut samples = std::collections::HashMap::new();
+        for s in &live {
+            raw.insert(s.id, exact_channel_hits(conn, &s.text, &mut samples)?);
+        }
+    }
+
+    // Jobs in span order, bm25 before trigram within a span, so extending
+    // per-span hit lists in job order reproduces the serial channel order.
+    let mut jobs: Vec<FtsJob> = Vec::new();
+    for s in &live {
+        for (channel, fts_table) in [("bm25", "lex_fts"), ("trigram", "lex_trigram")] {
+            jobs.push(FtsJob {
+                span_id: s.id,
+                text: s.text.clone(),
+                channel,
+                fts_table,
+            });
+        }
+    }
+
+    for (job, hits) in jobs.iter().zip(run_fts_jobs(db, &jobs)?) {
+        raw.entry(job.span_id).or_default().extend(hits);
+    }
+    Ok(raw)
+}
+
+/// One FTS channel query a span still owes after self-selection.
+struct FtsJob {
+    span_id: usize,
+    text: String,
+    channel: &'static str,
+    fts_table: &'static str,
+}
+
+/// Executes the FTS jobs and returns their hit lists in job order.
+///
+/// The queries are independent read-only statements, so they run across a
+/// scoped thread pool with one sibling connection per worker. The worker
+/// count is min(available cores, jobs) — structural, not tunable: each
+/// worker is one WAL reader (readers never block each other) doing
+/// CPU-bound work inside SQLite, so one per core is the most the machine
+/// can use and the job count is the most the request can use. Stores that
+/// cannot be reopened (in-memory) fall back to the serial path on the
+/// main connection; either path yields identical, deterministic output.
+fn run_fts_jobs(db: &StemmaDb, jobs: &[FtsJob]) -> Result<Vec<Vec<RawHit>>> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(jobs.len());
+    let Some((store, user)) = db.paths().filter(|_| workers > 1) else {
+        let conn = db.conn();
+        let mut samples = std::collections::HashMap::new();
+        return jobs
+            .iter()
+            .map(|j| fts_channel_hits(conn, &j.text, j.channel, j.fts_table, &mut samples))
+            .collect();
+    };
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<Option<Vec<RawHit>>> = Vec::new();
+    results.resize_with(jobs.len(), || None);
+    let worker_outputs: Vec<Result<Vec<(usize, Vec<RawHit>)>>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let wdb = StemmaDb::open(store, user)?;
+                        let conn = wdb.conn();
+                        let mut samples = std::collections::HashMap::new();
+                        let mut out = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(job) = jobs.get(i) else { break };
+                            out.push((
+                                i,
+                                fts_channel_hits(
+                                    conn,
+                                    &job.text,
+                                    job.channel,
+                                    job.fts_table,
+                                    &mut samples,
+                                )?,
+                            ));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("fts worker panicked"))
+                .collect()
+        });
+    for output in worker_outputs {
+        for (i, hits) in output? {
+            results[i] = Some(hits);
+        }
+    }
+    Ok(results
+        .into_iter()
+        .map(|r| r.expect("every job claimed by exactly one worker"))
+        .collect())
+}
+
+/// The exact channel (case/whitespace-normalized), short values only.
+/// Aggregated per interpretation — (table, column, normalized value) —
+/// so 40 rows sharing one value spend one candidate slot, not eight, and
+/// every distinct reading of the span surfaces. Every exact hit is equal
+/// evidence about the value, so every interpretation enters at rank 0:
+/// no fabricated decay across identical values.
+fn exact_channel_hits(
+    conn: &stemmadb::rusqlite::Connection,
+    span: &str,
+    samples: &mut std::collections::HashMap<(String, String, String), Vec<i64>>,
+) -> Result<Vec<RawHit>> {
+    let mut hits: Vec<RawHit> = Vec::new();
     {
         let mut stmt = conn.prepare_cached(
             "SELECT src_table, src_column, min(src_rowid), value, value_norm, count(*)
@@ -780,7 +921,7 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
         for row in rows {
             let (table, column, rowid, value, value_norm, n) = row?;
             let sample_rowids =
-                interpretation_samples(&conn, &mut samples, &table, &column, &value_norm)?;
+                interpretation_samples(conn, samples, &table, &column, &value_norm)?;
             hits.push(RawHit {
                 table,
                 column,
@@ -796,13 +937,24 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
             });
         }
     }
+    Ok(hits)
+}
 
-    // Channels 2 & 3: BM25 token search and trigram fuzzy/substring search.
-    // Value hits are aggregated per interpretation in SQL (best bm25, row
-    // count, representative rowid); document hits keep per-row identity but
-    // are windowed to DOC_COLUMN_QUOTA per (table, column) before the
-    // channel-wide LIMIT, so one document table cannot starve another.
-    for (channel, fts_table) in [("bm25", "lex_fts"), ("trigram", "lex_trigram")] {
+/// One FTS channel — BM25 token search over lex_fts or trigram
+/// fuzzy/substring search over lex_trigram — for one span.
+/// Value hits are aggregated per interpretation in SQL (best bm25, row
+/// count, representative rowid); document hits keep per-row identity but
+/// are windowed to DOC_COLUMN_QUOTA per (table, column) before the
+/// channel-wide LIMIT, so one document table cannot starve another.
+fn fts_channel_hits(
+    conn: &stemmadb::rusqlite::Connection,
+    span: &str,
+    channel: &'static str,
+    fts_table: &str,
+    samples: &mut std::collections::HashMap<(String, String, String), Vec<i64>>,
+) -> Result<Vec<RawHit>> {
+    let mut hits: Vec<RawHit> = Vec::new();
+    {
         let sql = format!(
             // MATERIALIZED: the CTE is read by both UNION arms, and FTS5
             // auxiliary functions (bm25, snippet) are only usable inside
@@ -865,7 +1017,7 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
             Ok(rows) => rows,
             // Spans under 3 chars (or odd tokenizations) can make a trigram
             // query legitimately unmatchable — treat as zero hits.
-            Err(_) => continue,
+            Err(_) => return Ok(hits),
         };
         // Competition ranking on the channel-native score: entries with an
         // identical bm25 are identical evidence and share a rank, so two
@@ -884,9 +1036,7 @@ fn gather_lexical_hits(db: &StemmaDb, span: &str) -> Result<Vec<RawHit>> {
                 prev_raw = raw;
             }
             let sample_rowids = match &vn {
-                Some(vn) => {
-                    interpretation_samples(&conn, &mut samples, &table, &column, vn)?
-                }
+                Some(vn) => interpretation_samples(conn, samples, &table, &column, vn)?,
                 None => vec![rowid],
             };
             hits.push(RawHit {

@@ -59,6 +59,9 @@ pub fn register_extensions() {
 /// A stemma store bound to one user database.
 pub struct StemmaDb {
     conn: Connection,
+    /// The (store, user db) file pair this handle was opened from; `None`
+    /// for in-memory stores, which cannot be reopened.
+    paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl StemmaDb {
@@ -77,7 +80,10 @@ impl StemmaDb {
             &format!("ATTACH DATABASE ?1 AS {SRC_SCHEMA}"),
             rusqlite::params![uri],
         )?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            paths: Some((store_path.to_path_buf(), user_db_path.to_path_buf())),
+        };
         db.init_store_schema()?;
         Ok(db)
     }
@@ -87,9 +93,19 @@ impl StemmaDb {
         register_extensions();
         let conn = Connection::open_in_memory()?;
         conn.execute(&format!("ATTACH DATABASE ':memory:' AS {SRC_SCHEMA}"), [])?;
-        let db = Self { conn };
+        let db = Self { conn, paths: None };
         db.init_store_schema()?;
         Ok(db)
+    }
+
+    /// The (store, user db) paths this handle was opened from — `None` for
+    /// in-memory stores. A SQLite connection is not Sync, so read-side
+    /// callers that want intra-request parallelism open sibling connections
+    /// from these paths rather than sharing this one.
+    pub fn paths(&self) -> Option<(&Path, &Path)> {
+        self.paths
+            .as_ref()
+            .map(|(store, user)| (store.as_path(), user.as_path()))
     }
 
     fn init_store_schema(&self) -> Result<()> {
