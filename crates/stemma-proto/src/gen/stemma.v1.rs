@@ -85,6 +85,12 @@ pub struct TraceCandidate {
     /// the first is the representative `rowid`.
     #[prost(int64, repeated, tag = "15")]
     pub sample_rowids: ::prost::alloc::vec::Vec<i64>,
+    /// Exact count of grain-table rows this reading reaches through the schema.
+    /// `row_count` counts the cells holding the value; `reach` counts the facts
+    /// they account for — what a query over this reading would aggregate.
+    /// 0 when not computed (only ambiguous mentions are measured).
+    #[prost(uint64, tag = "16")]
+    pub reach: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TraceSpan {
@@ -110,6 +116,13 @@ pub struct TraceSpan {
     /// question, and consumers should ask rather than pick.
     #[prost(bool, tag = "8")]
     pub ambiguous: bool,
+    /// max(reach)/min(reach) over the readings still tied for the mention: how
+    /// far apart they are in what they would return. `ambiguous` says the
+    /// readings are tied; this says whether the tie is worth interrupting a
+    /// human over. 1.0 means the choice barely moves the answer; 100.0 means two
+    /// orders of magnitude. 0.0 when not computed.
+    #[prost(double, tag = "9")]
+    pub divergence: f64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveRequest {
@@ -179,6 +192,12 @@ pub struct Mention {
     /// The tied readings, one per interpretation, when `ambiguous` is set.
     #[prost(message, repeated, tag = "7")]
     pub readings: ::prost::alloc::vec::Vec<Reading>,
+    /// max(reach)/min(reach) across `readings`: how far apart they are in what
+    /// they would return. `ambiguous` says the readings are tied; this says
+    /// whether the tie is worth asking about. 1.0 means the choice barely moves
+    /// the answer, 100.0 means two orders of magnitude. 0.0 when not computed.
+    #[prost(double, tag = "8")]
+    pub divergence: f64,
 }
 /// One reading of an ambiguous mention: an interpretation, summarized for
 /// asking the user which they meant.
@@ -196,6 +215,11 @@ pub struct Reading {
     /// Representative rowid for citation.
     #[prost(int64, tag = "5")]
     pub rowid: i64,
+    /// Grain-table rows this reading reaches. `row_count` counts the cells
+    /// holding the value; `reach` counts the facts they account for — what a
+    /// query over this reading would aggregate. 0 when not computed.
+    #[prost(uint64, tag = "6")]
+    pub reach: u64,
 }
 /// One concrete record (or schema element) a mention may resolve to.
 #[derive(Clone, PartialEq, ::prost::Message)]

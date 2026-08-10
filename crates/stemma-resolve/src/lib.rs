@@ -645,7 +645,6 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
                 kg_alias: false,
                 ambiguous: false,
                 divergence: 0.0,
-            divergence: 0.0,
             });
         }
     }
@@ -1507,10 +1506,8 @@ fn annotate_divergence(db: &StemmaDb, trace: &mut Trace) -> Result<()> {
         if !trace.spans[i].ambiguous {
             continue;
         }
-        // Readings a consumer might actually pick. A below-threshold
-        // near-miss must not widen the spread: it was never in the running.
-        // The readings actually in contention: those tied with the best, by
-        // the same margin the ambiguity itself was judged on. A lower-ranked
+        // The readings actually in contention: tied with the best by the
+        // same margin the ambiguity itself was judged on. A lower-ranked
         // near-miss must not set the spread — on a mention whose two tied
         // readings both reach 5,413 rows, an also-ran scoring 0.37 and
         // reaching 4 would report 1353x for a choice that changes nothing.
@@ -1526,11 +1523,7 @@ fn annotate_divergence(db: &StemmaDb, trace: &mut Trace) -> Result<()> {
             if best - c.score >= CONTEXT_TIE_GAP {
                 continue;
             }
-            // Exactly the set mark_ambiguous reasons over. A lower-ranked
-            // near-miss is not in contention, and letting one in would let a
-            // marginal reading set the spread: on a mention whose two tied
-            // readings both reach 5,413 rows, an also-ran reaching 4 reports
-            // a 1353x divergence for a choice that changes nothing.
+            // Exactly the set mark_ambiguous reasons over.
             if c.is_doc || !c.selected {
                 continue;
             }
@@ -3099,7 +3092,6 @@ mod tests {
                 kg_alias: false,
                 ambiguous: false,
                 divergence: 0.0,
-            divergence: 0.0,
             }],
             mentions: vec![0],
             elapsed_ms: 0.0,
