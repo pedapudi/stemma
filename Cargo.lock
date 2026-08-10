@@ -1438,6 +1438,7 @@ name = "stemma-ingest"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "stemma-embed",
  "stemmadb",
  "thiserror",
