@@ -409,6 +409,9 @@ fn drain_embeddings_batched(
                             "embed drain: {drained} embedded, {failed} failed"
                         ));
                     }
+                    if let Err(e) = stemma_ingest::derive_dense_geometry(db) {
+                        notes.push(format!("dense geometry derivation failed: {e}"));
+                    }
                     return;
                 }
             }

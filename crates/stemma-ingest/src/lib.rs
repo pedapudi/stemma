@@ -974,6 +974,9 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
+        if existing.is_some() {
+            let _ = derive_dense_geometry(db);
+        }
         return Ok(existing.map(|(model, dim)| {
             let vectors: i64 = conn
                 .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
@@ -1017,6 +1020,7 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         stemmadb::rusqlite::params![model, dim],
     )?;
     conn.execute_batch("DROP TABLE vec_staging;")?;
+    let _ = derive_dense_geometry(db);
 
     Ok(Some(DenseStats {
         vectors: moved,
@@ -1024,6 +1028,165 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         model,
         promoted: true,
     }))
+}
+
+/// Vectors sampled for the corpus's dense geometry; enough that the two
+/// means are stable, few enough that the derivation is sub-second.
+const GEOMETRY_SAMPLE: usize = 128;
+
+/// The corpus's dense-space geometry, derived from `vec_dense` itself and
+/// receipted like every other derived quantity: `null_mean` — the mean
+/// cosine of random pairs of this corpus's vectors under this model (its
+/// anisotropy floor: what "unrelated" scores HERE, not the 0.0 of an ideal
+/// space), and `nn_mean` — the mean cosine of a vector to its nearest
+/// distinct neighbor (what a genuine near-match scores). Resolution
+/// calibrates raw cosines between the two instead of against constants:
+/// on the legal corpus random pairs score +0.21, and treating cosine as
+/// absolute evidence let dense-only hits displace correct lexical
+/// candidates (eval: L1 recall@5 0.68 → 0.48 with dense enabled).
+///
+/// Returns `None` — and removes any stale receipt — when the index is
+/// absent, too small to measure, or degenerate (nn indistinguishable from
+/// null); the resolver then lets dense participate by rank alone.
+pub fn derive_dense_geometry(db: &StemmaDb) -> Result<Option<(f64, f64)>> {
+    let conn = db.conn();
+    let has: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let absent = |conn: &stemmadb::rusqlite::Connection| -> Result<Option<(f64, f64)>> {
+        conn.execute(
+            "DELETE FROM derivations WHERE artifact = 'dense:geometry'",
+            [],
+        )?;
+        Ok(None)
+    };
+    if has == 0 {
+        return absent(&conn);
+    }
+    let total: i64 = conn.query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))?;
+    if (total as usize) < GEOMETRY_SAMPLE {
+        return absent(&conn);
+    }
+    let model: String = conn
+        .query_row(
+            "SELECT model FROM model_registry WHERE vector_table = 'vec_dense'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let fingerprint = format!("{model}:{total}");
+    if read_receipt(&conn, "dense:geometry")?.as_deref() == Some(fingerprint.as_str()) {
+        let cached: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM derivations WHERE artifact = 'dense:geometry'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(json) = cached {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                if let (Some(nm), Some(nn)) = (
+                    v.get("null_mean").and_then(|x| x.as_f64()),
+                    v.get("nn_mean").and_then(|x| x.as_f64()),
+                ) {
+                    return Ok(Some((nm, nn)));
+                }
+            }
+        }
+    }
+
+    // Evenly-strided rowid probes: vec0 assigns rowids sequentially, so a
+    // stride over [min, max] samples the corpus without scanning it. Gaps
+    // (deleted rows) just shrink the sample.
+    let (lo, hi): (i64, i64) = conn.query_row(
+        "SELECT min(rowid), max(rowid) FROM vec_dense",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let stride = ((hi - lo) / GEOMETRY_SAMPLE as i64).max(1);
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(GEOMETRY_SAMPLE);
+    let mut probe = conn.prepare("SELECT embedding FROM vec_dense WHERE rowid = ?1")?;
+    let mut r = lo;
+    while r <= hi && vectors.len() < GEOMETRY_SAMPLE {
+        if let Ok(blob) = probe.query_row([r], |row| row.get::<_, Vec<u8>>(0)) {
+            vectors.push(
+                blob.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect(),
+            );
+        }
+        r += stride;
+    }
+    if vectors.len() < GEOMETRY_SAMPLE / 2 {
+        return absent(&conn);
+    }
+
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for (x, y) in a.iter().zip(b) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+        }
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na.sqrt() * nb.sqrt())
+        }
+    };
+
+    // Null: every distinct pair of the strided sample. The sample spans the
+    // corpus, so the pairs are what "two arbitrary rows" score.
+    let (mut sum, mut n) = (0.0f64, 0usize);
+    for i in 0..vectors.len() {
+        for j in (i + 1)..vectors.len() {
+            sum += cos(&vectors[i], &vectors[j]);
+            n += 1;
+        }
+    }
+    let null_mean = sum / n.max(1) as f64;
+
+    // Nearest-neighbor scale: KNN k=2 (self + nearest distinct) for a
+    // quarter of the sample — 32 brute-force scans, bounded and fast.
+    let mut knn = conn.prepare(
+        "SELECT distance FROM vec_dense WHERE embedding MATCH ?1 AND k = 2",
+    )?;
+    let (mut nn_sum, mut nn_n) = (0.0f64, 0usize);
+    for v in vectors.iter().take(GEOMETRY_SAMPLE / 4) {
+        let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let dists: Vec<f64> = knn
+            .query_map([blob], |row| row.get::<_, f64>(0))?
+            .filter_map(|d| d.ok())
+            .collect();
+        // First hit is (numerically) self; the second is the neighbor.
+        if let Some(d) = dists.get(1) {
+            nn_sum += 1.0 - (d * d) / 2.0;
+            nn_n += 1;
+        }
+    }
+    if nn_n == 0 {
+        return absent(&conn);
+    }
+    let nn_mean = nn_sum / nn_n as f64;
+    if nn_mean <= null_mean + 1e-6 {
+        // Degenerate geometry: neighbors indistinguishable from noise.
+        return absent(&conn);
+    }
+
+    write_receipt(
+        &conn,
+        "dense:geometry",
+        &fingerprint,
+        &format!(
+            "{{\"null_mean\":{null_mean:.6},\"nn_mean\":{nn_mean:.6},\"sampled\":{}}}",
+            vectors.len()
+        ),
+    )?;
+    Ok(Some((null_mean, nn_mean)))
 }
 
 /// Items per drain cycle: claimed together, embedded as [`EMBED_CONCURRENCY`]
@@ -1927,6 +2090,78 @@ mod tests {
             )
             .unwrap();
         db
+    }
+
+    /// Two tight clusters of unit vectors: within a cluster, neighbors are
+    /// near-identical (nn_mean ≈ 1); across clusters, orthogonal (null pulls
+    /// toward 0.5 with equal membership). The derivation must find
+    /// nn_mean > null_mean and receipt it; a store with too few vectors must
+    /// yield None and hold no receipt.
+    #[test]
+    fn dense_geometry_derives_from_the_corpus_and_receipts() {
+        let db = mini_db();
+        build_lexical_index(&db, false).unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE vec_dense USING vec0(
+                 embedding float[4],
+                 src_table text, src_column text, src_rowid integer);
+             INSERT INTO model_registry (vector_table, backend, model, dimension, quantization)
+             VALUES ('vec_dense', 'test', 'toy', 4, 'f32');",
+        )
+        .unwrap();
+        let blob = |v: [f32; 4]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO vec_dense (embedding, src_table, src_column, src_rowid)
+                 VALUES (?1, 'notes', 'body', ?2)",
+            )
+            .unwrap();
+        for i in 0..(GEOMETRY_SAMPLE as i64 * 2) {
+            // Cluster by parity, with a tiny per-row wobble so nearest
+            // neighbors are distinct rows, not exact duplicates.
+            let eps = (i as f32) * 1e-4;
+            let v = if i % 2 == 0 {
+                [1.0, eps, 0.0, 0.0]
+            } else {
+                [0.0, 0.0, 1.0, eps]
+            };
+            insert
+                .execute(stemmadb::rusqlite::params![blob(v), i])
+                .unwrap();
+        }
+        drop(insert);
+
+        let (null_mean, nn_mean) = derive_dense_geometry(&db).unwrap().expect("geometry");
+        assert!(
+            nn_mean > 0.9 && null_mean < 0.7 && nn_mean > null_mean,
+            "clusters should separate: null {null_mean} nn {nn_mean}"
+        );
+        let receipt: String = conn
+            .query_row(
+                "SELECT value_json FROM derivations WHERE artifact = 'dense:geometry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(receipt.contains("null_mean"));
+        // Second call is served by the receipt and agrees (to the receipt's
+        // six-decimal storage precision).
+        let (n2, nn2) = derive_dense_geometry(&db).unwrap().expect("cached geometry");
+        assert!((n2 - null_mean).abs() < 1e-5 && (nn2 - nn_mean).abs() < 1e-5);
+
+        // Under-populated index: no geometry, no receipt left behind.
+        conn.execute("DELETE FROM vec_dense WHERE rowid > 10", [])
+            .unwrap();
+        assert!(derive_dense_geometry(&db).unwrap().is_none());
+        let left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM derivations WHERE artifact = 'dense:geometry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "stale geometry receipt must be removed");
     }
 
     #[test]

@@ -174,6 +174,11 @@ pub struct Candidate {
     /// Up to [`SAMPLE_ROWIDS`] concrete rowids carrying the interpretation,
     /// ascending; the first is `rowid`.
     pub sample_rowids: Vec<i64>,
+    /// Exact count of grain-table rows this reading reaches, joined through
+    /// the schema. `row_count` counts the cells holding the value; `reach`
+    /// counts the facts they account for, which is what a query over this
+    /// reading would aggregate. 0 when not computed — see [`Span::divergence`].
+    pub reach: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +199,19 @@ pub struct Span {
     /// context coherence, encoder affinity, adjudication. The honest
     /// resolution is a question; consumers should ask, not guess.
     pub ambiguous: bool,
+    /// How far apart the viable readings are in what they would return:
+    /// `max(reach) / min(reach)`, 0.0 when not computed.
+    ///
+    /// Detecting ambiguity is cheap; acting on it is not. Against a large
+    /// corpus almost every mention has more than one reading, so a consumer
+    /// that asks whenever `ambiguous` is set asks constantly and gets muted.
+    /// This is the number that says whether asking is worth it: 1.0 means the
+    /// choice barely moves the answer, 100.0 means picking wrong moves it two
+    /// orders of magnitude.
+    ///
+    /// Computed only for ambiguous mentions, and only over the readings a
+    /// consumer might actually pick — one grouped count per (table, column).
+    pub divergence: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,6 +283,7 @@ pub fn resolve_full(
             candidates: Vec::new(),
             kg_alias: false,
             ambiguous: false,
+            divergence: 0.0,
         });
     }
 
@@ -339,13 +358,17 @@ pub fn resolve_full(
         }
     }
 
-    // Phase 3: fuse and refine.
+    // Phase 3: fuse and refine. The dense channel's cosines calibrate
+    // against the corpus's own derived geometry (see
+    // stemma_ingest::derive_dense_geometry); absent geometry, dense
+    // participates by rank alone.
+    let geometry = dense_geometry(db);
     for span in spans.iter_mut() {
         if span.status == "skipped" {
             continue;
         }
         let hits = raw.remove(&span.id).unwrap_or_default();
-        let mut candidates = fuse(&span.text, hits);
+        let mut candidates = fuse(&span.text, hits, geometry);
         apply_kg_coherence(db, &span.text, &mut candidates)?;
         apply_context_coherence(db, &tokens, span.start, span.end, &mut candidates)?;
         span.candidates = candidates;
@@ -380,6 +403,10 @@ pub fn resolve_full(
         trace.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
     mark_ambiguous(&mut trace);
+    // Last, because it only runs where `ambiguous` was set.
+    if let Err(e) = annotate_divergence(db, &mut trace) {
+        tracing::warn!(error = %e, "divergence estimation skipped");
+    }
     Ok(trace)
 }
 
@@ -621,6 +648,7 @@ fn enumerate_spans(query: &str, tokens: &[Token]) -> Vec<Span> {
                 candidates: Vec::new(),
                 kg_alias: false,
                 ambiguous: false,
+                divergence: 0.0,
             });
         }
     }
@@ -1211,46 +1239,71 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
         .collect();
 
     // Pairwise verification, cached: schema paths once per table pair, then
-    // for each surviving candidate pair a LIMIT-1 probe per path until one
-    // verifies. Everything downstream reads this map.
+    // one grouped probe per (column pair, path) that resolves every value
+    // pair at once. Everything downstream reads this map.
+    //
+    // Batching is what makes a value-level probe affordable. Probing each
+    // candidate pair separately means re-walking the same join for every
+    // combination; a single `IN (…) … GROUP BY` walks it once and reports
+    // which readings met. Measured on a 6-table corpus: 16 candidate pairs in
+    // one 356 ms query, against 1.9 s as sixteen.
     let mut path_cache: std::collections::HashMap<(String, String), Vec<Vec<stemma_kg::PathHop>>> =
         std::collections::HashMap::new();
     let mut verified: std::collections::HashMap<(usize, usize, usize, usize), String> =
         std::collections::HashMap::new();
+    // Candidates of one mention, bucketed by the (table, column) they read.
+    // Every candidate in a bucket probes through the same join, so the bucket
+    // is the unit of work.
+    let bucket = |i: usize, k: usize| {
+        let mut m: std::collections::BTreeMap<(String, String), Vec<(usize, String)>> =
+            std::collections::BTreeMap::new();
+        for c in 0..k {
+            let cand = &spans[i].candidates[c];
+            m.entry((cand.table.clone(), cand.column.clone()))
+                .or_default()
+                .push((c, cand.value.clone()));
+        }
+        m
+    };
     for p in 0..winners.len() {
         for q in p + 1..winners.len() {
-            for a in 0..ks[p] {
-                for b in 0..ks[q] {
-                    let ca = &spans[winners[p]].candidates[a];
-                    let cb = &spans[winners[q]].candidates[b];
-                    if ca.table == cb.table {
+            let ga = bucket(winners[p], ks[p]);
+            let gb = bucket(winners[q], ks[q]);
+            for ((ta, cola), va) in &ga {
+                for ((tb, colb), vb) in &gb {
+                    if ta == tb {
                         continue;
                     }
-                    let key = (ca.table.clone(), cb.table.clone());
+                    let key = (ta.clone(), tb.clone());
                     if !path_cache.contains_key(&key) {
                         let paths =
                             store.table_paths(&key.0, &key.1, MAX_PATH_HOPS, MAX_PATHS_PER_PAIR)?;
                         path_cache.insert(key.clone(), paths);
                     }
-                    // An interpretation candidate stands for up to
-                    // SAMPLE_ROWIDS concrete rows: probe the representative
-                    // first and fall back to the remaining samples, since
-                    // any row of the interpretation verifying the link
-                    // verifies the reading. The probed rowids are the ones
-                    // recorded in the evidence.
-                    let ra = probe_rowids(ca);
-                    let rb = probe_rowids(cb);
-                    'paths: for path in &path_cache[&key] {
-                        for &ar in &ra {
-                            for &br in &rb {
-                                if probe_instance_link(db, path, ar, br)? {
+                    let vals_a: Vec<String> = va.iter().map(|(_, v)| v.clone()).collect();
+                    let vals_b: Vec<String> = vb.iter().map(|(_, v)| v.clone()).collect();
+                    for path in &path_cache[&key] {
+                        let links =
+                            probe_value_links(db, path, cola, &vals_a, colb, &vals_b)?;
+                        for (ai, av) in va {
+                            for (bi, bv) in vb {
+                                if verified.contains_key(&(p, q, *ai, *bi)) {
+                                    continue;
+                                }
+                                let lk = (av.to_lowercase(), bv.to_lowercase());
+                                if let Some(&(ar, br)) = links.get(&lk) {
                                     verified.insert(
-                                        (p, q, a, b),
-                                        render_kg_path(path, &ca.table, ar, br),
+                                        (p, q, *ai, *bi),
+                                        render_kg_path(path, ta, ar, br),
                                     );
-                                    break 'paths;
                                 }
                             }
+                        }
+                        // Later paths can only add pairs this one missed.
+                        if va.iter().all(|(ai, _)| {
+                            vb.iter().all(|(bi, _)| verified.contains_key(&(p, q, *ai, *bi)))
+                        }) {
+                            break;
                         }
                     }
                 }
@@ -1321,35 +1374,248 @@ fn apply_collective_coherence(db: &StemmaDb, spans: &mut [Span]) -> Result<()> {
     Ok(())
 }
 
-/// The rowids collective disambiguation may probe for a candidate: its
-/// sample rowids (representative first), bounded at SAMPLE_ROWIDS by
-/// construction; the bare representative when no samples were carried.
-fn probe_rowids(c: &Candidate) -> Vec<i64> {
-    if c.sample_rowids.is_empty() {
-        vec![c.rowid]
-    } else {
-        c.sample_rowids.clone()
+/// The grain table: the join hub, i.e. the table with the most outgoing
+/// foreign keys, ties broken by row count. In a star or snowflake schema that
+/// is the fact table — the grain analytical questions aggregate over — and it
+/// is the natural common denominator for comparing readings that live in
+/// different dimension tables.
+fn grain_table(db: &StemmaDb) -> Result<Option<String>> {
+    let conn = db.conn();
+    let has_kg: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'kg_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_kg == 0 {
+        return Ok(None);
     }
+    let mut stmt = conn.prepare(
+        "SELECT ns.label, count(*) AS fks,
+                coalesce(json_extract(ns.props, '$.rows'), 0) AS rows
+         FROM kg_edges e
+         JOIN kg_nodes ns ON ns.id = e.src AND ns.kind = 'table'
+         WHERE e.kind IN ('fk', 'inferred_fk')
+         GROUP BY ns.label
+         ORDER BY fks DESC, rows DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    Ok(match rows.next()? {
+        Some(r) => Some(r.get::<_, String>(0)?),
+        None => None,
+    })
 }
 
-/// Verifies that two concrete rows connect along `path` in the user
-/// database: one LIMIT-1 join anchored by rowid at both ends, with the fk
-/// columns taken from the compiled graph's edges.
-fn probe_instance_link(
+/// Exact count of distinct grain rows each of `values` reaches, joined along
+/// `path`. One grouped query answers every value in the bucket.
+///
+/// `path` may be empty, meaning the reading already lives on the grain table;
+/// then this is a plain count of matching rows.
+fn reach_counts(
     db: &StemmaDb,
     path: &[stemma_kg::PathHop],
-    from_rowid: i64,
-    to_rowid: i64,
-) -> Result<bool> {
+    table: &str,
+    column: &str,
+    values: &[String],
+) -> Result<std::collections::HashMap<String, u64>> {
+    let mut out = std::collections::HashMap::new();
+    if values.is_empty() {
+        return Ok(out);
+    }
+    let mut sql = match path.first() {
+        None => format!(
+            "SELECT j0.\"{column}\", count(*) FROM {}.\"{table}\" j0",
+            stemmadb::SRC_SCHEMA
+        ),
+        Some(first) => {
+            let start = if first.forward {
+                &first.src_table
+            } else {
+                &first.dst_table
+            };
+            format!(
+                "SELECT j0.\"{column}\", count(DISTINCT j{}.rowid) FROM {}.\"{start}\" j0",
+                path.len(),
+                stemmadb::SRC_SCHEMA
+            )
+        }
+    };
+    for (i, hop) in path.iter().enumerate() {
+        let (next, cond) = if hop.forward {
+            (
+                &hop.dst_table,
+                format!("j{i}.\"{}\" = j{}.\"{}\"", hop.src_column, i + 1, hop.dst_column),
+            )
+        } else {
+            (
+                &hop.src_table,
+                format!("j{}.\"{}\" = j{i}.\"{}\"", i + 1, hop.src_column, hop.dst_column),
+            )
+        };
+        sql.push_str(&format!(
+            " JOIN {}.\"{next}\" j{} ON {cond}",
+            stemmadb::SRC_SCHEMA,
+            i + 1
+        ));
+    }
+    let ph = (0..values.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(
+        " WHERE j0.\"{column}\" IN ({ph}) GROUP BY 1"
+    ));
+    let params: Vec<&dyn stemmadb::rusqlite::ToSql> = values
+        .iter()
+        .map(|v| v as &dyn stemmadb::rusqlite::ToSql)
+        .collect();
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (v, n) = row?;
+        out.insert(v.to_lowercase(), n.max(0) as u64);
+    }
+    Ok(out)
+}
+
+/// Fills in `Candidate::reach` and `Span::divergence` for ambiguous mentions.
+///
+/// The point of the pass: `ambiguous` says the readings are tied, which is a
+/// statement about the evidence. It says nothing about whether the choice
+/// matters. Two readings of a surname that both reach a handful of rows are a
+/// tie worth ignoring; two that reach 3,984 and 23 rows are a tie worth
+/// interrupting a human over. Only the second deserves a question, and
+/// nothing upstream of here can tell them apart.
+///
+/// Bounded deliberately: ambiguous mentions only, viable readings only, one
+/// grouped query per (table, column). Readings that cannot reach the grain
+/// table are left at 0 and excluded from the ratio rather than counted as
+/// zero, which would report a spurious infinity.
+fn annotate_divergence(db: &StemmaDb, trace: &mut Trace) -> Result<()> {
+    let Some(grain) = grain_table(db)? else {
+        tracing::warn!("divergence: no grain table in the compiled graph");
+        return Ok(());
+    };
+    use stemma_kg::KnowledgeStore as _;
+    let store = stemma_kg::SqliteKnowledgeStore::new(db)?;
+    let mut path_cache: std::collections::HashMap<String, Option<Vec<stemma_kg::PathHop>>> =
+        std::collections::HashMap::new();
+
+    for i in trace.mentions.clone() {
+        if !trace.spans[i].ambiguous {
+            continue;
+        }
+        // The readings actually in contention: tied with the best by the
+        // same margin the ambiguity itself was judged on. A lower-ranked
+        // near-miss must not set the spread — on a mention whose two tied
+        // readings both reach 5,413 rows, an also-ran scoring 0.37 and
+        // reaching 4 would report 1353x for a choice that changes nothing.
+        let best = trace.spans[i]
+            .candidates
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.score)
+            .fold(f64::MIN, f64::max);
+        let mut buckets: std::collections::BTreeMap<(String, String), Vec<(usize, String)>> =
+            std::collections::BTreeMap::new();
+        for (ci, c) in trace.spans[i].candidates.iter().enumerate() {
+            if best - c.score >= CONTEXT_TIE_GAP {
+                continue;
+            }
+            // Exactly the set mark_ambiguous reasons over.
+            if c.is_doc || !c.selected {
+                continue;
+            }
+            buckets
+                .entry((c.table.clone(), c.column.clone()))
+                .or_default()
+                .push((ci, c.value.clone()));
+        }
+        for ((table, column), items) in &buckets {
+            if !path_cache.contains_key(table) {
+                let p = if table == &grain {
+                    Some(Vec::new())
+                } else {
+                    store
+                        .table_paths(table, &grain, MAX_PATH_HOPS, 1)?
+                        .into_iter()
+                        .next()
+                };
+                path_cache.insert(table.clone(), p);
+            }
+            let Some(path) = path_cache[table].clone() else {
+                continue;
+            };
+            let values: Vec<String> = items.iter().map(|(_, v)| v.clone()).collect();
+            let counts = reach_counts(db, &path, table, column, &values)?;
+            for (ci, v) in items {
+                if let Some(&n) = counts.get(&v.to_lowercase()) {
+                    trace.spans[i].candidates[*ci].reach = n;
+                }
+            }
+        }
+        let reaches: Vec<u64> = trace.spans[i]
+            .candidates
+            .iter()
+            .filter(|c| c.reach > 0)
+            .map(|c| c.reach)
+            .collect();
+        if reaches.len() >= 2 {
+            let (hi, lo) = (
+                *reaches.iter().max().unwrap_or(&0),
+                *reaches.iter().min().unwrap_or(&1),
+            );
+            trace.spans[i].divergence = hi as f64 / lo.max(1) as f64;
+        }
+    }
+    Ok(())
+}
+
+/// Which of `from_values` connect to which of `to_values` along `path` in the
+/// user database, and by which rows — one grouped join, fk columns taken from
+/// the compiled graph's edges. Returns `(from_value, to_value) -> (from_rowid,
+/// to_rowid)`, lowercased keys, absent when a pair does not connect.
+///
+/// This asks about READINGS, not rows. The predecessor anchored both ends to
+/// sampled rowids (`WHERE j0.rowid = ? AND jN.rowid = ?`), which verifies only
+/// when the sampled rows happen to be the joined ones. That holds on a corpus
+/// where a value names one row, and collapses everywhere else: for two values
+/// carrying 14,516 and 2,331 rows with 130 connecting pairs, nine sampled
+/// pairs hit with probability ~1 in 28,920, so the pass silently produced
+/// nothing at all. Constraining by value asks the question the caller means —
+/// do these two readings co-occur — and the returned rowids still give the
+/// evidence string concrete rows to cite.
+fn probe_value_links(
+    db: &StemmaDb,
+    path: &[stemma_kg::PathHop],
+    from_column: &str,
+    from_values: &[String],
+    to_column: &str,
+    to_values: &[String],
+) -> Result<std::collections::HashMap<(String, String), (i64, i64)>> {
+    let mut found = std::collections::HashMap::new();
+    if from_values.is_empty() || to_values.is_empty() {
+        return Ok(found);
+    }
     let Some(first) = path.first() else {
-        return Ok(false);
+        return Ok(found);
     };
     let start = if first.forward {
         &first.src_table
     } else {
         &first.dst_table
     };
-    let mut sql = format!("SELECT 1 FROM {}.\"{start}\" j0", stemmadb::SRC_SCHEMA);
+    let last = path.len();
+    let mut sql = format!(
+        "SELECT j0.\"{from_column}\", j{last}.\"{to_column}\", \
+         min(j0.rowid), min(j{last}.rowid) FROM {}.\"{start}\" j0",
+        stemmadb::SRC_SCHEMA
+    );
     for (i, hop) in path.iter().enumerate() {
         let (next, cond) = if hop.forward {
             (
@@ -1378,12 +1644,42 @@ fn probe_instance_link(
             i + 1
         ));
     }
+    let ph = |range: std::ops::Range<usize>| {
+        range
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     sql.push_str(&format!(
-        " WHERE j0.rowid = ?1 AND j{}.rowid = ?2 LIMIT 1",
-        path.len()
+        " WHERE j0.\"{from_column}\" IN ({}) AND j{last}.\"{to_column}\" IN ({}) \
+         GROUP BY 1, 2",
+        ph(0..from_values.len()),
+        ph(from_values.len()..from_values.len() + to_values.len()),
     ));
-    let mut stmt = db.conn().prepare(&sql)?;
-    Ok(stmt.exists(stemmadb::rusqlite::params![from_rowid, to_rowid])?)
+
+    let params: Vec<&dyn stemmadb::rusqlite::ToSql> = from_values
+        .iter()
+        .chain(to_values.iter())
+        .map(|v| v as &dyn stemmadb::rusqlite::ToSql)
+        .collect();
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (a, b, ar, br) = row?;
+        // Keyed case-insensitively: candidates are one per distinct
+        // `value_norm`, so folding cannot collide two readings, and it keeps
+        // the lookup robust to the representative's casing.
+        found.insert((a.to_lowercase(), b.to_lowercase()), (ar, br));
+    }
+    Ok(found)
 }
 
 /// "people #2 ←lead_id— teams #43": the arrow points from referencing
@@ -1605,7 +1901,29 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
 /// Reciprocal-rank fusion across channels, with a length-affinity factor so
 /// short stored values that closely match the span outrank long documents
 /// that merely contain it.
-fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
+/// The corpus's derived dense geometry (null-pair mean, nearest-neighbor
+/// mean), written by ingest with the other derivation receipts. One row;
+/// absent or unparsable means "no calibration", never a default constant.
+fn dense_geometry(db: &StemmaDb) -> Option<(f64, f64)> {
+    let json: String = db
+        .conn()
+        .query_row(
+            "SELECT value_json FROM derivations WHERE artifact = 'dense:geometry'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    match (
+        v.get("null_mean").and_then(|x| x.as_f64()),
+        v.get("nn_mean").and_then(|x| x.as_f64()),
+    ) {
+        (Some(nm), Some(nn)) if nn > nm => Some((nm, nn)),
+        _ => None,
+    }
+}
+
+fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Candidate> {
     use std::collections::BTreeMap;
     const RRF_K: f64 = 4.0;
 
@@ -1674,18 +1992,30 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 let affinity = (span_len / (g.value.chars().count() as f64).max(span_len)).sqrt();
                 (base * (0.4 + 0.6 * affinity)).min(1.0)
             };
-            // The dense channel's cosine is absolute evidence, not a rank:
-            // calibrate it to the score scale and let it floor the fusion —
-            // a 0.6 cosine match must survive having no lexical company.
-            if let Some(best_cos) = g
-                .channels
-                .iter()
-                .filter(|c| c.channel == "dense")
-                .map(|c| c.raw)
-                .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x))))
-            {
-                let calibrated = (((best_cos - 0.30) / 0.30).clamp(0.0, 1.0)) * 0.78;
-                score = score.max(calibrated);
+            // The dense channel's cosine is absolute evidence, not a rank —
+            // but only relative to THIS corpus's geometry. Calibrate between
+            // the corpus's null-pair mean (what unrelated rows score here;
+            // +0.21 on legal, not 0) and its nearest-neighbor mean (what a
+            // genuine match scores). The ceiling is structural, not tuned:
+            // full semantic confidence counts as exactly "two lexical
+            // channels agree at rank 0 on a document" — enough to nominate
+            // what no lexical channel can reach, never enough to outrank a
+            // corroborated lexical hit. The previous constant floor
+            // ((cos-0.30)/0.30 · 0.78) let dense-only documents displace
+            // correct anchored candidates: legal L1 recall@5 fell 0.68→0.48
+            // the day the dense index filled.
+            if let (Some((null_mean, nn_mean)), Some(best_cos)) = (
+                geometry,
+                g.channels
+                    .iter()
+                    .filter(|c| c.channel == "dense")
+                    .map(|c| c.raw)
+                    .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x)))),
+            ) {
+                let confidence =
+                    ((best_cos - null_mean) / (nn_mean - null_mean)).clamp(0.0, 1.0);
+                let two_channel_doc = (2.0 / RRF_K) / (3.0 / RRF_K) * 0.85;
+                score = score.max(confidence * two_channel_doc);
             }
             let (value, value_truncated) = truncate_value(&g.value);
             Candidate {
@@ -1708,6 +2038,7 @@ fn fuse(span: &str, hits: Vec<RawHit>) -> Vec<Candidate> {
                 } else {
                     g.sample_rowids
                 },
+                reach: 0,
             }
         })
         .collect();
@@ -1801,6 +2132,7 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                 // affirmative no-record-matches conclusion.
                 nil: s.status == "weak",
                 ambiguous: s.ambiguous,
+                divergence: s.divergence,
                 readings: if s.ambiguous {
                     let top_score = s
                         .candidates
@@ -1817,6 +2149,7 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                             column: c.column.clone(),
                             value: c.value.clone(),
                             row_count: c.row_count,
+                            reach: c.reach,
                             rowid: c.rowid,
                         })
                         .collect()
@@ -1882,6 +2215,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
             .map(|s| pb::TraceSpan {
                 kg_alias: s.kg_alias,
                 ambiguous: s.ambiguous,
+                divergence: s.divergence,
                 id: s.id as u32,
                 text: s.text.clone(),
                 start: s.start as u32,
@@ -1904,6 +2238,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
                         adjudicated: c.adjudicated,
                         coherence: c.coherence.clone().unwrap_or_default(),
                         row_count: c.row_count,
+                        reach: c.reach,
                         sample_rowids: c.sample_rowids.clone(),
                         channels: c
                             .channels
@@ -2276,6 +2611,57 @@ mod tests {
     }
 
     #[test]
+    fn dense_only_calibrates_against_corpus_geometry_and_defers_to_lexical() {
+        let hit = |channel: &'static str, rank: usize, raw: f64, rowid: i64| RawHit {
+            table: "docs".into(),
+            column: "text".into(),
+            rowid,
+            value: "a document long enough to be a document".into(),
+            channel,
+            rank,
+            raw,
+            is_doc: true,
+            snippet: None,
+            row_count: 1,
+            sample_rowids: vec![rowid],
+        };
+        // A dense-only hit at the corpus's nearest-neighbor scale vs a
+        // two-channel lexical document.
+        let geometry = Some((0.2, 0.7));
+        let out = fuse(
+            "span",
+            vec![
+                hit("dense", 0, 0.7, 1),
+                hit("bm25", 0, 5.0, 2),
+                hit("trigram", 0, 0.9, 2),
+            ],
+            geometry,
+        );
+        let dense = out.iter().find(|c| c.rowid == 1).unwrap();
+        let lexical = out.iter().find(|c| c.rowid == 2).unwrap();
+        // Full semantic confidence equals, never exceeds, two agreeing
+        // lexical channels at rank 0.
+        assert!(
+            dense.score <= lexical.score + 1e-9,
+            "dense {} must not outrank corroborated lexical {}",
+            dense.score,
+            lexical.score
+        );
+        // At the null point the floor vanishes; the hit still exists via RRF.
+        let out = fuse("span", vec![hit("dense", 0, 0.2, 3)], geometry);
+        let base_only = out[0].score;
+        let out = fuse("span", vec![hit("dense", 0, 0.2, 3)], None);
+        assert!(
+            (base_only - out[0].score).abs() < 1e-9,
+            "at null cosine, geometry must add nothing over rank participation"
+        );
+        // Between null and nn the floor scales; without geometry it is absent.
+        let out_mid = fuse("span", vec![hit("dense", 0, 0.45, 4)], geometry);
+        let out_none = fuse("span", vec![hit("dense", 0, 0.45, 4)], None);
+        assert!(out_mid[0].score > out_none[0].score);
+    }
+
+    #[test]
     fn dense_channel_collapses_duplicate_documents() {
         // Issue #3: a fact table repeating one document string across many
         // rows made every copy a separate KNN hit — identical text, identical
@@ -2391,6 +2777,153 @@ mod tests {
             .find(|s| s.text == "Billing")
             .expect("Billing mention");
         assert_eq!(billing.candidates[0].coherence.as_deref(), Some(evidence));
+    }
+
+    /// A corpus where every value names many rows, and the one connecting
+    /// pair is not among the sampled ones.
+    ///
+    /// `Fairview` and `Calderon` each carry `WIDE` rows; the single shipment
+    /// joins the last of each. No pair drawn from the first `SAMPLE_ROWIDS`
+    /// rows of either is joined, so an instance-level probe finds nothing —
+    /// which is the shape every real corpus takes once a value names more
+    /// rows than the sample width.
+    fn wide_value_db(tag: &str) -> StemmaDb {
+        const WIDE: i64 = 40;
+        let dir = std::env::temp_dir().join(format!("stemma-resolve-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(
+                "CREATE TABLE warehouses (id INTEGER PRIMARY KEY, city TEXT);
+                 CREATE TABLE buyers (id INTEGER PRIMARY KEY, state TEXT);
+                 CREATE TABLE shipments (
+                     id INTEGER PRIMARY KEY,
+                     warehouse_id INTEGER REFERENCES warehouses(id),
+                     buyer_id INTEGER REFERENCES buyers(id));",
+            )
+            .unwrap();
+            for i in 1..=WIDE {
+                c.execute("INSERT INTO warehouses (id, city) VALUES (?1, 'Fairview')", [i])
+                    .unwrap();
+                c.execute("INSERT INTO buyers (id, state) VALUES (?1, 'Calderon')", [i])
+                    .unwrap();
+            }
+            c.execute(
+                "INSERT INTO shipments (id, warehouse_id, buyer_id) VALUES (1, ?1, ?1)",
+                [WIDE],
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn collective_coherence_verifies_readings_not_sampled_rows() {
+        let db = wide_value_db("wide");
+        stemma_kg::compile(&db, false).unwrap();
+        let trace = resolve_lexical(&db, "shipments from Fairview to Calderon").unwrap();
+        let mention = |text: &str| {
+            trace
+                .mentions
+                .iter()
+                .map(|&i| &trace.spans[i])
+                .find(|s| s.text == text)
+                .unwrap_or_else(|| panic!("{text} mention"))
+        };
+
+        let city = &mention("Fairview").candidates[0];
+        assert_eq!((city.table.as_str(), city.column.as_str()), ("warehouses", "city"));
+        let evidence = city
+            .coherence
+            .as_deref()
+            .expect("the reading connects, so coherence must be recorded");
+        // Cited rows are the ones that actually carry the link, not the
+        // representatives that were sampled up front.
+        assert!(
+            evidence.contains("warehouses #40") && evidence.contains("buyers #40"),
+            "got {evidence:?}"
+        );
+        // Both partners of a verified pair carry the same evidence.
+        let state = &mention("Calderon").candidates[0];
+        assert_eq!((state.table.as_str(), state.column.as_str()), ("buyers", "state"));
+        assert_eq!(state.coherence.as_deref(), Some(evidence));
+    }
+
+    /// Two readings of one value that are tied on score and far apart in
+    /// consequence: `Ellis` names one brand behind 2 sales, and 20 people
+    /// behind all 40.
+    fn skewed_reading_db(tag: &str) -> StemmaDb {
+        let dir = std::env::temp_dir().join(format!("stemma-resolve-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(
+                "CREATE TABLE brands (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE people (id INTEGER PRIMARY KEY, surname TEXT);
+                 CREATE TABLE sales (
+                     id INTEGER PRIMARY KEY,
+                     brand_id INTEGER REFERENCES brands(id),
+                     person_id INTEGER REFERENCES people(id));
+                 INSERT INTO brands VALUES (1, 'Ellis'), (2, 'Kestrel');",
+            )
+            .unwrap();
+            for i in 1..=20i64 {
+                c.execute("INSERT INTO people VALUES (?1, 'Ellis')", [i]).unwrap();
+            }
+            // Every sale touches an Ellis person; only two touch the brand.
+            for i in 1..=40i64 {
+                let brand = if i <= 2 { 1 } else { 2 };
+                c.execute(
+                    "INSERT INTO sales VALUES (?1, ?2, ?3)",
+                    [i, brand, (i - 1) % 20 + 1],
+                )
+                .unwrap();
+            }
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    #[test]
+    fn divergence_measures_what_the_choice_costs() {
+        let db = skewed_reading_db("divergence");
+        stemma_kg::compile(&db, false).unwrap();
+        let mut trace = resolve_lexical(&db, "what about Ellis").unwrap();
+        annotate_divergence(&db, &mut trace).unwrap();
+        let span = trace
+            .mentions
+            .iter()
+            .map(|&i| &trace.spans[i])
+            .find(|s| s.text == "Ellis")
+            .expect("Ellis mention");
+        assert!(span.ambiguous, "brand and surname are distinct readings");
+
+        let reach = |table: &str| {
+            span.candidates
+                .iter()
+                .find(|c| c.table == table && c.selected)
+                .unwrap_or_else(|| panic!("{table} reading"))
+                .reach
+        };
+        // Exact counts of grain rows, not estimates: sales is the grain
+        // (most outgoing foreign keys), and the two readings reach 2 and 40.
+        assert_eq!((reach("brands"), reach("people")), (2, 40));
+        assert!(
+            (span.divergence - 20.0).abs() < 1e-9,
+            "divergence should be 40/2, got {}",
+            span.divergence
+        );
     }
 
     /// The context-coherence fixture: the value 'Atlas Freight' lives in
@@ -2625,6 +3158,7 @@ mod tests {
             coherence: None,
             row_count: 1,
             sample_rowids: vec![rowid],
+            reach: 0,
         }
     }
 
@@ -2646,6 +3180,7 @@ mod tests {
                 ],
                 kg_alias: false,
                 ambiguous: false,
+                divergence: 0.0,
             }],
             mentions: vec![0],
             elapsed_ms: 0.0,
@@ -2887,6 +3422,7 @@ mod tests {
             coherence: None,
             row_count: 1,
             sample_rowids: vec![rowid],
+            reach: 0,
         }
     }
 
@@ -2900,6 +3436,7 @@ mod tests {
             end: 7,
             status: "selected".into(),
             ambiguous: false,
+            divergence: 0.0,
             candidates: vec![
                 interp_cand("offices", "city", 1, 0.60),
                 interp_cand("products", "name", 1, 0.58),
