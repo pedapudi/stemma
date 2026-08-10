@@ -50,7 +50,7 @@ pub struct EvalQuestion {
     #[serde(default)]
     pub corpus: String,
     pub question: String,
-    /// "L1" | "L2" | "L3" | "L4" | "NIL"
+    /// "anchor" | "paraphrase" | "join" | "cross-record" | "absent"
     pub tier: String,
     #[serde(default)]
     pub nil: bool,
@@ -62,7 +62,7 @@ pub struct EvalQuestion {
     pub provenance: serde_json::Value,
 }
 
-pub const TIERS: [&str; 5] = ["L1", "L2", "L3", "L4", "NIL"];
+pub const TIERS: [&str; 5] = ["anchor", "paraphrase", "join", "cross-record", "absent"];
 
 /// Loads a dataset file, skipping header/metadata lines.
 pub fn load(path: &Path) -> anyhow::Result<Vec<EvalQuestion>> {
@@ -119,8 +119,8 @@ mod tests {
             &path,
             concat!(
                 "{\"type\":\"header\",\"dataset\":\"demo\",\"version\":1}\n",
-                "{\"question\":\"q one\",\"tier\":\"L1\",\"targets\":[{\"table\":\"t\",\"column\":\"c\",\"literal\":\"x\",\"match_mode\":\"exact\",\"rowids\":[1]}]}\n",
-                "{\"question\":\"absent\",\"tier\":\"NIL\",\"nil\":true,\"targets\":[]}\n",
+                "{\"question\":\"q one\",\"tier\":\"anchor\",\"targets\":[{\"table\":\"t\",\"column\":\"c\",\"literal\":\"x\",\"match_mode\":\"exact\",\"rowids\":[1]}]}\n",
+                "{\"question\":\"absent\",\"tier\":\"absent\",\"nil\":true,\"targets\":[]}\n",
             ),
         )
         .unwrap();

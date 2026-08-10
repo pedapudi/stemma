@@ -6,7 +6,7 @@
   "date": "20260807-013436",
   "cells": {
     "lex": {
-      "L1": {
+      "anchor": {
         "r5_strict": 0.8166666666666667,
         "grounded": 0.9523809523809524,
         "n": 42,
@@ -55,7 +55,7 @@
           "bird/california_schools/9": 1.0
         }
       },
-      "L3": {
+      "join": {
         "r5_strict": 0.75,
         "grounded": 0.8,
         "n": 10,
@@ -72,7 +72,7 @@
           "bird/california_schools/87": 1.0
         }
       },
-      "L4": {
+      "cross-record": {
         "r5_strict": 0.7142857142857143,
         "grounded": 1.0,
         "n": 3,
@@ -89,9 +89,9 @@
   },
   "budgets": {
     "p95_latency_ms": {
-      "L1": 53698.0,
-      "L3": 91437.0,
-      "L4": 128164.0
+      "anchor": 53698.0,
+      "join": 91437.0,
+      "cross-record": 128164.0
     },
     "adjudication_rate_max": 0.1
   }

@@ -62,8 +62,8 @@ pub const DEFAULT_ABLATIONS: [&str; 4] = ["lex", "+dense", "+kg", "+adj"];
 /// `+adj` is exempt: it buys points on ties wherever they occur.
 pub fn target_tiers(ablation: &str) -> Option<&'static [&'static str]> {
     match ablation {
-        "+dense" => Some(&["L2"]),
-        "+kg" | "+coh" => Some(&["L3", "L4"]),
+        "+dense" => Some(&["paraphrase"]),
+        "+kg" | "+coh" => Some(&["join", "cross-record"]),
         _ => None,
     }
 }
@@ -254,7 +254,7 @@ pub struct NilReport {
     /// Correct absences / all absence outcomes (None when the run produced
     /// no absence outcomes).
     pub precision: Option<f64>,
-    /// NIL queries with no confident wrong mention / all NIL queries.
+    /// absent-tier queries with no confident wrong mention / all absent-tier queries.
     pub recall: Option<f64>,
     pub confident_wrong: Vec<ConfidentWrong>,
 }
@@ -303,7 +303,7 @@ pub struct RunFile {
     pub tiers: Vec<String>,
     /// ablation → tier → cell.
     pub cells: BTreeMap<String, BTreeMap<String, CellReport>>,
-    /// ablation → NIL behavior across the whole run.
+    /// ablation → absent-tier behavior across the whole run.
     pub nil: BTreeMap<String, NilReport>,
     pub calibration: BTreeMap<String, Vec<CalibrationBucket>>,
     pub backend_cost: BTreeMap<String, BackendCost>,
@@ -679,7 +679,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
         }
         run_file.cells.insert(name.clone(), tier_cells);
 
-        // NIL behavior + calibration across the whole run for this ablation.
+        // absent-tier behavior + calibration across the whole run for this ablation.
         run_file
             .nil
             .insert(name.clone(), nil_report(outcomes));
@@ -768,7 +768,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
 }
 
 /// The graded per-query currency: column-strict recall@5 (07's matrix
-/// metric). NIL queries grade on affirmed absence.
+/// metric). absent-tier queries grade on affirmed absence.
 pub fn cell_metric(o: &QueryOutcome) -> f64 {
     if o.n_targets == 0 {
         if o.nil_outcome {

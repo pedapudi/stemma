@@ -47,7 +47,7 @@ pub struct QueryOutcome {
     /// Mean reciprocal rank of the gold row across targets (column-strict).
     pub mrr: f64,
     /// The conjunctive headline: every target linked by a selected candidate
-    /// (NIL queries: absence affirmed).
+    /// (absent-tier queries: absence affirmed).
     pub grounded: bool,
     /// The resolver produced no confident mention (empty, weak, or nothing
     /// selected) — the affirmative-absence outcome.
@@ -187,7 +187,7 @@ pub fn score_query(
         trace.mentions.iter().map(|&i| &trace.spans[i]).collect();
 
     // The affirmative-absence outcome: no mention carries a selected
-    // candidate (spans demoted to weak by adjudication NIL included).
+    // candidate (spans demoted to weak by adjudication nil included).
     let nil_outcome = mention_spans
         .iter()
         .all(|s| s.status != "selected" || !s.candidates.iter().any(|c| c.selected));

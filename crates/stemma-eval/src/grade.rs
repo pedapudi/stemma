@@ -8,8 +8,8 @@
 //!    significant drop at α = 0.05);
 //! 2. tier-mechanism containment: off-target cells move <1 point in either
 //!    direction between consecutive ablations;
-//! 3. NIL precision does not drop; confident-wrongs are named in the run
-//!    file's NIL panel;
+//! 3. absence precision does not drop; confident-wrongs are named in the run
+//!    file's absence panel;
 //! 4. cost envelopes hold (p95 latency per tier, adjudication routing rate)
 //!    against the budgets stored next to the baseline numbers.
 //! Rule 5 (layer-3 agent-grounding regression cases) is separately gated
@@ -108,7 +108,7 @@ pub fn check(run: &RunFile, baseline: &Baseline, permutations: usize) -> Vec<Fai
         }
     }
 
-    // 3. NIL precision must not drop.
+    // 3. absence precision must not drop.
     for (ab, nil) in &run.nil {
         let base = baseline.nil_precision.get(ab).copied().flatten();
         if let (Some(now), Some(before)) = (nil.precision, base) {
@@ -116,7 +116,7 @@ pub fn check(run: &RunFile, baseline: &Baseline, permutations: usize) -> Vec<Fai
                 failures.push(Failure {
                     check: "nil-precision".into(),
                     cell: ab.clone(),
-                    detail: format!("NIL precision {now:.3} < baseline {before:.3}"),
+                    detail: format!("absence precision {now:.3} < baseline {before:.3}"),
                     queries: nil.confident_wrong.iter().map(|c| c.id.clone()).collect(),
                 });
             }
@@ -263,10 +263,10 @@ mod tests {
             git_rev: "g".into(),
             date: "now".into(),
             ablations: vec!["lex".into()],
-            tiers: vec!["L1".into()],
+            tiers: vec!["anchor".into()],
             cells: BTreeMap::from([(
                 "lex".to_string(),
-                BTreeMap::from([("L1".to_string(), cell(run_r5, &run_pq_ref))]),
+                BTreeMap::from([("anchor".to_string(), cell(run_r5, &run_pq_ref))]),
             )]),
             nil: BTreeMap::from([("lex".to_string(), NilReport::default())]),
             calibration: BTreeMap::new(),
@@ -284,11 +284,11 @@ mod tests {
             date: "then".into(),
             cells: BTreeMap::from([(
                 "lex".to_string(),
-                BTreeMap::from([("L1".to_string(), base_cell(base_r5, &base_pq_ref))]),
+                BTreeMap::from([("anchor".to_string(), base_cell(base_r5, &base_pq_ref))]),
             )]),
             nil_precision: BTreeMap::from([("lex".to_string(), None)]),
             budgets: Budgets {
-                p95_latency_ms: BTreeMap::from([("L1".to_string(), 1000.0)]),
+                p95_latency_ms: BTreeMap::from([("anchor".to_string(), 1000.0)]),
                 adjudication_rate_max: 0.5,
             },
         };
@@ -330,8 +330,8 @@ mod tests {
     fn off_target_movement_fails_containment_both_directions() {
         for direction in [0.02, -0.02] {
             let (mut run, baseline) = scaffold(0.6, 0.6, 10);
-            // Rebrand the ablation as +dense (target tier: L2 only) and give
-            // its L1 cell a delta_prev exceeding one point.
+            // Rebrand the ablation as +dense (target tier: paraphrase only) and give
+            // its anchor cell a delta_prev exceeding one point.
             let cells = run.cells.remove("lex").unwrap();
             run.cells.insert("+dense".into(), cells);
             run.ablations = vec!["lex".into(), "+dense".into()];
@@ -339,7 +339,7 @@ mod tests {
                 .cells
                 .get_mut("+dense")
                 .unwrap()
-                .get_mut("L1")
+                .get_mut("anchor")
                 .unwrap();
             c.delta_prev = Some(Delta {
                 vs: "prev:lex".into(),
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn latency_budget_violation_fails() {
         let (mut run, baseline) = scaffold(0.6, 0.6, 10);
-        run.cells.get_mut("lex").unwrap().get_mut("L1").unwrap().cell.latency_p95_ms = 5000.0;
+        run.cells.get_mut("lex").unwrap().get_mut("anchor").unwrap().cell.latency_p95_ms = 5000.0;
         let failures = check(&run, &baseline, 500);
         assert!(failures.iter().any(|f| f.check == "latency-budget"));
     }

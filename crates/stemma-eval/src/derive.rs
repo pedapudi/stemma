@@ -381,17 +381,17 @@ fn table_has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> b
 /// - L4 when the gold rows span ≥2 distinct tables (cross-record co-answer);
 /// - L3 when there are ≥2 value targets and the gold SQL joins ≥2 tables
 ///   (the join path is what disambiguates the mentions);
-/// - L1 otherwise. L2 and NIL never come from BIRD — they are constructed
+/// - anchor otherwise. paraphrase and absent never come from BIRD — they are constructed
 ///   by the synthetic generator with their own mechanical verification.
 fn assign_tier(targets: &[Target], schema_tables: &BTreeSet<String>) -> (String, &'static str) {
     let target_tables: BTreeSet<&str> = targets.iter().map(|t| t.table.as_str()).collect();
     if target_tables.len() >= 2 {
-        return ("L4".into(), "gold rows in >=2 distinct tables");
+        return ("cross-record".into(), "gold rows in >=2 distinct tables");
     }
     if targets.len() >= 2 && schema_tables.len() >= 2 {
-        return ("L3".into(), ">=2 mentions, gold SQL joins across tables");
+        return ("join".into(), ">=2 mentions, gold SQL joins across tables");
     }
-    ("L1".into(), "default: lexical anchor")
+    ("anchor".into(), "default: lexical anchor")
 }
 
 /// Collects table aliases: `FROM frpm AS T1` → {"t1": "frpm", "frpm": "frpm"}.
@@ -669,16 +669,16 @@ mod tests {
         let two_tables: BTreeSet<String> = ["a".to_string(), "b".to_string()].into();
         let one_table: BTreeSet<String> = ["a".to_string()].into();
         // Single target, single table: L1.
-        assert_eq!(assign_tier(&[tgt("a", vec![1])], &one_table).0, "L1");
+        assert_eq!(assign_tier(&[tgt("a", vec![1])], &one_table).0, "anchor");
         // Two targets in one table, gold SQL joins: L3.
         assert_eq!(
             assign_tier(&[tgt("a", vec![1]), tgt("a", vec![2])], &two_tables).0,
-            "L3"
+            "join"
         );
         // Gold rows across two tables: L4.
         assert_eq!(
             assign_tier(&[tgt("a", vec![1]), tgt("b", vec![2])], &two_tables).0,
-            "L4"
+            "cross-record"
         );
     }
 }

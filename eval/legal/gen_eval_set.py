@@ -11,20 +11,20 @@ in its provenance.
 
 Tier checks (all read-only queries against legal.stemmadb):
 
-  L1   the question must contain >= 1 content phrase that exact/trigram-hits
+  anchor   the question must contain >= 1 content phrase that exact/trigram-hits
        the gold row's lex entries, and the rest must be paraphrase (longest
        contiguous phrase hit bounded).
-  L2   NO content token of the question (resolver stopword list removed) may
+  paraphrase   NO content token of the question (resolver stopword list removed) may
        produce an exact OR trigram hit on the gold row's lex_values entries;
        colloquial register enforced by a banned-token list.
-  L4   two gold rows, one per table (state + federal, same topic); both rows
-       pass the L2-style no-anchor check, or the pair is explicitly mixed
+  cross-record   two gold rows, one per table (state + federal, same topic); both rows
+       pass the paraphrase-style no-anchor check, or the pair is explicitly mixed
        (one anchored, one not — recorded which).
-  L3   legal has no join tables yet (citation mining is in flight), so the
-       legal set carries an empty L3 slot in its header and relational
+  join   legal has no join tables yet (citation mining is in flight), so the
+       legal set carries an empty join slot in its header and relational
        queries are generated against the mini corpus instead, where the gold
        tuple is verified by executing the join path.
-  NIL  the defining topic phrase must have ZERO exact and ZERO trigram hits
+  absent  the defining topic phrase must have ZERO exact and ZERO trigram hits
        corpus-wide, and the topic comes from a domain the corpus plainly
        lacks (argument recorded per question).
 
@@ -73,7 +73,7 @@ REGISTER_BANNED = {
 }
 REGISTER_BANNED_SUBSTR = ["§"]  # the section sign
 
-# Words too generic to serve as an L4 pairing term or an L1 anchor nucleus.
+# Words too generic to serve as an cross-record pairing term or an anchor anchor nucleus.
 BOILERPLATE = {
     "california", "regulation", "regulations", "title", "division", "chapter",
     "article", "section", "sections", "subchapter", "subdivision", "cites",
@@ -86,10 +86,10 @@ BOILERPLATE = {
     "united", "government",
 }
 
-# NIL topic candidates: (defining phrase, absence argument). Each phrase is
+# absent topic candidates: (defining phrase, absence argument). Each phrase is
 # verified corpus-wide (0 exact-phrase hits AND 0 trigram hits) before use;
 # candidates that hit anything are discarded, so this list only *proposes*.
-NIL_TOPICS = [
+ABSENT_TOPICS = [
     ("parking meter", "Metered street parking is municipal code, not CCR or CFR."),
     ("homeowners association", "HOA governance is the Davis-Stirling Act (Civil Code), a statute — not regulation."),
     ("library card", "Public library membership is a local/county service policy, not state or federal regulation."),
@@ -273,7 +273,7 @@ class LexIndex:
             return 0
 
     def corpus_phrase_counts(self, phrase):
-        """(fts_phrase_hits, trigram_hits) corpus-wide, for NIL absence."""
+        """(fts_phrase_hits, trigram_hits) corpus-wide, for absent absence."""
         toks = tokenize(phrase)
         return (
             self._count_all("lex_fts", fts_phrase(toks)),
@@ -344,10 +344,10 @@ def anchor_windows(lex, question, lex_ids, max_len=5):
     return hits, longest
 
 
-def verify_l1(lex, question, table, rowid):
-    """L1: >= 1 content anchor phrase hits the gold row; rest paraphrased
+def verify_anchor(lex, question, table, rowid):
+    """anchor: >= 1 content anchor phrase hits the gold row; rest paraphrased
     (longest contiguous hitting run bounded)."""
-    v = {"tier": "L1", "checks": []}
+    v = {"tier": "anchor", "checks": []}
     if not well_formed(question):
         v["fail"] = "malformed"
         return False, None, v
@@ -383,7 +383,7 @@ def verify_l1(lex, question, table, rowid):
     return True, " ".join(best[0]), v
 
 
-def l2_offending_tokens(lex, question, lex_ids):
+def paraphrase_offending_tokens(lex, question, lex_ids):
     """Content tokens of the question that exact- or trigram-hit the given
     gold entries. Empty list == no lexical anchor on that row."""
     off = []
@@ -394,16 +394,16 @@ def l2_offending_tokens(lex, question, lex_ids):
     return off
 
 
-def verify_l2(lex, question, table, rowid):
-    """L2: no content token hits the gold row on either channel, and the
+def verify_paraphrase(lex, question, table, rowid):
+    """paraphrase: no content token hits the gold row on either channel, and the
     register is colloquial."""
-    v = {"tier": "L2"}
+    v = {"tier": "paraphrase"}
     if not well_formed(question):
         v["fail"] = "malformed"
         return False, v
     entries = lex.gold_entries(table, rowid)
     lex_ids = [e[0] for e in entries]
-    off = l2_offending_tokens(lex, question, lex_ids)
+    off = paraphrase_offending_tokens(lex, question, lex_ids)
     reg = register_offenders(question)
     v["offending_tokens"] = off
     v["register_offenders"] = reg
@@ -418,16 +418,16 @@ def verify_l2(lex, question, table, rowid):
     return True, v
 
 
-def verify_l4(lex, question, reg_rowid, sec_rowid):
-    """L4: two gold rows (regulations + sections). Both no-anchor, or
+def verify_cross_record(lex, question, reg_rowid, sec_rowid):
+    """cross-record: two gold rows (regulations + sections). Both no-anchor, or
     explicitly mixed — never both anchored."""
-    v = {"tier": "L4"}
+    v = {"tier": "cross-record"}
     if not well_formed(question):
         v["fail"] = "malformed"
         return False, v
-    reg_off = l2_offending_tokens(
+    reg_off = paraphrase_offending_tokens(
         lex, question, [e[0] for e in lex.gold_entries("regulations", reg_rowid)])
-    sec_off = l2_offending_tokens(
+    sec_off = paraphrase_offending_tokens(
         lex, question, [e[0] for e in lex.gold_entries("sections", sec_rowid)])
     reg_reg = register_offenders(question)
     v["regulations_offending"] = reg_off
@@ -447,10 +447,10 @@ def verify_l4(lex, question, reg_rowid, sec_rowid):
     return True, v
 
 
-def verify_nil(lex, question, phrase):
-    """NIL: the defining phrase is in the question and has zero exact-phrase
+def verify_absent(lex, question, phrase):
+    """absent: the defining phrase is in the question and has zero exact-phrase
     and zero trigram hits corpus-wide."""
-    v = {"tier": "NIL", "defining_phrase": phrase}
+    v = {"tier": "absent", "defining_phrase": phrase}
     if not well_formed(question):
         v["fail"] = "malformed"
         return False, v
@@ -601,7 +601,7 @@ def frequent_terms(text, n=18):
 
 # ------------------------------------------------------------------- prompts
 
-L1_PROMPT = """Below is an excerpt of a legal regulation. Write {k} different \
+ANCHOR_PROMPT = """Below is an excerpt of a legal regulation. Write {k} different \
 questions an ordinary person (not a lawyer) might type into a search box, each \
 answerable by this text.
 
@@ -618,7 +618,7 @@ TEXT:
 {text}
 """
 
-L2_PROMPT = """Below is an excerpt of a legal regulation. Write {k} different \
+PARAPHRASE_PROMPT = """Below is an excerpt of a legal regulation. Write {k} different \
 questions that this text ANSWERS, but that share NO vocabulary with it.
 
 Hard rules for every question:
@@ -638,7 +638,7 @@ TEXT:
 {text}
 """
 
-L4_PROMPT = """Below are two regulations on the same topic: one from the \
+CROSS_RECORD_PROMPT = """Below are two regulations on the same topic: one from the \
 California Code of Regulations (STATE) and one from the Code of Federal \
 Regulations (FEDERAL). Write {k} different questions an ordinary person might \
 ask that BOTH texts help answer — the state rule and the federal rule are each \
@@ -660,14 +660,14 @@ FEDERAL TEXT:
 {sec_text}
 """
 
-NIL_PROMPT = """Write {k} different casual questions a person might type into \
+ABSENT_PROMPT = """Write {k} different casual questions a person might type into \
 a search box about "{topic}". Every question MUST contain the exact phrase \
 "{topic}". Everyday register, no legal citations. Each ends with "?". Under 18 \
 words. Make them sound like someone expecting rules or requirements to exist \
 (who regulates it, is a permit needed, what are the rules), varied in phrasing.
 {feedback}"""
 
-L3_PROMPT = """Rewrite the question below in {k} different casual, natural \
+JOIN_PROMPT = """Rewrite the question below in {k} different casual, natural \
 ways. Every rewrite MUST keep these exact words unchanged: {keep}. Do not add \
 facts. Keep it under 18 words and end with "?".
 
@@ -677,9 +677,9 @@ QUESTION: {q}
 
 # --------------------------------------------------------------- generation
 
-def gen_tier_l1_l2(tier, mk_lex, mk_legal, lm, stream_reg, stream_sec, n, seed,
+def gen_tier_single_row(tier, mk_lex, mk_legal, lm, stream_reg, stream_sec, n, seed,
                    stats, review, max_calls=6, k=4, workers=1):
-    """Shared loop for the single-row tiers L1 and L2. Rows run in parallel
+    """Shared loop for the single-row tiers anchor and paraphrase. Rows run in parallel
     (each row's feedback iteration stays serial); acceptance follows stream
     order, stats merge on this thread."""
     state = {"take_reg": True}
@@ -709,10 +709,10 @@ def gen_tier_l1_l2(tier, mk_lex, mk_legal, lm, stream_reg, stream_sec, n, seed,
         feedback = ""
         rejected_here = []
         while calls < max_calls and not accepted:
-            if tier == "L1":
-                prompt = L1_PROMPT.format(k=k, text=ex, feedback=feedback)
+            if tier == "anchor":
+                prompt = ANCHOR_PROMPT.format(k=k, text=ex, feedback=feedback)
             else:
-                prompt = L2_PROMPT.format(
+                prompt = PARAPHRASE_PROMPT.format(
                     k=k, text=ex, feedback=feedback,
                     stop=", ".join(sorted(STOPWORDS)),
                     avoid=", ".join(frequent_terms(text)),
@@ -730,10 +730,10 @@ def gen_tier_l1_l2(tier, mk_lex, mk_legal, lm, stream_reg, stream_sec, n, seed,
                     continue
                 candidates += 1
                 d["candidates"] += 1
-                if tier == "L1":
-                    ok, anchor, v = verify_l1(lex, q, table, rowid)
+                if tier == "anchor":
+                    ok, anchor, v = verify_anchor(lex, q, table, rowid)
                 else:
-                    ok, v = verify_l2(lex, q, table, rowid)
+                    ok, v = verify_paraphrase(lex, q, table, rowid)
                     anchor = None
                 if ok:
                     accepted = (q, anchor, v, calls, candidates)
@@ -742,11 +742,11 @@ def gen_tier_l1_l2(tier, mk_lex, mk_legal, lm, stream_reg, stream_sec, n, seed,
                 rejected_here.append({"question": q, "fail": v.get("fail")})
                 for o in v.get("offending_tokens", []):
                     offenders_seen.append(o["token"])
-            if not accepted and tier == "L2" and offenders_seen:
+            if not accepted and tier == "paraphrase" and offenders_seen:
                 feedback = ("- Previous attempt FAILED: these words appear in "
                             "the text, avoid them and any word containing "
                             "them: " + ", ".join(sorted(set(offenders_seen))) + "\n")
-            elif not accepted and tier == "L1":
+            elif not accepted and tier == "anchor":
                 feedback = ("- Previous attempt FAILED: no 2-4 word phrase was "
                             "copied verbatim from the text. Copy one short "
                             "distinctive phrase exactly.\n")
@@ -811,7 +811,7 @@ def find_partner(lex, legal, reg_rowid):
     return None, None
 
 
-def gen_tier_l4(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
+def gen_tier_cross_record(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
                 max_calls=6, k=4, workers=1):
     def draw():
         try:
@@ -838,14 +838,14 @@ def gen_tier_l4(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
         feedback = ""
         rejected_here = []
         while calls < max_calls and not accepted:
-            prompt = L4_PROMPT.format(
+            prompt = CROSS_RECORD_PROMPT.format(
                 k=k, reg_text=excerpt(reg_text, 1800),
                 sec_text=excerpt(sec_text, 1800),
                 avoid=", ".join(avoid), feedback=feedback)
             try:
                 out = lm.generate_json(prompt, QUESTIONS_SCHEMA)
             except RuntimeError as e:
-                print(f"  [L4] LM error on pair ({reg_rowid},{sec_rowid}): {e}",
+                print(f"  [cross-record] LM error on pair ({reg_rowid},{sec_rowid}): {e}",
                       file=sys.stderr)
                 break
             calls += 1
@@ -856,7 +856,7 @@ def gen_tier_l4(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
                     continue
                 candidates += 1
                 d["candidates"] += 1
-                ok, v = verify_l4(lex, q, reg_rowid, sec_rowid)
+                ok, v = verify_cross_record(lex, q, reg_rowid, sec_rowid)
                 if ok:
                     accepted = (q, v, calls, candidates)
                     break
@@ -877,7 +877,7 @@ def gen_tier_l4(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
         d["accepted"] += 1
         rec = {
             "question": q,
-            "tier": "L4",
+            "tier": "cross-record",
             "corpus": "legal",
             "targets": [
                 {"table": "regulations", "column": "text",
@@ -906,17 +906,17 @@ def gen_tier_l4(mk_lex, mk_legal, lm, stream_reg, n, seed, stats, review,
         if rec is not None and len(records) >= n:
             d = {**d, "accepted": 0}
         for key, delta in d.items():
-            stats["L4"][key] += delta
+            stats["cross-record"][key] += delta
         if rec is None or len(records) >= n:
             continue
         records.append(rec)
         review.append(rv)
-        print(f"  [L4] {len(records)}/{n} {log}")
+        print(f"  [cross-record] {len(records)}/{n} {log}")
     return records
 
 
-def gen_tier_nil(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
-    topics = list(NIL_TOPICS)
+def gen_tier_absent(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
+    topics = list(ABSENT_TOPICS)
     rng.shuffle(topics)
     topic_iter = iter(topics)
 
@@ -931,15 +931,15 @@ def gen_tier_nil(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
         fts_n, tri_n = lex.corpus_phrase_counts(phrase)
         if fts_n or tri_n:
             d["topics_rejected_present"] += 1
-            print(f"  [NIL] topic '{phrase}' PRESENT in corpus "
+            print(f"  [absent] topic '{phrase}' PRESENT in corpus "
                   f"(fts={fts_n}, trigram={tri_n}) — discarded")
             return None, None, d, None
         try:
             out = lm.generate_json(
-                NIL_PROMPT.format(k=k, topic=phrase, feedback=""),
+                ABSENT_PROMPT.format(k=k, topic=phrase, feedback=""),
                 QUESTIONS_SCHEMA)
         except RuntimeError as e:
-            print(f"  [NIL] LM error on '{phrase}': {e}", file=sys.stderr)
+            print(f"  [absent] LM error on '{phrase}': {e}", file=sys.stderr)
             return None, None, d, None
         accepted = None
         candidates = 0
@@ -950,7 +950,7 @@ def gen_tier_nil(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
                 continue
             candidates += 1
             d["candidates"] += 1
-            ok, v = verify_nil(lex, q, phrase)
+            ok, v = verify_absent(lex, q, phrase)
             if ok:
                 accepted = (q, v)
                 break
@@ -964,7 +964,7 @@ def gen_tier_nil(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
         d["accepted"] += 1
         rec = {
             "question": q,
-            "tier": "NIL",
+            "tier": "absent",
             "corpus": "legal",
             "targets": [],
             "nil": True,
@@ -983,18 +983,18 @@ def gen_tier_nil(mk_lex, lm, n, seed, rng, stats, review, k=3, workers=1):
         if rec is not None and len(records) >= n:
             d = {**d, "accepted": 0}
         for key, delta in d.items():
-            stats["NIL"][key] += delta
+            stats["absent"][key] += delta
         if rec is None or len(records) >= n:
             continue
         records.append(rec)
         review.append(rv)
-        print(f"  [NIL] {len(records)}/{n} {log}")
+        print(f"  [absent] {len(records)}/{n} {log}")
     return records
 
 
-# ------------------------------------------------------------------- mini L3
+# ------------------------------------------------------------------- mini join
 
-def mini_l3_cases(mini):
+def mini_join_cases(mini):
     """Relational cases against the mini corpus. Each case: a seed question,
     the surface mentions that must survive paraphrase, the join SQL that
     derives the gold tuple, and how result columns map to targets. The gold
@@ -1086,9 +1086,9 @@ def mini_l3_cases(mini):
     return out
 
 
-def gen_mini_l3(mini, lm, n, seed, rng, stats, review, k=3):
+def gen_mini_join(mini, lm, n, seed, rng, stats, review, k=3):
     records = []
-    cases = mini_l3_cases(mini)
+    cases = mini_join_cases(mini)
     rng.shuffle(cases)
     per_case = max(1, (n + len(cases) - 1) // len(cases)) if cases else 0
     for case in cases:
@@ -1098,36 +1098,36 @@ def gen_mini_l3(mini, lm, n, seed, rng, stats, review, k=3):
         if per_case > 1:
             try:
                 out = lm.generate_json(
-                    L3_PROMPT.format(k=k, q=case["seed_q"],
+                    JOIN_PROMPT.format(k=k, q=case["seed_q"],
                                      keep=", ".join('"%s"' % m for m in case["keep"])),
                     QUESTIONS_SCHEMA, temperature=0.8)
                 variants += [(c.get("question") or "").strip()
                              for c in out.get("questions", [])]
             except RuntimeError as e:
-                print(f"  [L3] LM error on {case['case']}: {e}", file=sys.stderr)
+                print(f"  [join] LM error on {case['case']}: {e}", file=sys.stderr)
         taken = 0
         for q in variants:
             if not q or taken >= per_case or len(records) >= n:
                 break
-            stats["L3"]["candidates"] += 1
-            v = {"tier": "L3", "join_path": case["sql"],
+            stats["join"]["candidates"] += 1
+            v = {"tier": "join", "join_path": case["sql"],
                  "join_params": case["params"],
                  "gold_tuples": case["tuples"],
                  "mentions_required": case["keep"]}
             if not well_formed(q):
-                stats["L3"]["rejected"] += 1
+                stats["join"]["rejected"] += 1
                 v["fail"] = "malformed"
                 continue
             missing = [m for m in case["keep"] if m.lower() not in q.lower()]
             if missing:
-                stats["L3"]["rejected"] += 1
+                stats["join"]["rejected"] += 1
                 v["fail"] = "mention_lost:" + ",".join(missing)
                 continue
             v["pass"] = True
-            stats["L3"]["accepted"] += 1
+            stats["join"]["accepted"] += 1
             rec = {
                 "question": q,
-                "tier": "L3",
+                "tier": "join",
                 "corpus": "mini",
                 "targets": case["targets"],
                 "nil": False,
@@ -1142,7 +1142,7 @@ def gen_mini_l3(mini, lm, n, seed, rng, stats, review, k=3):
             records.append(rec)
             review.append({"rec": rec, "snippets": [], "rejected": []})
             taken += 1
-            print(f"  [L3] {len(records)}/{n} {case['case']}: {q}")
+            print(f"  [join] {len(records)}/{n} {case['case']}: {q}")
     return records
 
 
@@ -1185,7 +1185,7 @@ def render_review(path, dataset_name, seed, stats, review_items, header):
     def esc(s):
         return html.escape(str(s))
 
-    tiers = ["L1", "L2", "L3", "L4", "NIL"]
+    tiers = ["anchor", "paraphrase", "join", "cross-record", "absent"]
     rows = []
     for t in tiers:
         s = stats.get(t, {})
@@ -1211,7 +1211,7 @@ def render_review(path, dataset_name, seed, stats, review_items, header):
         "<th>rows abandoned</th></tr>",
         *rows,
         "</table>",
-        f"<p class=meta>L3 note: {esc(header['l3']['note'])}</p>",
+        f"<p class=meta>join note: {esc(header['l3']['note'])}</p>",
     ]
     for t in tiers:
         items = [it for it in review_items if it["rec"]["tier"] == t]
@@ -1223,7 +1223,7 @@ def render_review(path, dataset_name, seed, stats, review_items, header):
             v = rec["provenance"]["verification"]
             tgt = " · ".join(
                 f"{x['table']}.{x['column']} #{','.join(map(str, x['rowids']))}"
-                for x in rec["targets"]) or "NIL (no target)"
+                for x in rec["targets"]) or "absent (no target)"
             parts.append("<div class=item>")
             parts.append(f"<p class=q>{esc(rec['question'])}</p>")
             attempts = rec["provenance"]["attempts"]
@@ -1270,7 +1270,7 @@ def load_lm_config(config_path):
 def new_stats():
     keys = ("candidates", "accepted", "rejected", "rows_abandoned",
             "no_partner", "topics_rejected_present")
-    return {t: dict.fromkeys(keys, 0) for t in ("L1", "L2", "L3", "L4", "NIL")}
+    return {t: dict.fromkeys(keys, 0) for t in ("anchor", "paraphrase", "join", "cross-record", "absent")}
 
 
 def write_jsonl(path, header, records):
@@ -1289,10 +1289,10 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", default="eval/datasets/legal-synth-v1.jsonl")
     ap.add_argument("--mini-out", default=None,
-                    help="mini L3 output (default: mini-l3-v1.jsonl next to --out)")
+                    help="mini join output (default: mini-join-v1.jsonl next to --out)")
     ap.add_argument("--html", default=None,
                     help="review page (default: <out-stem>-review.html)")
-    ap.add_argument("--tiers", default="L1,L2,L3,L4,NIL",
+    ap.add_argument("--tiers", default="anchor,paraphrase,join,cross-record,absent",
                     help="comma list of tiers to generate")
     ap.add_argument("--workers", type=int, default=12,
                     help="concurrent rows in flight (each row's feedback "
@@ -1304,9 +1304,9 @@ def main():
     mini_db = dbs["mini"]
     stemmadb = os.path.splitext(legal_db)[0] + ".stemmadb"
     out = args.out
-    mini_out = args.mini_out or os.path.join(os.path.dirname(out), "mini-l3-v1.jsonl")
+    mini_out = args.mini_out or os.path.join(os.path.dirname(out), "mini-join-v1.jsonl")
     html_out = args.html or os.path.splitext(out)[0] + "-review.html"
-    tiers = [t.strip().upper() for t in args.tiers.split(",") if t.strip()]
+    tiers = [t.strip().lower() for t in args.tiers.split(",") if t.strip()]
 
     legal = ro_connect(legal_db)
     mini = ro_connect(mini_db)
@@ -1329,9 +1329,9 @@ def main():
     records = []
     mini_records = []
 
-    l3_note = ("legal L3 slot is empty: the legal corpus has no join tables "
+    join_note = ("legal join slot is empty: the legal corpus has no join tables "
                "yet (citation mining is in flight on a sibling branch); "
-               "relational-tier queries live in mini-l3-v1.jsonl against the "
+               "relational-tier queries live in mini-join-v1.jsonl against the "
                "mini corpus until legal citation edges land.")
 
     # Deterministic sampling streams (independent per tier so a change to one
@@ -1344,12 +1344,12 @@ def main():
                 stratified_stream(sec_strata, random.Random(r.randint(0, 1 << 30))),
                 stratified_stream(reg_strata, random.Random(r.randint(0, 1 << 30))))
 
-    s_reg_l1, s_sec_l1, s_reg_l2, s_sec_l2, s_reg_l4 = streams()
+    s_reg_anchor, s_sec_anchor, s_reg_para, s_sec_para, s_reg_cross = streams()
 
     def flush():
         counts = {t: sum(1 for r in records if r["tier"] == t)
-                  for t in ("L1", "L2", "L4", "NIL")}
-        counts["L3"] = 0
+                  for t in ("anchor", "paraphrase", "cross-record", "absent")}
+        counts["join"] = 0
         header = {
             "type": "header",
             "dataset": "legal-synth-v1",
@@ -1363,56 +1363,56 @@ def main():
                        "sections_rows": legal.execute(
                            "SELECT count(*) FROM sections").fetchone()[0]},
             "counts": counts,
-            "l3": {"status": "todo", "note": l3_note},
+            "join": {"status": "todo", "note": join_note},
             "stats": stats,
         }
         write_jsonl(out, header, records)
         mini_header = {
             "type": "header",
-            "dataset": "mini-l3-v1",
+            "dataset": "mini-join-v1",
             "version": 1,
             "generator": GENERATOR,
             "model": lm_cfg["model"],
             "seed": args.seed,
             "corpus": {"mini_db": os.path.basename(mini_db)},
-            "counts": {"L3": len(mini_records)},
+            "counts": {"join": len(mini_records)},
         }
         write_jsonl(mini_out, mini_header, mini_records)
-        render_review(html_out, "legal-synth-v1 (+ mini-l3-v1)", args.seed,
+        render_review(html_out, "legal-synth-v1 (+ mini-join-v1)", args.seed,
                       stats, review, header)
 
     t0 = time.time()
-    if "L1" in tiers:
-        print("== L1 (lexical anchor) ==")
-        records += gen_tier_l1_l2("L1", mk_lex, mk_legal, lm, s_reg_l1, s_sec_l1,
+    if "anchor" in tiers:
+        print("== anchor (lexical anchor) ==")
+        records += gen_tier_single_row("anchor", mk_lex, mk_legal, lm, s_reg_anchor, s_sec_anchor,
                                   args.n_per_tier, args.seed, stats, review,
                                   workers=args.workers)
         flush()
-    if "L2" in tiers:
-        print("== L2 (semantic, no lexical anchor) ==")
-        records += gen_tier_l1_l2("L2", mk_lex, mk_legal, lm, s_reg_l2, s_sec_l2,
+    if "paraphrase" in tiers:
+        print("== paraphrase (semantic, no lexical anchor) ==")
+        records += gen_tier_single_row("paraphrase", mk_lex, mk_legal, lm, s_reg_para, s_sec_para,
                                   args.n_per_tier, args.seed, stats, review,
                                   workers=args.workers)
         flush()
-    if "L4" in tiers:
-        print("== L4 (cross-record, state + federal) ==")
-        records += gen_tier_l4(mk_lex, mk_legal, lm, s_reg_l4, args.n_per_tier,
+    if "cross-record" in tiers:
+        print("== cross-record (cross-record, state + federal) ==")
+        records += gen_tier_cross_record(mk_lex, mk_legal, lm, s_reg_cross, args.n_per_tier,
                                args.seed, stats, review, workers=args.workers)
         flush()
-    if "NIL" in tiers:
-        print("== NIL (verified absence) ==")
-        records += gen_tier_nil(mk_lex, lm, args.n_nil, args.seed, rng, stats,
+    if "absent" in tiers:
+        print("== absent (verified absence) ==")
+        records += gen_tier_absent(mk_lex, lm, args.n_nil, args.seed, rng, stats,
                                 review, workers=args.workers)
         flush()
-    if "L3" in tiers:
-        print("== L3 (relational, mini corpus) ==")
-        mini_records = gen_mini_l3(mini, lm, args.n_per_tier, args.seed, rng,
+    if "join" in tiers:
+        print("== join (relational, mini corpus) ==")
+        mini_records = gen_mini_join(mini, lm, args.n_per_tier, args.seed, rng,
                                    stats, review)
         flush()
 
     dt = time.time() - t0
     print(f"\nwrote {len(records)} legal records -> {out}")
-    print(f"wrote {len(mini_records)} mini L3 records -> {mini_out}")
+    print(f"wrote {len(mini_records)} mini join records -> {mini_out}")
     print(f"review page -> {html_out}")
     print(f"{lm.calls} LM calls in {dt / 60:.1f} min")
     for t, s in stats.items():

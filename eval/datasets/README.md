@@ -5,8 +5,8 @@ Frozen, versioned question sets consumed by the eval harness
 
 | File | Corpus | Contents |
 |---|---|---|
-| `legal-synth-v1.jsonl` | legal (`eval/legal/data/legal.db`) | synthetic questions, tiers L1/L2/L4 + NIL |
-| `mini-l3-v1.jsonl` | mini (`eval/mini/data/mini.db`) | relational (L3) questions over declared joins |
+| `legal-synth-v1.jsonl` | legal (`eval/legal/data/legal.db`) | synthetic questions, tiers anchor/paraphrase/cross-record + absent |
+| `mini-join-v1.jsonl` | mini (`eval/mini/data/mini.db`) | relational (join) questions over declared joins |
 | `legal-synth-v1-review.html` | — | the human-skim page for the review pass |
 
 ## Format
@@ -14,14 +14,14 @@ Frozen, versioned question sets consumed by the eval harness
 One JSON object per line. The **first line is a header record** — consumers
 must skip any line with `"type": "header"` (equivalently: any line without a
 `"question"` key). The header carries the dataset name, version, seed,
-per-tier counts, generation stats, and the L3 slot note.
+per-tier counts, generation stats, and the join slot note.
 
 Question records:
 
 ```json
 {
   "question": "...",
-  "tier": "L1" | "L2" | "L3" | "L4" | "NIL",
+  "tier": "anchor" | "paraphrase" | "join" | "cross-record" | "absent",
   "corpus": "legal" | "mini",
   "targets": [
     {"table": "...", "column": "...", "rowids": [1, 2],
@@ -42,17 +42,17 @@ Question records:
 - `match_mode: "doc"` — the gold row is a document (`is_doc` containment
   semantics); `"value"` — exact stored-value semantics, `literal` carries the
   stored value.
-- L1 records carry `literal` = the verified lexical anchor phrase.
-- L4 records carry two targets (one `regulations` row, one `sections` row);
+- anchor records carry `literal` = the verified lexical anchor phrase.
+- cross-record records carry two targets (one `regulations` row, one `sections` row);
   `provenance.verification.mode` records `no_anchor` or which side is
   anchored (`mixed:...`).
-- NIL records have empty `targets` and `nil: true`; the verification block
+- absent records have empty `targets` and `nil: true`; the verification block
   records the defining phrase, its corpus-wide hit counts (must be zero on
   both the exact-phrase and trigram channels), and the absence argument.
 
-The legal set has **no L3 records yet**: the legal corpus has no join tables
+The legal set has **no join records yet**: the legal corpus has no join tables
 (citation mining is in flight on a sibling branch). The header's `l3` field
-documents the empty slot; `mini-l3-v1.jsonl` covers the relational tier
+documents the empty slot; `mini-join-v1.jsonl` covers the relational tier
 against the mini corpus until legal citation edges land.
 
 ## Ground truth is derived, tiers are verified
@@ -62,16 +62,16 @@ oblique question about it), so the gold rowid is known **by construction**.
 Tier membership is **verified mechanically** against the store's lexical
 index (`legal.stemmadb`), never trusted from generation:
 
-- **L1** — at least one content phrase of the question exact/trigram-hits the
+- **anchor** — at least one content phrase of the question exact/trigram-hits the
   gold row, and the longest verbatim run is bounded (paraphrase enforced).
-- **L2** — no content token of the question (resolver stopword list removed)
+- **paraphrase** — no content token of the question (resolver stopword list removed)
   produces an exact or trigram hit on any of the gold row's lex entries;
   colloquial register enforced by a banned-token list.
-- **L4** — both gold rows pass the L2-style no-anchor check, or the pair is
+- **cross-record** — both gold rows pass the paraphrase-style no-anchor check, or the pair is
   explicitly mixed (recorded which side is anchored). Never both anchored.
-- **L3** — the gold tuple is derived by executing the recorded join path
+- **join** — the gold tuple is derived by executing the recorded join path
   against the corpus (a pure function of the database).
-- **NIL** — the defining topic phrase has zero exact-phrase and zero trigram
+- **absent** — the defining topic phrase has zero exact-phrase and zero trigram
   hits corpus-wide, plus a recorded domain-level absence argument.
 
 Every record's `provenance.verification` contains the evidence for its own

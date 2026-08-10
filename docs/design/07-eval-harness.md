@@ -25,7 +25,7 @@ building and running it:
   the BIRD dev databases contain **zero**
   document-shaped columns (measured across all candidate DBs), so no vector
   table is ever built and the only behavioral difference is the
-  whole-query span. Dense lift (and the L2 tier) must be measured on the
+  whole-query span. Dense lift (and the paraphrase tier) must be measured on the
   legal corpus, which is what the tier design predicted anyway.
 - **Backend costs are metered at the seams.** LM round-trip time and
   embedding calls are measured by wrapper implementations of the
@@ -40,11 +40,11 @@ building and running it:
   not yet a correlated report. **Layer 3** (agent-grounding regression
   cases, grading rule 5) is separately gated and not part of
   `stemma-eval grade`.
-- **Tier assignment on BIRD** is mechanical as designed: L4 when the
-  verified gold rows span ≥2 distinct tables, else L3 when ≥2 value
-  targets and the gold SQL joins ≥2 tables, else L1. On the chosen
-  six-database slice this yields 391 L1 / 83 L3 / 71 L4 across 545 kept
-  questions; L2 and NIL come from the synthetic legal set.
+- **Tier assignment on BIRD** is mechanical as designed: cross-record when the
+  verified gold rows span ≥2 distinct tables, else join when ≥2 value
+  targets and the gold SQL joins ≥2 tables, else anchor. On the chosen
+  six-database slice this yields 391 anchor / 83 join / 71 cross-record across 545 kept
+  questions; paraphrase and absent come from the synthetic legal set.
 - The first run surfaced the coincidence rate the design predicted:
   on `california_schools`, value-loose recall@5 is 0.80 where
   column-strict is 0.40 — the same literal in the wrong column, exactly
@@ -85,7 +85,7 @@ Three further ideas carry over directly:
    denser graphs measurably bought better multi-hop recall. We adopt the
    layering and the correlation habit.
 2. **Faithfulness is a metric, not a vibe.** Their generation layer checks
-   answers against retrieved context. Our sharper analog: explicit-NIL
+   answers against retrieved context. Our sharper analog: explicit-absent
    behavior, measured on queries whose answers are genuinely absent.
 3. **Cost on the same axis as quality.** Their prompt-inflation finding
    (graph pipelines bloating contexts to ~40k tokens and *introducing
@@ -105,7 +105,7 @@ Value linking sits at the junction of four fields with mature evaluation
 literatures — entity linking, text-to-SQL, ad-hoc retrieval, and RAG — and
 each contributes a hard-won lesson this harness adopts.
 
-**Entity linking: matching modes must be explicit, and NIL is part of the
+**Entity linking: matching modes must be explicit, and absent is part of the
 headline score.** GERBIL [Röder 2018] standardized EL evaluation after a
 decade in which systems were incomparable partly because *annotation
 matching* was underspecified — does a predicted span count when it overlaps
@@ -117,9 +117,9 @@ is itself a segmentation-quality signal; and both **micro** (per-mention)
 and **macro** (per-query) aggregates are reported, since our queries carry
 one to four mentions and micro-only reporting would over-weight multi-
 mention queries. From TAC-KBP's decade of EL tracks [TAC-KBP 2013], whose
-B³+ metric refused to score linking and NIL-handling separately: our
+B³+ metric refused to score linking and absent-handling separately: our
 headline per-query credit is **conjunctive** — a query scores fully only
-when its mentions are detected *and* linked to gold rowids, with NIL
+when its mentions are detected *and* linked to gold rowids, with absent
 queries scoring only on affirmed absence. Partial credit exists in the
 diagnostic decomposition, never in the headline.
 
@@ -190,8 +190,8 @@ that is where real failures happen (a segmentation failure sent "fired from
 a" into a mortar regulation; no phrase-level probe would have caught it).
 That makes query realism a dataset property to protect: a "semantic tier"
 query that secretly has a lexical anchor measures nothing. So tier
-assignment is checked by machine: an L2 candidate qualifies only if none of
-its content tokens produce an exact or trigram hit on the gold row; an L3
+assignment is checked by machine: an paraphrase candidate qualifies only if none of
+its content tokens produce an exact or trigram hit on the gold row; an join
 candidate only if its gold tuple actually traverses a join path. Queries
 that fail verification are regenerated or discarded.
 
@@ -220,11 +220,16 @@ to require:
 
 | Tier | Requires | Example shape |
 |---|---|---|
-| L1 | lexical anchor | "the Q3 numbers for the Seattle office" |
-| L2 | semantic resolution (zero lexical overlap, verified) | "getting fired from a state job" |
-| L3 | relational coherence (multi-mention, join-path decides) | "what did Chen's Billing team ship" |
-| L4 | cross-record co-answer (≥2 gold rows, often ≥2 tables) | "overdraft fees on checking accounts" |
-| NIL | honest absence (answer verifiably not in corpus) | "who inspects restaurant kitchens" (retail food code is statute, not CCR) |
+| anchor | lexical anchor | "the Q3 numbers for the Seattle office" |
+| paraphrase | semantic resolution (zero lexical overlap, verified) | "getting fired from a state job" |
+| join | relational coherence (multi-mention, join-path decides) | "what did Chen's Billing team ship" |
+| cross-record | cross-record co-answer (≥2 gold rows, often ≥2 tables) | "overdraft fees on checking accounts" |
+| absent | honest absence (answer verifiably not in corpus) | "who inspects restaurant kitchens" (retail food code is statute, not CCR) |
+
+Tiers were briefly labeled L1–L4/NIL; run artifacts produced before
+2026-08-09 carry those labels (anchor=L1, paraphrase=L2, join=L3,
+cross-record=L4, absent=NIL). The codenames are retired: a tier's name
+states what it tests.
 
 ### Layer 2 — construction
 
@@ -261,12 +266,12 @@ filterable noise). Per (tier × ablation) cell:
   the k-pattern diagnosis table from 06 (ranking vs threshold vs retrieval
   failure), each at value-loose and column-strict matching [Zhong 2020].
 - **Grounded-query rate**: the conjunctive headline — mentions detected
-  *and* gold rowids linked (NIL affirmed, for the NIL tier), in the
+  *and* gold rowids linked (absent affirmed, for the absent tier), in the
   B³+/KILT lineage [TAC-KBP 2013; Petroni 2021]. One number per (tier ×
   ablation) cell that cannot be gamed by partial success.
-- **NIL-precision / NIL-recall** on the NIL tier: NIL-precision is the
+- **absent-precision / absent-recall** on the absent tier: absent-precision is the
   fraction of no-mention (or below-threshold) outcomes that are correct
-  absences; NIL-recall is the fraction of absent-answer queries that did
+  absences; absent-recall is the fraction of absent-answer queries that did
   *not* produce a confident wrong mention. A valid-but-wrong resolution is
   the worst failure the system's positioning names; it gets its own number.
 - **Calibration curve**: P(gold ∈ selected | score bucket), 10 buckets.
@@ -281,8 +286,8 @@ filterable noise). Per (tier × ablation) cell:
 The **primary artifact of a run is the mechanism × tier matrix** — recall@5
 per cell with deltas against the previous accepted run — not any single
 number. Expected shape, stated in advance so deviations are findings:
-`+dense` lifts L2 and should not move L1; `+coh` lifts L3 and should not
-move L1/L2; `+adj` buys points on ties wherever they occur, at bounded
+`+dense` lifts paraphrase and should not move anchor; `+coh` lifts join and should not
+move anchor/paraphrase; `+adj` buys points on ties wherever they occur, at bounded
 routing cost. A mechanism moving a tier it has no business moving is a
 regression *even if the movement is upward* — it means the mechanism fires
 where its evidence is not real, and the next corpus will pay for it.
@@ -300,7 +305,7 @@ A run passes when:
    randomised Tukey HSD for multiple-comparison control [Carterette 2012].
 2. **Tier-mechanism containment holds**: off-target cells move < 1 point in
    either direction (see above — upward drift off-target is also a fail).
-3. **NIL-precision does not drop**; any new confident-wrong on the NIL set
+3. **absent-precision does not drop**; any new confident-wrong on the absent set
    is surfaced as a named case in the report, not just a rate.
 4. **Cost envelopes hold**: p95 latency per tier and adjudication routing
    rate stay within declared budgets (budgets live next to the baseline
@@ -318,7 +323,7 @@ alongside as JSON (the baseline file diffs against it).
 
 - **BIRD dev slice**: 5–8 databases spanning clean and dirty schemas,
   questions verbatim, evidence field withheld (the no-evidence protocol),
-  targets derived per 06. Primarily L1/L3/L4; BIRD questions are rarely L2.
+  targets derived per 06. Primarily anchor/join/cross-record; BIRD questions are rarely paraphrase.
   The chosen slice (checked in under `eval/datasets/`): three dirty
   schemas — `california_schools` (spaced/abbreviated column names, values
   duplicated across tables), `thrombosis_prediction` (opaque medical
@@ -328,7 +333,7 @@ alongside as JSON (the baseline file diffs against it).
   questions; the discarded remainder had no string-equality/LIKE targets
   (aggregation-only questions) or, in 5 cases, targets that failed
   verification (flagged in each dataset's header record).
-- **Legal synthetic**: ~200 questions, ~50 per tier plus ~25 NIL,
+- **Legal synthetic**: ~200 questions, ~50 per tier plus ~25 absent,
   reverse-generated by the LM against sampled records with mechanical tier
   verification (above) and a human skim in the console before freezing.
   Frozen after review — the set is versioned, and regenerating it is a
@@ -355,7 +360,7 @@ mechanisms report into, in the same units as everything before them.
   "GERBIL — Benchmarking Named Entity Recognition and Linking
   Consistently." Semantic Web 9(5), 2018.
 - [TAC-KBP 2013] "TAC KBP Entity Linking Task Description v1.0" (B³+
-  scoring, NIL clustering). NIST TAC, 2013.
+  scoring, absent clustering). NIST TAC, 2013.
 - [Zhong 2020] Ruiqi Zhong, Tao Yu, Dan Klein. "Semantic Evaluation for
   Text-to-SQL with Distilled Test Suites." EMNLP 2020. arXiv:2010.02840.
 - [Thakur 2021] Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek
