@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "stemma-parse",
+    srcs = ["src/lib.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//crates/stemma-lm",
+        "//crates/stemma-resolve",
+        "//crates/stemmadb",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:sqlparser",
+        "@crates//:thiserror",
+    ],
+)
+
+rust_test(
+    name = "stemma-parse_test",
+    crate = ":stemma-parse",
+)

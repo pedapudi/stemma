@@ -10,6 +10,7 @@ rust_binary(
         "//crates/stemma-ingest",
         "//crates/stemma-kg",
         "//crates/stemma-lm",
+        "//crates/stemma-parse",
         "//crates/stemma-proto",
         "//crates/stemma-resolve",
         "//crates/stemmadb",

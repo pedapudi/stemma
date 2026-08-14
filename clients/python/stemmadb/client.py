@@ -64,6 +64,19 @@ class StemmaClient:
             timeout=self._timeout,
         )
 
+    def parse(
+        self, query: str, database: str, source: str = "", session: str = "",
+        allow_lm: bool = True,
+    ) -> resolve_pb2.ParseResponse:
+        """Resolve and produce a validated, parameterized read-only query."""
+        request = resolve_pb2.ParseRequest(
+            query=query,
+            database=database,
+            options=self._request(
+                query, database, source, session, allow_lm).options,
+        )
+        return self._stub.Parse(request, timeout=self._timeout)
+
     def explain_dict(
         self, query: str, database: str, source: str = "", session: str = "",
         allow_lm: bool = False,

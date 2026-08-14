@@ -1,8 +1,7 @@
 // stemma Resolve API: pin natural-language mentions to concrete records.
 //
-// The response is deliberately a *candidate set with evidence*, not a single
-// forced answer: downstream consumers (a text-to-SQL generator, an agent, a
-// human) choose, and recall matters more than a premature hard commit.
+// Resolve preserves candidate evidence and reports whether grounding is
+// settled. Parse proceeds only from a settled trace.
 syntax = "proto3";
 
 package stemma.v1;
@@ -17,6 +16,9 @@ service ResolveService {
   // reason each near-miss was not selected. The analogue of SQL EXPLAIN;
   // drives the UI's query-plan view.
   rpc Explain(ResolveRequest) returns (ExplainResponse);
+
+  // Resolve the query and propose a validated, parameterized read-only query.
+  rpc Parse(ParseRequest) returns (ParseResponse);
 }
 
 // ---------- Explain (full trajectory) ----------
@@ -29,6 +31,40 @@ message ExplainResponse {
   repeated TraceSpan spans = 4;
   // Indices into `spans` of the spans selected as mentions, in query order.
   repeated uint32 mentions = 5;
+  // Query-level resolution derived from the selected mentions.
+  ResolutionOutcome outcome = 6;
+  // The best deterministic question, when the outcome is ambiguous.
+  Clarification clarification = 7;
+}
+
+enum ResolutionStatus {
+  RESOLUTION_STATUS_UNSPECIFIED = 0;
+  RESOLUTION_STATUS_RESOLVED = 1;
+  RESOLUTION_STATUS_EQUIVALENT = 2;
+  RESOLUTION_STATUS_AMBIGUOUS = 3;
+  RESOLUTION_STATUS_UNKNOWN = 4;
+  RESOLUTION_STATUS_UNANSWERABLE = 5;
+}
+
+message ResolutionOutcome {
+  ResolutionStatus status = 1;
+  // Span ids requiring clarification. Empty unless status is AMBIGUOUS.
+  repeated uint32 ambiguous_spans = 2;
+  // Stable, machine-readable explanation of the status.
+  string reason = 3;
+}
+
+message Clarification {
+  uint32 span_id = 1;
+  string dimension = 2;
+  string question = 3;
+  repeated ClarificationOption options = 4;
+}
+
+message ClarificationOption {
+  string label = 1;
+  // Indices into the owning span's candidates.
+  repeated uint32 candidate_indices = 2;
 }
 
 message TraceToken {
@@ -143,10 +179,8 @@ message ResolveOptions {
 message ResolveResponse {
   // Detected mentions with their ranked candidate resolutions.
   repeated Mention mentions = 1;
-  // The query with mentions substituted by canonical terms, suitable as
-  // enriched input to a downstream query generator. Empty until substitution
-  // is implemented.
-  string rewritten_query = 2;
+  ResolutionOutcome outcome = 2;
+  Clarification clarification = 3;
 }
 
 // A span of the query believed to reference something in the database.
@@ -161,32 +195,62 @@ message Mention {
   // True when the pipeline affirmatively concluded no record matches
   // (distinct from "no candidates found").
   bool nil = 5;
-  // Distinct readings remain tied after every disambiguation stage; the
-  // caller should present `readings` and ask, not guess.
-  bool ambiguous = 6;
-  // The tied readings, one per interpretation, when `ambiguous` is set.
-  repeated Reading readings = 7;
-  // max(reach)/min(reach) across `readings`: how far apart they are in what
-  // they would return. `ambiguous` says the readings are tied; this says
-  // whether the tie is worth asking about. 1.0 means the choice barely moves
-  // the answer, 100.0 means two orders of magnitude. 0.0 when not computed.
-  double divergence = 8;
 }
 
-// One reading of an ambiguous mention: an interpretation, summarized for
-// asking the user which they meant.
-message Reading {
-  string table = 1;
-  string column = 2;
-  string value = 3;
-  // How many rows share this reading ("40 brands named Ellis").
-  uint32 row_count = 4;
-  // Representative rowid for citation.
-  int64 rowid = 5;
-  // Grain-table rows this reading reaches. `row_count` counts the cells
-  // holding the value; `reach` counts the facts they account for — what a
-  // query over this reading would aggregate. 0 when not computed.
-  uint64 reach = 6;
+// ---------- Parse (validated query) ----------
+
+message ParseRequest {
+  string query = 1;
+  string database = 2;
+  ResolveOptions options = 3;
+}
+
+enum ParseStatus {
+  PARSE_STATUS_UNSPECIFIED = 0;
+  PARSE_STATUS_RESOLVED = 1;
+  PARSE_STATUS_AMBIGUOUS = 2;
+  PARSE_STATUS_UNKNOWN = 3;
+  PARSE_STATUS_UNANSWERABLE = 4;
+  PARSE_STATUS_PROPOSAL_UNAVAILABLE = 5;
+  PARSE_STATUS_INVALID_PROPOSAL = 6;
+}
+
+message ParseResponse {
+  ParseStatus status = 1;
+  ResolveResponse resolution = 2;
+  string sql = 3;
+  repeated QueryParameter parameters = 4;
+  repeated GroundingUse grounding_uses = 5;
+  repeated string assumptions = 6;
+  repeated ValidationFailure validation_failures = 7;
+  // Reserved for a future parse-structure clarification; grounding questions
+  // remain in `resolution`.
+  Clarification clarification = 8;
+}
+
+message QueryParameter {
+  uint32 position = 1;
+  oneof value {
+    int64 integer = 2;
+    double real = 3;
+    string text = 4;
+    bytes blob = 5;
+    bool boolean = 6;
+    bool null = 7;
+  }
+}
+
+message GroundingUse {
+  string kind = 1;
+  string name = 2;
+  optional uint32 span_id = 3;
+  optional uint32 candidate_index = 4;
+}
+
+message ValidationFailure {
+  string code = 1;
+  string message = 2;
+  string location = 3;
 }
 
 // One concrete record (or schema element) a mention may resolve to.

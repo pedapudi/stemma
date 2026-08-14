@@ -10,15 +10,15 @@ the accent dot is the referent. <a href="docs/brand.md">brand</a></sub>
 
 # stemma
 
-Extract the entities referenced in a natural-language query and resolve them to
-concrete records in the database.
+Ground natural-language queries in concrete database records, then compile
+them into safe, parameterized, read-only SQLite queries.
 
 A query names things obliquely — by nickname, by abbreviation, by description, by
 association. *the Q3 numbers for the Seattle office*, *what did Chen's team ship*,
 *the crown's holdings*. Each of those mentions has to be pinned to an actual row
-before the query can run. stemma does that pinning: it spans the mentions, links
-them to candidate records, and returns a resolution with the evidence that
-supports it.
+before the query can run. stemma first does that pinning: it spans mentions,
+links them to candidate records, and returns an evidence-rich trace. The
+semantic parser builds directly from that trace after ambiguity is resolved.
 
 ## Name
 
@@ -45,8 +45,8 @@ Early. Nothing to install yet.
 ## Layout
 
 The design and the literature behind it are in
-[docs/architecture.md](docs/architecture.md). In short: a Rust resolution
-engine beside a stock SQLite database. The storage layer is **stemmadb**
+[docs/architecture.md](docs/architecture.md). In short: a grounding-first Rust
+semantic parser beside a stock SQLite database. The storage layer is **stemmadb**
 (`crates/stemmadb`): the user's database is attached read-only, and every
 derived artifact — lexical and vector indexes, the knowledge store, the embed
 queue, the model registry — lives in a sidecar `.stemmadb` file. Retrieval is
@@ -59,7 +59,8 @@ protocol respectively.
   `tools/regen_protos.sh`)
 - `crates/` — `stemmadb` (storage), `stemma-resolve` (pipeline), `stemma-kg`
   (knowledge store), `stemma-embed` / `stemma-lm` (model backends),
-  `stemma-server` (gRPC front door), `stemma-eval` (BIRD harness)
+  `stemma-parse` (grounded query validation), `stemma-server` (gRPC front
+  door), `stemma-eval` (BIRD harness)
 - `eval/bird/` — BIRD no-evidence evaluation: `fetch_bird.sh`, then
   `stemma-eval derive` to extract resolution targets from gold SQL
 - `third_party/` — vendored SQLite headers and sqlite-vec, statically linked

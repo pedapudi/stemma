@@ -5,8 +5,8 @@ description = "Client library for stemma: resolve natural-language mentions to d
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "grpcio>=1.60",
-    "protobuf>=4.25",
+    "grpcio>=1.83",
+    "protobuf>=7.35",
 ]
 
 [build-system]

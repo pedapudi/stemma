@@ -13,6 +13,42 @@ pub struct ExplainResponse {
     /// Indices into `spans` of the spans selected as mentions, in query order.
     #[prost(uint32, repeated, tag = "5")]
     pub mentions: ::prost::alloc::vec::Vec<u32>,
+    /// Query-level resolution derived from the selected mentions.
+    #[prost(message, optional, tag = "6")]
+    pub outcome: ::core::option::Option<ResolutionOutcome>,
+    /// The best deterministic question, when the outcome is ambiguous.
+    #[prost(message, optional, tag = "7")]
+    pub clarification: ::core::option::Option<Clarification>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolutionOutcome {
+    #[prost(enumeration = "ResolutionStatus", tag = "1")]
+    pub status: i32,
+    /// Span ids requiring clarification. Empty unless status is AMBIGUOUS.
+    #[prost(uint32, repeated, tag = "2")]
+    pub ambiguous_spans: ::prost::alloc::vec::Vec<u32>,
+    /// Stable, machine-readable explanation of the status.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Clarification {
+    #[prost(uint32, tag = "1")]
+    pub span_id: u32,
+    #[prost(string, tag = "2")]
+    pub dimension: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub question: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub options: ::prost::alloc::vec::Vec<ClarificationOption>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClarificationOption {
+    #[prost(string, tag = "1")]
+    pub label: ::prost::alloc::string::String,
+    /// Indices into the owning span's candidates.
+    #[prost(uint32, repeated, tag = "2")]
+    pub candidate_indices: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TraceToken {
@@ -169,11 +205,10 @@ pub struct ResolveResponse {
     /// Detected mentions with their ranked candidate resolutions.
     #[prost(message, repeated, tag = "1")]
     pub mentions: ::prost::alloc::vec::Vec<Mention>,
-    /// The query with mentions substituted by canonical terms, suitable as
-    /// enriched input to a downstream query generator. Empty until substitution
-    /// is implemented.
-    #[prost(string, tag = "2")]
-    pub rewritten_query: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub outcome: ::core::option::Option<ResolutionOutcome>,
+    #[prost(message, optional, tag = "3")]
+    pub clarification: ::core::option::Option<Clarification>,
 }
 /// A span of the query believed to reference something in the database.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -193,41 +228,81 @@ pub struct Mention {
     /// (distinct from "no candidates found").
     #[prost(bool, tag = "5")]
     pub nil: bool,
-    /// Distinct readings remain tied after every disambiguation stage; the
-    /// caller should present `readings` and ask, not guess.
-    #[prost(bool, tag = "6")]
-    pub ambiguous: bool,
-    /// The tied readings, one per interpretation, when `ambiguous` is set.
-    #[prost(message, repeated, tag = "7")]
-    pub readings: ::prost::alloc::vec::Vec<Reading>,
-    /// max(reach)/min(reach) across `readings`: how far apart they are in what
-    /// they would return. `ambiguous` says the readings are tied; this says
-    /// whether the tie is worth asking about. 1.0 means the choice barely moves
-    /// the answer, 100.0 means two orders of magnitude. 0.0 when not computed.
-    #[prost(double, tag = "8")]
-    pub divergence: f64,
 }
-/// One reading of an ambiguous mention: an interpretation, summarized for
-/// asking the user which they meant.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Reading {
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseRequest {
     #[prost(string, tag = "1")]
-    pub table: ::prost::alloc::string::String,
+    pub query: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
-    pub column: ::prost::alloc::string::String,
+    pub database: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub options: ::core::option::Option<ResolveOptions>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseResponse {
+    #[prost(enumeration = "ParseStatus", tag = "1")]
+    pub status: i32,
+    #[prost(message, optional, tag = "2")]
+    pub resolution: ::core::option::Option<ResolveResponse>,
     #[prost(string, tag = "3")]
-    pub value: ::prost::alloc::string::String,
-    /// How many rows share this reading ("40 brands named Ellis").
-    #[prost(uint32, tag = "4")]
-    pub row_count: u32,
-    /// Representative rowid for citation.
-    #[prost(int64, tag = "5")]
-    pub rowid: i64,
-    /// Grain-table rows this reading reaches. `row_count` counts the cells
-    /// holding the value; `reach` counts the facts they account for — what a
-    /// query over this reading would aggregate. 0 when not computed.
-    #[prost(uint64, tag = "6")]
-    pub reach: u64,
+    pub sql: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub parameters: ::prost::alloc::vec::Vec<QueryParameter>,
+    #[prost(message, repeated, tag = "5")]
+    pub grounding_uses: ::prost::alloc::vec::Vec<GroundingUse>,
+    #[prost(string, repeated, tag = "6")]
+    pub assumptions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "7")]
+    pub validation_failures: ::prost::alloc::vec::Vec<ValidationFailure>,
+    /// Reserved for a future parse-structure clarification; grounding questions
+    /// remain in `resolution`.
+    #[prost(message, optional, tag = "8")]
+    pub clarification: ::core::option::Option<Clarification>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryParameter {
+    #[prost(uint32, tag = "1")]
+    pub position: u32,
+    #[prost(oneof = "query_parameter::Value", tags = "2, 3, 4, 5, 6, 7")]
+    pub value: ::core::option::Option<query_parameter::Value>,
+}
+/// Nested message and enum types in `QueryParameter`.
+pub mod query_parameter {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(int64, tag = "2")]
+        Integer(i64),
+        #[prost(double, tag = "3")]
+        Real(f64),
+        #[prost(string, tag = "4")]
+        Text(::prost::alloc::string::String),
+        #[prost(bytes, tag = "5")]
+        Blob(::prost::alloc::vec::Vec<u8>),
+        #[prost(bool, tag = "6")]
+        Boolean(bool),
+        #[prost(bool, tag = "7")]
+        Null(bool),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GroundingUse {
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint32, optional, tag = "3")]
+    pub span_id: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub candidate_index: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ValidationFailure {
+    #[prost(string, tag = "1")]
+    pub code: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub location: ::prost::alloc::string::String,
 }
 /// One concrete record (or schema element) a mention may resolve to.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -325,6 +400,85 @@ pub struct Adjudication {
     pub model: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub rationale: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ResolutionStatus {
+    Unspecified = 0,
+    Resolved = 1,
+    Equivalent = 2,
+    Ambiguous = 3,
+    Unknown = 4,
+    Unanswerable = 5,
+}
+impl ResolutionStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "RESOLUTION_STATUS_UNSPECIFIED",
+            Self::Resolved => "RESOLUTION_STATUS_RESOLVED",
+            Self::Equivalent => "RESOLUTION_STATUS_EQUIVALENT",
+            Self::Ambiguous => "RESOLUTION_STATUS_AMBIGUOUS",
+            Self::Unknown => "RESOLUTION_STATUS_UNKNOWN",
+            Self::Unanswerable => "RESOLUTION_STATUS_UNANSWERABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "RESOLUTION_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "RESOLUTION_STATUS_RESOLVED" => Some(Self::Resolved),
+            "RESOLUTION_STATUS_EQUIVALENT" => Some(Self::Equivalent),
+            "RESOLUTION_STATUS_AMBIGUOUS" => Some(Self::Ambiguous),
+            "RESOLUTION_STATUS_UNKNOWN" => Some(Self::Unknown),
+            "RESOLUTION_STATUS_UNANSWERABLE" => Some(Self::Unanswerable),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ParseStatus {
+    Unspecified = 0,
+    Resolved = 1,
+    Ambiguous = 2,
+    Unknown = 3,
+    Unanswerable = 4,
+    ProposalUnavailable = 5,
+    InvalidProposal = 6,
+}
+impl ParseStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PARSE_STATUS_UNSPECIFIED",
+            Self::Resolved => "PARSE_STATUS_RESOLVED",
+            Self::Ambiguous => "PARSE_STATUS_AMBIGUOUS",
+            Self::Unknown => "PARSE_STATUS_UNKNOWN",
+            Self::Unanswerable => "PARSE_STATUS_UNANSWERABLE",
+            Self::ProposalUnavailable => "PARSE_STATUS_PROPOSAL_UNAVAILABLE",
+            Self::InvalidProposal => "PARSE_STATUS_INVALID_PROPOSAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PARSE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "PARSE_STATUS_RESOLVED" => Some(Self::Resolved),
+            "PARSE_STATUS_AMBIGUOUS" => Some(Self::Ambiguous),
+            "PARSE_STATUS_UNKNOWN" => Some(Self::Unknown),
+            "PARSE_STATUS_UNANSWERABLE" => Some(Self::Unanswerable),
+            "PARSE_STATUS_PROPOSAL_UNAVAILABLE" => Some(Self::ProposalUnavailable),
+            "PARSE_STATUS_INVALID_PROPOSAL" => Some(Self::InvalidProposal),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod resolve_service_client {
@@ -471,6 +625,28 @@ pub mod resolve_service_client {
                 .insert(GrpcMethod::new("stemma.v1.ResolveService", "Explain"));
             self.inner.unary(req, path, codec).await
         }
+        /// Resolve the query and propose a validated, parameterized read-only query.
+        pub async fn parse(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ParseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ParseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/stemma.v1.ResolveService/Parse",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("stemma.v1.ResolveService", "Parse"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -500,6 +676,11 @@ pub mod resolve_service_server {
             &self,
             request: tonic::Request<super::ResolveRequest>,
         ) -> std::result::Result<tonic::Response<super::ExplainResponse>, tonic::Status>;
+        /// Resolve the query and propose a validated, parameterized read-only query.
+        async fn parse(
+            &self,
+            request: tonic::Request<super::ParseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ParseResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ResolveServiceServer<T> {
@@ -652,6 +833,50 @@ pub mod resolve_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ExplainSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/stemma.v1.ResolveService/Parse" => {
+                    #[allow(non_camel_case_types)]
+                    struct ParseSvc<T: ResolveService>(pub Arc<T>);
+                    impl<
+                        T: ResolveService,
+                    > tonic::server::UnaryService<super::ParseRequest> for ParseSvc<T> {
+                        type Response = super::ParseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ParseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResolveService>::parse(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ParseSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

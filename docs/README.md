@@ -22,6 +22,9 @@
    gRPC Resolve API, calling it with grpcurl.
 4. [Corpora](user-guide/04-corpora.md) — the bundled test corpus, the
    California Code of Regulations corpus, BIRD, and how to build your own.
+5. [Live validation](user-guide/05-live-validation.md) — explicit service
+   configuration, capability checks, and the boundary between hermetic and
+   live acceptance suites.
 
 ## Component docs
 
@@ -44,6 +47,9 @@
   mathematics, the knowledge compiler's algorithms, the designed dense
   channel and LM band, and the evaluation protocol. Includes a shared
   [bibliography](design/00-bibliography.md).
+- [Query-level disambiguation](design/08-query-disambiguation.md) — the
+  grounding-first roadmap from the resolution trace to a grounded SQLite
+  syntax tree, including clarification, validation, and evaluation gates.
 - [Brand](brand.md) — the mark and its grammar, the wordmark, the one color
   rule (`currentColor` strokes, the dot is the only colored element), clear
   space and minimum sizes, and the voice/microcopy conventions. Assets live in

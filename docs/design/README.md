@@ -139,9 +139,17 @@ tier fails the run even when it moves it upward. Grounded in
 GraphRAG-Bench's finding that structure helps only on the tiers that need
 it, and that only per-tier reporting can see this.
 
+**[08 — Query-level disambiguation](08-query-disambiguation.md)**
+The grounding-first semantic-parser roadmap: the resolution trace remains the
+only grounding artifact, an optional bounded service proposes parameterized
+queries, and deterministic validation admits a grounded SQLite syntax tree.
+It defines grounding gates, clarification behavior, semantic coverage,
+hermetic and live evaluation, and the explicit rejection of a custom
+intermediate representation.
+
 **[00 — Bibliography](00-bibliography.md)**
 The shared reference list, grouped by topic, with citation keys disambiguated
-by first-author given name where surnames collide. Sections A–G were checked
+by first-author given name where surnames collide. Sections A–G and I were checked
 against the published record — anthology pages, proceedings, DOIs — rather
 than cited from memory; section H is labelled as checked against a secondary
 list. It closes with notes on contested claims, including why this document
@@ -154,4 +162,4 @@ on a single paper's own error profile.
 For the design argument, read 01 then 05 — the topology and the
 encoder/decoder split are the same decision seen from two sides. For the
 implementation, read 02 then 03 then 04, which is the order the data flows.
-For the research framing, 06 and the bibliography.
+For the research framing, read 06, 08 and the bibliography.

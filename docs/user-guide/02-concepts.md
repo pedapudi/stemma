@@ -12,10 +12,11 @@ Before any query can run, each mention must be pinned to an actual record:
 "the Seattle office" → `offices` rowid 17, whose stored name might be
 `'Seattle - Northgate'`. stemma does that pinning — it **spans** the mentions,
 **links** them to candidate records, and returns a **resolution with
-evidence**. It deliberately does *not* generate SQL: the resolution artifact
-is useful to any downstream consumer (a text-to-SQL system, an agent, a
-human), and the published error analyses say this linking step — not SQL
-logic — is where natural-language database interfaces actually fail (the
+evidence**. That grounding artifact is independently useful and is the first
+stage of the planned semantic parser. Parsing will produce a parameterized,
+read-only SQLite syntax tree only after grounding ambiguity is settled. The
+published error analyses say this linking step is a dominant source of
+natural-language database failures (the
 numbers, with their caveats, in
 [architecture.md](../architecture.md#why-this-problem) and the
 [bibliography](../design/00-bibliography.md)).
@@ -103,6 +104,8 @@ a mismatched identity is a hard error, not a warning.
 | LM adjudication band (`allow_lm`) | ✅ |
 | MCP server, reference agent, console with trajectories | ✅ |
 | Mention expansion | designed ([design/05](../design/05-encoders-decoders.md)) |
-| Evaluation harness | designed ([design/07](../design/07-eval-harness.md)) |
+| Evaluation harness | built ([design/07](../design/07-eval-harness.md)) |
+| Query-level interpretation and clarification | initial vertical slice built; calibration and dialogue evaluation staged ([design/08](../design/08-query-disambiguation.md)) |
+| Grounded SQLite semantic parser | staged; grounding completion is the release gate ([design/08](../design/08-query-disambiguation.md)) |
 
 The deep reference for each piece is [docs/design/](../design/README.md).

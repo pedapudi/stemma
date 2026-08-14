@@ -44,6 +44,11 @@ class ResolveServiceStub:
                 request_serializer=stemma_dot_v1_dot_resolve__pb2.ResolveRequest.SerializeToString,
                 response_deserializer=stemma_dot_v1_dot_resolve__pb2.ExplainResponse.FromString,
                 _registered_method=True)
+        self.Parse = channel.unary_unary(
+                '/stemma.v1.ResolveService/Parse',
+                request_serializer=stemma_dot_v1_dot_resolve__pb2.ParseRequest.SerializeToString,
+                response_deserializer=stemma_dot_v1_dot_resolve__pb2.ParseResponse.FromString,
+                _registered_method=True)
 
 
 class ResolveServiceServicer:
@@ -67,6 +72,13 @@ class ResolveServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Parse(self, request, context):
+        """Resolve the query and propose a validated, parameterized read-only query.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ResolveServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -79,6 +91,11 @@ def add_ResolveServiceServicer_to_server(servicer, server):
                     servicer.Explain,
                     request_deserializer=stemma_dot_v1_dot_resolve__pb2.ResolveRequest.FromString,
                     response_serializer=stemma_dot_v1_dot_resolve__pb2.ExplainResponse.SerializeToString,
+            ),
+            'Parse': grpc.unary_unary_rpc_method_handler(
+                    servicer.Parse,
+                    request_deserializer=stemma_dot_v1_dot_resolve__pb2.ParseRequest.FromString,
+                    response_serializer=stemma_dot_v1_dot_resolve__pb2.ParseResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -135,6 +152,33 @@ class ResolveService:
             '/stemma.v1.ResolveService/Explain',
             stemma_dot_v1_dot_resolve__pb2.ResolveRequest.SerializeToString,
             stemma_dot_v1_dot_resolve__pb2.ExplainResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Parse(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/stemma.v1.ResolveService/Parse',
+            stemma_dot_v1_dot_resolve__pb2.ParseRequest.SerializeToString,
+            stemma_dot_v1_dot_resolve__pb2.ParseResponse.FromString,
             options,
             channel_credentials,
             insecure,

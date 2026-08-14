@@ -241,7 +241,83 @@ pub struct Trace {
     pub spans: Vec<Span>,
     /// Ids (into `spans`) of the spans selected as mentions, in query order.
     pub mentions: Vec<usize>,
+    /// The best deterministic question for materially distinct readings.
+    pub clarification: Option<Clarification>,
     pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionStatus {
+    Resolved,
+    Equivalent,
+    Ambiguous,
+    Unknown,
+    Unanswerable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolutionOutcome {
+    pub status: ResolutionStatus,
+    pub ambiguous_spans: Vec<usize>,
+    pub reason: &'static str,
+}
+
+impl Trace {
+    /// Conservatively summarizes mention-level evidence. `Equivalent` and
+    /// `Unanswerable` require query-level denotation evidence not yet present
+    /// in a trace, so this derivation never guesses either state.
+    pub fn outcome(&self) -> ResolutionOutcome {
+        let ambiguous_spans: Vec<_> = self
+            .mentions
+            .iter()
+            .copied()
+            .filter(|&id| self.spans[id].ambiguous)
+            .collect();
+        if !ambiguous_spans.is_empty() {
+            return ResolutionOutcome {
+                status: ResolutionStatus::Ambiguous,
+                ambiguous_spans,
+                reason: "ambiguous_mentions",
+            };
+        }
+        let confident = self.mentions.iter().any(|&id| {
+            let span = &self.spans[id];
+            span.status == "selected"
+                && span.admitted_by.is_none()
+                && span.candidates.iter().any(|candidate| candidate.selected)
+        });
+        ResolutionOutcome {
+            status: if confident {
+                ResolutionStatus::Resolved
+            } else {
+                ResolutionStatus::Unknown
+            },
+            ambiguous_spans,
+            reason: if confident {
+                "confident_mentions"
+            } else {
+                "no_confident_candidates"
+            },
+        }
+    }
+}
+
+/// A question whose answers partition the viable readings of one mention.
+#[derive(Debug, Clone, Serialize)]
+pub struct Clarification {
+    pub span_id: usize,
+    /// The semantic distinction being localized: relation, attribute, or record.
+    pub dimension: String,
+    pub question: String,
+    pub options: Vec<ClarificationOption>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClarificationOption {
+    pub label: String,
+    /// Indices into the owning span's `candidates`.
+    pub candidate_indices: Vec<usize>,
 }
 
 /// Resolve `query` against the lexical index alone.
@@ -483,6 +559,7 @@ pub fn resolve_full(
         tokens,
         spans,
         mentions,
+        clarification: None,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     };
     if let Some(lm) = lm {
@@ -494,7 +571,67 @@ pub fn resolve_full(
     if let Err(e) = annotate_divergence(db, &mut trace) {
         tracing::warn!(error = %e, "divergence estimation skipped");
     }
+    plan_clarification(&mut trace);
     Ok(trace)
+}
+
+/// Builds one minimal, deterministic ask-back for each ambiguous mention.
+pub fn plan_clarification(trace: &mut Trace) {
+    trace.clarification = trace
+        .mentions
+        .iter()
+        .find_map(|&span_id| clarification_for(&trace.spans[span_id]));
+}
+
+fn clarification_for(span: &Span) -> Option<Clarification> {
+    if !span.ambiguous {
+        return None;
+    }
+    let best = span
+        .candidates
+        .iter()
+        .filter(|c| c.selected)
+        .map(|c| c.score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut groups: std::collections::BTreeMap<(&str, &str), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, candidate) in span.candidates.iter().enumerate() {
+        if candidate.selected && best - candidate.score < ADJUDICATION_MARGIN {
+            groups
+                .entry((&candidate.table, &candidate.column))
+                .or_default()
+                .push(i);
+        }
+    }
+    if groups.len() < 2 {
+        return None;
+    }
+    let tables: std::collections::BTreeSet<_> = groups.keys().map(|(t, _)| *t).collect();
+    let columns: std::collections::BTreeSet<_> = groups.keys().map(|(_, c)| *c).collect();
+    let dimension = if tables.len() > 1 {
+        "relation"
+    } else if columns.len() > 1 {
+        "attribute"
+    } else {
+        "record"
+    };
+    let options = groups
+        .into_iter()
+        .map(|((table, column), candidate_indices)| ClarificationOption {
+            label: format!("{} in {}", humanize(column), humanize(table)),
+            candidate_indices,
+        })
+        .collect();
+    Some(Clarification {
+        span_id: span.id,
+        dimension: dimension.into(),
+        question: format!("Which meaning of {:?} did you intend?", span.text),
+        options,
+    })
+}
+
+fn humanize(name: &str) -> String {
+    name.replace('_', " ")
 }
 
 /// The end of the escalation: after context coherence, encoder affinity and
@@ -774,7 +911,11 @@ fn interpretation_samples(
     column: &str,
     value_norm: &str,
 ) -> Result<Vec<i64>> {
-    let key = (table.to_string(), column.to_string(), value_norm.to_string());
+    let key = (
+        table.to_string(),
+        column.to_string(),
+        value_norm.to_string(),
+    );
     if let Some(hit) = cache.get(&key) {
         return Ok(hit.clone());
     }
@@ -828,8 +969,7 @@ fn gather_lexical_hits(
     let conn = db.conn();
     let live: Vec<&Span> = spans.iter().filter(|s| s.status != "skipped").collect();
 
-    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> =
-        std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<usize, Vec<RawHit>> = std::collections::HashMap::new();
     {
         let mut samples = std::collections::HashMap::new();
         for s in &live {
@@ -897,38 +1037,37 @@ fn run_fts_jobs(db: &StemmaDb, jobs: &[FtsJob]) -> Result<Vec<Vec<RawHit>>> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut results: Vec<Option<Vec<RawHit>>> = Vec::new();
     results.resize_with(jobs.len(), || None);
-    let worker_outputs: Vec<Result<Vec<(usize, Vec<RawHit>)>>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let wdb = StemmaDb::open(store, user)?;
-                        let conn = wdb.conn();
-                        let mut samples = std::collections::HashMap::new();
-                        let mut out = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(job) = jobs.get(i) else { break };
-                            out.push((
-                                i,
-                                fts_channel_hits(
-                                    conn,
-                                    &job.text,
-                                    job.channel,
-                                    job.fts_table,
-                                    &mut samples,
-                                )?,
-                            ));
-                        }
-                        Ok(out)
-                    })
+    let worker_outputs: Vec<Result<Vec<(usize, Vec<RawHit>)>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let wdb = StemmaDb::open(store, user)?;
+                    let conn = wdb.conn();
+                    let mut samples = std::collections::HashMap::new();
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(job) = jobs.get(i) else { break };
+                        out.push((
+                            i,
+                            fts_channel_hits(
+                                conn,
+                                &job.text,
+                                job.channel,
+                                job.fts_table,
+                                &mut samples,
+                            )?,
+                        ));
+                    }
+                    Ok(out)
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("fts worker panicked"))
-                .collect()
-        });
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("fts worker panicked"))
+            .collect()
+    });
     for output in worker_outputs {
         for (i, hits) in output? {
             results[i] = Some(hits);
@@ -1944,12 +2083,22 @@ fn reach_counts(
         let (next, cond) = if hop.forward {
             (
                 &hop.dst_table,
-                format!("j{i}.\"{}\" = j{}.\"{}\"", hop.src_column, i + 1, hop.dst_column),
+                format!(
+                    "j{i}.\"{}\" = j{}.\"{}\"",
+                    hop.src_column,
+                    i + 1,
+                    hop.dst_column
+                ),
             )
         } else {
             (
                 &hop.src_table,
-                format!("j{}.\"{}\" = j{i}.\"{}\"", i + 1, hop.src_column, hop.dst_column),
+                format!(
+                    "j{}.\"{}\" = j{i}.\"{}\"",
+                    i + 1,
+                    hop.src_column,
+                    hop.dst_column
+                ),
             )
         };
         sql.push_str(&format!(
@@ -1962,9 +2111,7 @@ fn reach_counts(
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    sql.push_str(&format!(
-        " WHERE j0.\"{column}\" IN ({ph}) GROUP BY 1"
-    ));
+    sql.push_str(&format!(" WHERE j0.\"{column}\" IN ({ph}) GROUP BY 1"));
     let params: Vec<&dyn stemmadb::rusqlite::ToSql> = values
         .iter()
         .map(|v| v as &dyn stemmadb::rusqlite::ToSql)
@@ -2775,9 +2922,7 @@ fn apply_column_affinity(
 
     // A span qualifies when there is something to weigh: distinct readings.
     let qualifies = |s: &Span| {
-        s.status == "selected"
-            && s.candidates.len() >= 2
-            && s.candidates.iter().any(|c| !c.is_doc)
+        s.status == "selected" && s.candidates.len() >= 2 && s.candidates.iter().any(|c| !c.is_doc)
     };
     if !spans.iter().any(|s| qualifies(s)) {
         return;
@@ -2796,8 +2941,7 @@ fn apply_column_affinity(
     let mut affinity: std::collections::HashMap<(String, String), f64> =
         std::collections::HashMap::new();
     let loaded: Result<()> = (|| {
-        let mut stmt =
-            conn.prepare("SELECT src_table, src_column, embedding FROM col_cards")?;
+        let mut stmt = conn.prepare("SELECT src_table, src_column, embedding FROM col_cards")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2880,10 +3024,9 @@ fn apply_column_affinity(
                 && a.score - b.score < CONTEXT_TIE_GAP
         };
         if tied {
-            if let (Some(cos_a), Some(cos_b)) = (
-                cos_of(&span.candidates[0]),
-                cos_of(&span.candidates[1]),
-            ) {
+            if let (Some(cos_a), Some(cos_b)) =
+                (cos_of(&span.candidates[0]), cos_of(&span.candidates[1]))
+            {
                 if (cos_a - cos_b).abs() > CONTEXT_COS_GAP {
                     let winner = if cos_a >= cos_b { 0 } else { 1 };
                     let c = &mut span.candidates[winner];
@@ -3042,8 +3185,7 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
                     .map(|c| c.raw)
                     .fold(None::<f64>, |m, x| Some(m.map_or(x, |m| m.max(x)))),
             ) {
-                let confidence =
-                    ((best_cos - null_mean) / (nn_mean - null_mean)).clamp(0.0, 1.0);
+                let confidence = ((best_cos - null_mean) / (nn_mean - null_mean)).clamp(0.0, 1.0);
                 let two_channel_doc = (2.0 / RRF_K) / (3.0 / RRF_K) * 0.85;
                 score = score.max(confidence * two_channel_doc);
                 dense_confidence = Some(confidence);
@@ -3225,31 +3367,6 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
                 // only mean the adjudication band answered NIL — the
                 // affirmative no-record-matches conclusion.
                 nil: s.status == "weak",
-                ambiguous: s.ambiguous,
-                divergence: s.divergence,
-                readings: if s.ambiguous {
-                    let top_score = s
-                        .candidates
-                        .iter()
-                        .find(|c| c.selected)
-                        .map(|c| c.score)
-                        .unwrap_or(0.0);
-                    s.candidates
-                        .iter()
-                        .filter(|c| c.selected && top_score - c.score < ADJUDICATION_MARGIN)
-                        .take(4)
-                        .map(|c| pb::Reading {
-                            table: c.table.clone(),
-                            column: c.column.clone(),
-                            value: c.value.clone(),
-                            row_count: c.row_count,
-                            reach: c.reach,
-                            rowid: c.rowid,
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
                 candidates: s
                     .candidates
                     .iter()
@@ -3283,7 +3400,49 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
         .collect();
     pb::ResolveResponse {
         mentions,
-        rewritten_query: String::new(),
+        outcome: Some(outcome_to_proto(trace)),
+        clarification: clarification_to_proto(trace),
+    }
+}
+
+fn clarification_to_proto(trace: &Trace) -> Option<stemma_proto::v1::Clarification> {
+    use stemma_proto::v1 as pb;
+    trace
+        .clarification
+        .as_ref()
+        .map(|plan| pb::Clarification {
+            span_id: plan.span_id as u32,
+            dimension: plan.dimension.clone(),
+            question: plan.question.clone(),
+            options: plan
+                .options
+                .iter()
+                .map(|option| pb::ClarificationOption {
+                    label: option.label.clone(),
+                    candidate_indices: option.candidate_indices.iter().map(|&i| i as u32).collect(),
+                })
+                .collect(),
+        })
+}
+
+fn outcome_to_proto(trace: &Trace) -> stemma_proto::v1::ResolutionOutcome {
+    use stemma_proto::v1 as pb;
+    let outcome = trace.outcome();
+    let status = match outcome.status {
+        ResolutionStatus::Resolved => pb::ResolutionStatus::Resolved,
+        ResolutionStatus::Equivalent => pb::ResolutionStatus::Equivalent,
+        ResolutionStatus::Ambiguous => pb::ResolutionStatus::Ambiguous,
+        ResolutionStatus::Unknown => pb::ResolutionStatus::Unknown,
+        ResolutionStatus::Unanswerable => pb::ResolutionStatus::Unanswerable,
+    };
+    pb::ResolutionOutcome {
+        status: status.into(),
+        ambiguous_spans: outcome
+            .ambiguous_spans
+            .into_iter()
+            .map(|id| id as u32)
+            .collect(),
+        reason: outcome.reason.into(),
     }
 }
 
@@ -3349,6 +3508,8 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
             })
             .collect(),
         mentions: trace.mentions.iter().map(|&i| i as u32).collect(),
+        outcome: Some(outcome_to_proto(trace)),
+        clarification: clarification_to_proto(trace),
     }
 }
 
@@ -3556,7 +3717,9 @@ mod tests {
             ddl.push_str("INSERT INTO people (surname) VALUES ('Ellis');");
         }
         for filler in ["Okafor", "Natarajan", "Silva"] {
-            ddl.push_str(&format!("INSERT INTO people (surname) VALUES ('{filler}');"));
+            ddl.push_str(&format!(
+                "INSERT INTO people (surname) VALUES ('{filler}');"
+            ));
         }
         let db = custom_db("ellis", &ddl);
 
@@ -3570,14 +3733,28 @@ mod tests {
         for c in &span.candidates {
             println!(
                 "{}.{} #{} '{}' score={:.3} row_count={} samples={:?} selected={}",
-                c.table, c.column, c.rowid, c.value, c.score, c.row_count,
-                c.sample_rowids, c.selected
+                c.table,
+                c.column,
+                c.rowid,
+                c.value,
+                c.score,
+                c.row_count,
+                c.sample_rowids,
+                c.selected
             );
         }
 
         // One candidate per interpretation — duplicate rows collapsed.
-        let brands: Vec<_> = span.candidates.iter().filter(|c| c.table == "brands").collect();
-        let people: Vec<_> = span.candidates.iter().filter(|c| c.table == "people").collect();
+        let brands: Vec<_> = span
+            .candidates
+            .iter()
+            .filter(|c| c.table == "brands")
+            .collect();
+        let people: Vec<_> = span
+            .candidates
+            .iter()
+            .filter(|c| c.table == "people")
+            .collect();
         assert_eq!(brands.len(), 1, "one candidate per interpretation");
         assert_eq!(people.len(), 1, "the rival reading must surface");
         let (brand, person) = (brands[0], people[0]);
@@ -3603,7 +3780,10 @@ mod tests {
             assert_eq!(exact.rank, 0);
             assert_eq!(exact.raw, 1.0);
         }
-        assert_eq!(brand.score, person.score, "identical evidence, identical score");
+        assert_eq!(
+            brand.score, person.score,
+            "identical evidence, identical score"
+        );
 
         // TOP_K selection carries both readings.
         assert!(brand.selected && person.selected);
@@ -3656,7 +3836,11 @@ mod tests {
             tables.contains("memos"),
             "the smaller table must survive the channel budget, got {tables:?}"
         );
-        let manuals = span.candidates.iter().filter(|c| c.table == "manuals").count();
+        let manuals = span
+            .candidates
+            .iter()
+            .filter(|c| c.table == "manuals")
+            .count();
         assert!(manuals <= DOC_COLUMN_QUOTA, "per-column quota holds");
     }
 
@@ -3788,7 +3972,12 @@ mod tests {
     /// An unselected dense-only candidate at the given calibrated confidence,
     /// scored exactly as fuse scores a dense-only document (conf × 0.5667).
     fn dense_cand(rowid: i64, conf: f64) -> Candidate {
-        let mut c = cand(rowid, "a long stored document body", conf * 0.85 * 2.0 / 3.0, &["dense"]);
+        let mut c = cand(
+            rowid,
+            "a long stored document body",
+            conf * 0.85 * 2.0 / 3.0,
+            &["dense"],
+        );
         c.selected = false;
         c.is_doc = true;
         c.dense_confidence = Some(conf);
@@ -3905,6 +4094,7 @@ mod tests {
             tokens: Vec::new(),
             spans: vec![demoted, nominated],
             mentions: vec![0, 1],
+            clarification: None,
             elapsed_ms: 0.0,
         };
         let resp = trace_to_proto(&trace);
@@ -3928,15 +4118,15 @@ mod tests {
         let pad = "Additional descriptive language follows so every record \
                    clears the document classification threshold comfortably. "
             .repeat(3);
-        let repeated =
-            format!("PT903W Womens Cut Single Ply Light Weight Track Singlet. {pad}");
+        let repeated = format!("PT903W Womens Cut Single Ply Light Weight Track Singlet. {pad}");
         let others = [
             format!("Marathon foam trainer with recycled mesh upper. {pad}"),
             format!("Alpine down parka rated for deep winter conditions. {pad}"),
             format!("Trail running vest with soft flask pockets. {pad}"),
         ];
-        let mut ddl =
-            String::from("CREATE TABLE inventory_items (id INTEGER PRIMARY KEY, product_name TEXT);");
+        let mut ddl = String::from(
+            "CREATE TABLE inventory_items (id INTEGER PRIMARY KEY, product_name TEXT);",
+        );
         for _ in 0..8 {
             ddl.push_str(&format!(
                 "INSERT INTO inventory_items (product_name) VALUES ('{repeated}');"
@@ -3960,8 +4150,14 @@ mod tests {
         for h in &hits {
             println!(
                 "{}.{} #{} rank={} cos={:.4} row_count={} samples={:?} '{}…'",
-                h.table, h.column, h.rowid, h.rank, h.raw, h.row_count,
-                h.sample_rowids, &h.value[..24]
+                h.table,
+                h.column,
+                h.rowid,
+                h.rank,
+                h.raw,
+                h.row_count,
+                h.sample_rowids,
+                &h.value[..24]
             );
         }
         // One hit per interpretation, not per row.
@@ -4062,10 +4258,16 @@ mod tests {
             )
             .unwrap();
             for i in 1..=WIDE {
-                c.execute("INSERT INTO warehouses (id, city) VALUES (?1, 'Fairview')", [i])
-                    .unwrap();
-                c.execute("INSERT INTO buyers (id, state) VALUES (?1, 'Calderon')", [i])
-                    .unwrap();
+                c.execute(
+                    "INSERT INTO warehouses (id, city) VALUES (?1, 'Fairview')",
+                    [i],
+                )
+                .unwrap();
+                c.execute(
+                    "INSERT INTO buyers (id, state) VALUES (?1, 'Calderon')",
+                    [i],
+                )
+                .unwrap();
             }
             c.execute(
                 "INSERT INTO shipments (id, warehouse_id, buyer_id) VALUES (1, ?1, ?1)",
@@ -4093,7 +4295,10 @@ mod tests {
         };
 
         let city = &mention("Fairview").candidates[0];
-        assert_eq!((city.table.as_str(), city.column.as_str()), ("warehouses", "city"));
+        assert_eq!(
+            (city.table.as_str(), city.column.as_str()),
+            ("warehouses", "city")
+        );
         let evidence = city
             .coherence
             .as_deref()
@@ -4106,7 +4311,10 @@ mod tests {
         );
         // Both partners of a verified pair carry the same evidence.
         let state = &mention("Calderon").candidates[0];
-        assert_eq!((state.table.as_str(), state.column.as_str()), ("buyers", "state"));
+        assert_eq!(
+            (state.table.as_str(), state.column.as_str()),
+            ("buyers", "state")
+        );
         assert_eq!(state.coherence.as_deref(), Some(evidence));
     }
 
@@ -4301,7 +4509,8 @@ mod tests {
             )
             .unwrap();
             for i in 1..=20i64 {
-                c.execute("INSERT INTO people VALUES (?1, 'Ellis')", [i]).unwrap();
+                c.execute("INSERT INTO people VALUES (?1, 'Ellis')", [i])
+                    .unwrap();
             }
             // Every sale touches an Ellis person; only two touch the brand.
             for i in 1..=40i64 {
@@ -4400,12 +4609,26 @@ mod tests {
         for c in &span.candidates {
             println!(
                 "{}.{} '{}' score={:.3} channels={:?}",
-                c.table, c.column, c.value, c.score,
-                c.channels.iter().map(|ch| (ch.channel.as_str(), ch.rank, ch.raw)).collect::<Vec<_>>()
+                c.table,
+                c.column,
+                c.value,
+                c.score,
+                c.channels
+                    .iter()
+                    .map(|ch| (ch.channel.as_str(), ch.rank, ch.raw))
+                    .collect::<Vec<_>>()
             );
         }
-        let vendor = span.candidates.iter().find(|c| c.table == "vendors").unwrap();
-        let client = span.candidates.iter().find(|c| c.table == "clients").unwrap();
+        let vendor = span
+            .candidates
+            .iter()
+            .find(|c| c.table == "vendors")
+            .unwrap();
+        let client = span
+            .candidates
+            .iter()
+            .find(|c| c.table == "clients")
+            .unwrap();
         // Identical lexical evidence — the flip is the context term's doing,
         // and it is recorded as a "kg" channel entry carrying the bonus.
         let kg = vendor
@@ -4441,8 +4664,16 @@ mod tests {
                 .iter()
                 .find(|s| s.text == "Atlas")
                 .expect("Atlas span");
-            let vendor = span.candidates.iter().find(|c| c.table == "vendors").unwrap();
-            let client = span.candidates.iter().find(|c| c.table == "clients").unwrap();
+            let vendor = span
+                .candidates
+                .iter()
+                .find(|c| c.table == "vendors")
+                .unwrap();
+            let client = span
+                .candidates
+                .iter()
+                .find(|c| c.table == "clients")
+                .unwrap();
             assert_eq!(vendor.score, client.score, "query {query:?}");
             assert!(
                 span.candidates
@@ -4608,7 +4839,49 @@ mod tests {
                 admitted_by: None,
             }],
             mentions: vec![0],
+            clarification: None,
             elapsed_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn query_outcome_is_ambiguous_with_machine_readable_span_ids() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].ambiguous = true;
+        let outcome = trace.outcome();
+        assert_eq!(outcome.status, ResolutionStatus::Ambiguous);
+        assert_eq!(outcome.ambiguous_spans, [0]);
+        assert_eq!(outcome.reason, "ambiguous_mentions");
+
+        let resolve = trace_to_proto(&trace).outcome.unwrap();
+        let explain = trace_to_explain_proto(&trace).outcome.unwrap();
+        assert_eq!(resolve, explain);
+        assert_eq!(
+            resolve.status,
+            stemma_proto::v1::ResolutionStatus::Ambiguous as i32
+        );
+    }
+
+    #[test]
+    fn query_outcome_requires_a_confident_selected_candidate() {
+        let mut trace = ambiguous_trace();
+        assert_eq!(trace.outcome().status, ResolutionStatus::Resolved);
+
+        trace.mentions.clear();
+        let outcome = trace.outcome();
+        assert_eq!(outcome.status, ResolutionStatus::Unknown);
+        assert_eq!(outcome.reason, "no_confident_candidates");
+    }
+
+    #[test]
+    fn trace_derivation_reserves_states_that_need_denotation_evidence() {
+        let mut unknown = ambiguous_trace();
+        unknown.mentions.clear();
+        for trace in [ambiguous_trace(), unknown] {
+            assert!(!matches!(
+                trace.outcome().status,
+                ResolutionStatus::Equivalent | ResolutionStatus::Unanswerable
+            ));
         }
     }
 
@@ -4630,6 +4903,61 @@ mod tests {
         ];
         mark_ambiguous(&mut trace);
         assert!(trace.spans[0].ambiguous);
+    }
+
+    #[test]
+    fn clarification_partitions_readings() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].text = "Ellis".into();
+        trace.spans[0].ambiguous = true;
+        trace.spans[0].divergence = 4.0;
+        trace.spans[0].candidates = vec![
+            cand_at("brands", "display_name", 1, 0.60),
+            cand_at("people", "surname", 2, 0.58),
+        ];
+
+        plan_clarification(&mut trace);
+
+        let plan = trace.clarification.as_ref().unwrap();
+        assert_eq!(plan.dimension, "relation");
+        assert_eq!(plan.question, "Which meaning of \"Ellis\" did you intend?");
+        assert_eq!(plan.options[0].label, "display name in brands");
+        assert_eq!(plan.options[0].candidate_indices, vec![0]);
+        assert_eq!(plan.options[1].candidate_indices, vec![1]);
+
+        let resolve = trace_to_proto(&trace).clarification;
+        let explain = trace_to_explain_proto(&trace).clarification;
+        assert_eq!(resolve, explain);
+        assert_eq!(resolve.unwrap().options[1].candidate_indices, [1]);
+    }
+
+    #[test]
+    fn clarification_localizes_same_relation_to_attribute() {
+        let mut trace = ambiguous_trace();
+        trace.spans[0].ambiguous = true;
+        trace.spans[0].candidates = vec![
+            cand_at("people", "given_name", 1, 0.60),
+            cand_at("people", "surname", 2, 0.58),
+        ];
+
+        plan_clarification(&mut trace);
+
+        assert_eq!(trace.clarification.unwrap().dimension, "attribute");
+    }
+
+    #[test]
+    fn clarification_planner_omits_resolved_mentions() {
+        let mut trace = ambiguous_trace();
+        trace.clarification = Some(Clarification {
+            span_id: 9,
+            dimension: "stale".into(),
+            question: String::new(),
+            options: Vec::new(),
+        });
+
+        plan_clarification(&mut trace);
+
+        assert!(trace.clarification.is_none());
     }
 
     /// Two rows of ONE reading are the same answer, not ambiguity.
@@ -4682,11 +5010,22 @@ mod tests {
     fn exact_cross_interpretation_ties_route_and_mark() {
         let mut trace = ambiguous_trace();
         let mut a = cand_at("brands", "name", 1, 1.0);
-        a.channels.push(ChannelScore { channel: "exact".into(), rank: 0, raw: 1.0 });
+        a.channels.push(ChannelScore {
+            channel: "exact".into(),
+            rank: 0,
+            raw: 1.0,
+        });
         let mut b = cand_at("people", "surname", 2, 1.0);
-        b.channels.push(ChannelScore { channel: "exact".into(), rank: 0, raw: 1.0 });
+        b.channels.push(ChannelScore {
+            channel: "exact".into(),
+            rank: 0,
+            raw: 1.0,
+        });
         trace.spans[0].candidates = vec![a, b];
-        assert!(is_ambiguous(&trace.spans[0]), "exact-vs-exact distinct readings route");
+        assert!(
+            is_ambiguous(&trace.spans[0]),
+            "exact-vs-exact distinct readings route"
+        );
         mark_ambiguous(&mut trace);
         assert!(trace.spans[0].ambiguous);
     }
@@ -5332,7 +5671,13 @@ mod tests {
         // No embedder.
         let db = interp_db(true);
         let mut spans = tied_spans();
-        apply_context_affinity(&db, None, "which product sku is Mercury", &mut spans, &mut None);
+        apply_context_affinity(
+            &db,
+            None,
+            "which product sku is Mercury",
+            &mut spans,
+            &mut None,
+        );
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
 
         // No vec_interp (queue never drained).
@@ -5544,9 +5889,13 @@ mod tests {
     fn column_affinity_lifts_the_warehouse_reading_into_contention() {
         let db = warehouse_db(true, true);
         let embedder = WarehouseEmbedder::new();
-        let trace =
-            resolve_full(&db, "items from the Chicago warehouse", Some(&embedder), None)
-                .unwrap();
+        let trace = resolve_full(
+            &db,
+            "items from the Chicago warehouse",
+            Some(&embedder),
+            None,
+        )
+        .unwrap();
         let span = trace
             .mentions
             .iter()
@@ -5609,8 +5958,14 @@ mod tests {
         );
         let span = &spans[0];
         assert_eq!(span.candidates[0].table, "distribution_centers");
-        assert!((span.candidates[0].score - 0.62).abs() < 1e-9, "0.58 + CONTEXT_BOOST");
-        assert!((span.candidates[1].score - 0.60).abs() < 1e-9, "loser untouched");
+        assert!(
+            (span.candidates[0].score - 0.62).abs() < 1e-9,
+            "0.58 + CONTEXT_BOOST"
+        );
+        assert!(
+            (span.candidates[1].score - 0.60).abs() < 1e-9,
+            "loser untouched"
+        );
         assert!(span.candidates[0].score <= CONTEXT_CAP);
         assert!(
             !span.ambiguous,
@@ -5632,7 +5987,10 @@ mod tests {
         );
         let span = &spans[0];
         assert_eq!(span.candidates[0].table, "users", "no manufactured winner");
-        assert!((span.candidates[0].score - 0.92).abs() < 1e-9, "scores untouched");
+        assert!(
+            (span.candidates[0].score - 0.92).abs() < 1e-9,
+            "scores untouched"
+        );
         assert!((span.candidates[1].score - 0.48).abs() < 1e-9);
         assert!(span.ambiguous, "beyond the margin, contention is a flag");
         for c in &span.candidates {
@@ -5663,13 +6021,25 @@ mod tests {
         // No cards built.
         let db = warehouse_db(false, true);
         let mut spans = spans_fixture();
-        apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
+        apply_column_affinity(
+            &db,
+            Some(&WarehouseEmbedder::new()),
+            query,
+            &mut spans,
+            &mut None,
+        );
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
 
         // No compiled graph: the knowledge-layer axis is off.
         let db = warehouse_db(true, false);
         let mut spans = spans_fixture();
-        apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
+        apply_column_affinity(
+            &db,
+            Some(&WarehouseEmbedder::new()),
+            query,
+            &mut spans,
+            &mut None,
+        );
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
 
         // Cards registered to a different model: mixing spaces would be
@@ -5683,7 +6053,13 @@ mod tests {
             )
             .unwrap();
         let mut spans = spans_fixture();
-        apply_column_affinity(&db, Some(&WarehouseEmbedder::new()), query, &mut spans, &mut None);
+        apply_column_affinity(
+            &db,
+            Some(&WarehouseEmbedder::new()),
+            query,
+            &mut spans,
+            &mut None,
+        );
         assert_eq!(serde_json::to_value(&spans).unwrap(), baseline);
     }
 
@@ -5819,8 +6195,12 @@ mod tests {
     #[test]
     fn interp_channel_reaches_a_paraphrase_with_no_lexical_overlap() {
         let db = category_db(true);
-        let trace = resolve(&db, "warm layers for cold winter months", Some(&CategoryEmbedder))
-            .unwrap();
+        let trace = resolve(
+            &db,
+            "warm layers for cold winter months",
+            Some(&CategoryEmbedder),
+        )
+        .unwrap();
         let span = trace
             .mentions
             .iter()
@@ -5866,8 +6246,12 @@ mod tests {
     #[test]
     fn interp_returns_both_cross_column_readings() {
         let db = category_db(true);
-        let trace = resolve(&db, "warm layers for cold winter months", Some(&CategoryEmbedder))
-            .unwrap();
+        let trace = resolve(
+            &db,
+            "warm layers for cold winter months",
+            Some(&CategoryEmbedder),
+        )
+        .unwrap();
         let span = trace
             .mentions
             .iter()
@@ -5950,7 +6334,10 @@ mod tests {
             sample_rowids: vec![1],
         };
         assert!(has_strong_lexical("vocab", &[lex_hit("exact")]));
-        assert!(has_strong_lexical("vocab", &[lex_hit("bm25"), lex_hit("trigram")]));
+        assert!(has_strong_lexical(
+            "vocab",
+            &[lex_hit("bm25"), lex_hit("trigram")]
+        ));
         assert!(!has_strong_lexical("vocab", &[lex_hit("bm25")]));
         assert!(!has_strong_lexical("vocab", &[]));
     }
@@ -6014,8 +6401,12 @@ mod tests {
     #[test]
     fn interp_without_geometry_participates_by_rank_only() {
         let db = category_db(false);
-        let trace = resolve(&db, "warm layers for cold winter months", Some(&CategoryEmbedder))
-            .unwrap();
+        let trace = resolve(
+            &db,
+            "warm layers for cold winter months",
+            Some(&CategoryEmbedder),
+        )
+        .unwrap();
         assert!(
             trace.mentions.is_empty(),
             "rank-only semantic evidence claims nothing: {:?}",

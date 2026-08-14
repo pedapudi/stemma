@@ -3,8 +3,9 @@
 > The runnable harness built on this protocol — tiers, ablations, grading —
 > is designed in [07-eval-harness.md](07-eval-harness.md).
 
-stemma's output is a resolution artifact, not an answer, so it cannot be
-scored by execution accuracy. This document specifies the evaluation
+The built harness evaluates the resolution artifact. The staged semantic
+parser adds execution accuracy as a separate downstream layer without
+replacing grounding metrics. This document specifies the grounding evaluation
 protocol: why the no-evidence setting is the only honest one, how ground
 truth is derived from gold SQL instead of hand-labelled, why the metrics are
 recall-weighted, what the corpora are for, and what each milestone gate has
@@ -225,12 +226,13 @@ measured baseline today is 60–95 ms per non-skipped span on a
 92,696-document corpus; sub-second on small corpora, seconds on large ones.
 See [03-resolution.md](03-resolution.md#complexity).
 
-### What is not measured
+### What is not measured by the grounding harness
 
-Execution accuracy. stemma does not generate SQL, and scoring it by the
-downstream success of a generator it does not control would measure the
-generator. The relationship to execution accuracy is the *argument* for the
-work, established by the published error analyses; it is not stemma's metric.
+Execution accuracy is not attributed to grounding because it also measures
+query construction. Parser evaluation therefore runs twice: once with gold
+traces and once with predicted traces. The gap attributes grounding debt while
+syntax validity, safe compilation, and denotation accuracy measure parsing.
+See [08-query-disambiguation.md](08-query-disambiguation.md#evaluation-layers).
 
 ## Corpora
 
@@ -389,10 +391,22 @@ ambiguous band without reducing recall; explicit NIL is returned rather than
 a forced choice when no candidate is right. Every LM decision carries an
 `Adjudication` evidence message with the model identity.
 
-**Gate — scoring harness.** `stemma-eval` gains the subcommand that runs a
-resolver over derived targets and reports the metric set above. Until this
-exists, every claim in this document about stemma's accuracy is unmeasured —
-which is why no such claim appears anywhere in this document set.
+**Gate — scoring harness.** *Met for record resolution.* `stemma-eval`
+derives datasets, runs resolver ablations, writes JSON and HTML reports, and
+grades runs against accepted baselines. Its first run demonstrated why strict
+grounding matters: on `california_schools`, value-loose recall@5 was 0.80
+while column-strict recall@5 was 0.40. Layer 2 correlation and the separately
+gated agent-grounding cases remain incomplete; see
+[07-eval-harness.md](07-eval-harness.md).
+
+**Gate — query-level disambiguation.** *Initial vertical slice built; gate not
+yet met.* Outcome contracts and deterministic first-pass grounding
+clarification exist. Ambiguity localization, risk–coverage, decision
+equivalence, and multi-turn clarification must pass before complete grounding
+can be claimed. Parser acceptance then measures syntax validity, grounded
+identifier compliance, safe compilation, and denotation accuracy using both
+gold and predicted traces. See
+[08-query-disambiguation.md](08-query-disambiguation.md#evaluation-layers).
 
 ## References
 

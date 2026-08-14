@@ -28,6 +28,7 @@ crate.from_cargo(
         "//crates/stemma-kg:Cargo.toml",
         "//crates/stemma-embed:Cargo.toml",
         "//crates/stemma-resolve:Cargo.toml",
+        "//crates/stemma-parse:Cargo.toml",
         "//crates/stemma-lm:Cargo.toml",
         "//crates/stemma-server:Cargo.toml",
         "//crates/stemma-eval:Cargo.toml",

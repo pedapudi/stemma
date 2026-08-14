@@ -1,10 +1,10 @@
 # stemma architecture
 
-stemma resolves oblique natural-language mentions — *the Q3 numbers for the
-Seattle office*, *what did Chen's team ship* — to concrete records in a SQLite
-database, returning candidate resolutions with the evidence that supports them.
-It does **not** generate SQL: its output is the resolution artifact that a
-downstream consumer (a query generator, an agent, a human) builds on.
+stemma is a grounding-first semantic parser. It resolves oblique
+natural-language mentions — *the Q3 numbers for the Seattle office*, *what did
+Chen's team ship* — to concrete SQLite records and returns candidate readings
+with evidence. Parsing builds on that trace to produce a grounded,
+parameterized, read-only query; it never bypasses unresolved grounding.
 
 ## Why this problem
 
@@ -22,8 +22,9 @@ incorrect tables, columns or values [C. Li 2025], while others range from
 as evidence about where failures concentrate, not as a constant.
 
 The field's newest systems converge on *resolve-then-generate*: produce a
-verified resolution artifact before query generation. stemma is a purpose-built
-engine for that artifact. Full citations, with the caveat on each number, are
+verified resolution artifact before query generation. stemma makes that
+artifact the measured first stage of its parser. Full citations, with the
+caveat on each number, are
 in [docs/design/00-bibliography.md](design/00-bibliography.md).
 
 ## Design conclusions from the literature

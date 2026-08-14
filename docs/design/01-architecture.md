@@ -1,10 +1,10 @@
 # Architecture
 
-stemma pins the entity and value mentions in a natural-language question to
-concrete records in a SQLite database, and returns the resolution with the
-evidence that supports it. It does not generate SQL. Its output is an
-artifact a downstream consumer — a query generator, an agent, a human —
-builds on.
+stemma is a grounding-first semantic parser. Its built resolution engine pins
+entity and value mentions in a natural-language question to concrete SQLite
+records and returns an inspectable evidence trace. The staged parser will
+consume that trace and produce a grounded, parameterized, read-only query.
+Grounding remains independently useful and independently measurable.
 
 This document specifies the system decomposition, the process topology, the
 ownership and trust boundaries, the trait seams that make backends
@@ -530,16 +530,17 @@ pipeline's shape is a cheap-first cascade rather than a model call.
 | Dense channel: `vec_staging` → `vec0` promotion, targeted KNN, model-registry write | built |
 | Index-time embedding (embed-queue drain), online blue-green swap, `Rerank` | designed |
 | Fusion constants re-derived for four channels; `SemanticMatch` evidence | outstanding |
-| Collective disambiguation, verification probes, instance layer | designed |
-| LM band (expansion, adjudication), `rewritten_query`, `nil` | designed |
-| Scoring resolver output against BIRD targets | designed |
+| Collective disambiguation and verification probes | built |
+| Instance layer and mention expansion | designed |
+| Constrained adjudication, `rewritten_query`, `nil` | built |
+| Scoring resolver output against BIRD targets | built |
+| Query-level interpretation, five outcomes and clarification | initial vertical slice built; full gate staged |
+| Grounded SQLite parser and deterministic validation | staged |
 
-Two documents in this repository predate the current code and disagree with
-it: [`docs/walkthrough.md`](../walkthrough.md) describes the milestone-1
-server that returned empty resolutions, and
-[`docs/user-guide/02-concepts.md`](../user-guide/02-concepts.md) lists
-lexical resolution and the knowledge store as unbuilt milestones. The code is
-the authority; those pages need refreshing.
+The table distinguishes shipping paths from staged work. Detailed evaluation
+status is in [07-eval-harness.md](07-eval-harness.md); the query-level vertical
+slice and its remaining gates are in
+[08-query-disambiguation.md](08-query-disambiguation.md).
 
 ## References
 

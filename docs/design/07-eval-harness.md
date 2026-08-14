@@ -14,6 +14,11 @@ Status: **built** — `crates/stemma-eval` implements derivation
 (`eval/report/`). Honest deviations from the design as agreed, found in
 building and running it:
 
+This status applies to record-resolution evaluation. The query-level vertical
+slice is built, but outcome classification, clarification dialogue, and parser
+acceptance evaluation are not. Their protocol is
+[08-query-disambiguation.md](08-query-disambiguation.md#evaluation-layers).
+
 - **`+kg` and `+coh` are one column, not two.** Every KG assist — mention
   detection, term coherence, collective disambiguation — keys on the
   compiled graph's presence; there is no shipping flag that separates

@@ -12,7 +12,10 @@ use std::sync::Mutex;
 use anyhow::Context;
 use clap::Parser;
 use stemma_proto::v1::resolve_service_server::{ResolveService, ResolveServiceServer};
-use stemma_proto::v1::{ExplainResponse, ResolveRequest, ResolveResponse};
+use stemma_proto::v1::{
+    query_parameter, ExplainResponse, GroundingUse, ParseRequest, ParseResponse, ParseStatus,
+    QueryParameter, ResolveRequest, ResolveResponse, ValidationFailure,
+};
 use stemmadb::StemmaDb;
 use tonic::{Request, Response, Status};
 
@@ -247,6 +250,142 @@ impl ResolveService for Resolver {
         Ok(Response::new(stemma_resolve::trace_to_explain_proto(
             &trace,
         )))
+    }
+
+    async fn parse(
+        &self,
+        request: Request<ParseRequest>,
+    ) -> Result<Response<ParseResponse>, Status> {
+        let request = request.into_inner();
+        let resolve_request = ResolveRequest {
+            query: request.query,
+            database: request.database,
+            options: request.options,
+        };
+        let trace = self.trace_for(&resolve_request)?;
+        let resolution = stemma_resolve::trace_to_proto(&trace);
+        let status = match trace.outcome().status {
+            stemma_resolve::ResolutionStatus::Ambiguous => ParseStatus::Ambiguous,
+            stemma_resolve::ResolutionStatus::Unknown => ParseStatus::Unknown,
+            stemma_resolve::ResolutionStatus::Unanswerable => ParseStatus::Unanswerable,
+            _ => ParseStatus::Resolved,
+        };
+        let mut response = ParseResponse {
+            status: status.into(),
+            resolution: Some(resolution),
+            ..Default::default()
+        };
+        if status != ParseStatus::Resolved {
+            return Ok(Response::new(response));
+        }
+        let Some(lm) = self.lm.as_deref() else {
+            response.status = ParseStatus::ProposalUnavailable.into();
+            return Ok(Response::new(response));
+        };
+        let db = self
+            .dbs
+            .get(&resolve_request.database)
+            .expect("trace_for verified the database")
+            .lock()
+            .expect("stemmadb lock poisoned");
+        match stemma_parse::parse(&trace, &db, lm) {
+            Ok(result) if result.proposals.len() == 1 => {
+                let proposal = &result.proposals[0];
+                response.sql = proposal.sql.clone();
+                response.parameters = proposal
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| QueryParameter {
+                        position: index as u32 + 1,
+                        value: Some(parameter_value(value)),
+                    })
+                    .collect();
+                response.grounding_uses = proposal.grounding.iter().map(grounding_use).collect();
+                response.assumptions = proposal.assumptions.clone();
+            }
+            Ok(_) => {
+                response.status = ParseStatus::InvalidProposal.into();
+                response.validation_failures.push(ValidationFailure {
+                    code: "multiple_valid_proposals".into(),
+                    message: "proposal service returned multiple valid queries".into(),
+                    location: String::new(),
+                });
+            }
+            Err(error @ stemma_parse::ParseError::Backend(_)) => {
+                response.status = ParseStatus::ProposalUnavailable.into();
+                response.validation_failures.push(validation_failure(error));
+            }
+            Err(error) => {
+                response.status = ParseStatus::InvalidProposal.into();
+                response.validation_failures.push(validation_failure(error));
+            }
+        }
+        Ok(Response::new(response))
+    }
+}
+
+fn parameter_value(value: &stemma_parse::ParameterValue) -> query_parameter::Value {
+    use stemma_parse::ParameterValue::*;
+    match value {
+        Null => query_parameter::Value::Null(true),
+        Integer(value) => query_parameter::Value::Integer(*value),
+        Real(value) => query_parameter::Value::Real(*value),
+        Text(value) => query_parameter::Value::Text(value.clone()),
+    }
+}
+
+fn grounding_use(value: &stemma_parse::GroundingUse) -> GroundingUse {
+    let kind = match value.kind {
+        stemma_parse::GroundingKind::Table => "table",
+        stemma_parse::GroundingKind::Column => "column",
+        stemma_parse::GroundingKind::Parameter => "parameter",
+        stemma_parse::GroundingKind::Join => "join",
+    };
+    GroundingUse {
+        kind: kind.into(),
+        name: value.name.clone(),
+        span_id: value.span_id.map(|id| id as u32),
+        candidate_index: value.candidate_index.map(|id| id as u32),
+    }
+}
+
+fn validation_failure(error: stemma_parse::ParseError) -> ValidationFailure {
+    let code = match &error {
+        stemma_parse::ParseError::Backend(_) => "proposal_unavailable",
+        stemma_parse::ParseError::Response(_) => "malformed_response",
+        stemma_parse::ParseError::Invalid(_) => "invalid_proposal",
+        stemma_parse::ParseError::Schema(_) => "schema_inspection",
+    };
+    ValidationFailure {
+        code: code.into(),
+        message: error.to_string(),
+        location: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_values_project_without_string_coercion() {
+        use stemma_parse::ParameterValue::*;
+        assert_eq!(parameter_value(&Null), query_parameter::Value::Null(true));
+        assert_eq!(parameter_value(&Integer(7)), query_parameter::Value::Integer(7));
+        assert_eq!(parameter_value(&Real(1.5)), query_parameter::Value::Real(1.5));
+        assert_eq!(parameter_value(&Text("x".into())), query_parameter::Value::Text("x".into()));
+    }
+
+    #[test]
+    fn absent_grounding_reference_stays_absent() {
+        let projected = grounding_use(&stemma_parse::GroundingUse {
+            kind: stemma_parse::GroundingKind::Column,
+            name: "total".into(),
+            span_id: None,
+            candidate_index: None,
+        });
+        assert_eq!((projected.span_id, projected.candidate_index), (None, None));
     }
 }
 

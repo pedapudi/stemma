@@ -25,14 +25,17 @@ Rounded boxes are processes; folded-corner boxes are files. Every edge is
 labeled with its protocol and direction.
 
 **stemma-server** (`crates/stemma-server`, Rust) is the gRPC front door on
-`127.0.0.1:50051`, serving two RPCs: `Resolve` (selected mentions with
-evidence) and `Explain` (the full trajectory, near-misses included). At
+`127.0.0.1:50051`, serving `Resolve` (selected mentions with evidence),
+`Explain` (the full trajectory, near-misses included), and `Parse` (grounded,
+validated query proposals). At
 startup it registers each configured database: it opens the `.stemmadb`
 sidecar as the connection's `main` schema, attaches the user database
 read-only as `src`, builds the lexical index (`stemma-ingest`), compiles the
 knowledge graph (`stemma-kg`), and promotes any staged vectors into the
 dense index. After every non-empty resolve it appends one `query_log` row —
-a failed history write never fails the resolution.
+a failed history write never fails the resolution. The topology image still
+focuses on the grounding path; parsing reuses the same optional language
+service and never writes the user database.
 
 **console** (`ui/serve.py`, FastAPI on `:8600`) is the optional web UI, and
 nothing in the core depends on it. It is three things in one process: the

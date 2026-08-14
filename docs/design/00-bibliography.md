@@ -415,6 +415,50 @@ design.
   size from 32 to 1024. This is the base encoder for the legal corpus
   vectors.)*
 
+## I. Query ambiguity and clarification
+
+- **[Min 2020]** Sewon Min, Julian Michael, Hannaneh Hajishirzi, Luke
+  Zettlemoyer. “[AmbigQA: Answering Ambiguous Open-domain
+  Questions](https://aclanthology.org/2020.emnlp-main.466/).” EMNLP 2020,
+  5783–5797. DOI 10.18653/v1/2020.emnlp-main.466. *(Defines the target as
+  every plausible answer plus a minimally disambiguated rewrite.)*
+- **[Lee 2023]** Dongryeol Lee, Segwang Kim, Minwoo Lee, Hwanhee Lee, Joonsuk
+  Park, Sang-Woo Lee, Kyomin Jung. “[Asking Clarification Questions to Handle
+  Ambiguity in Open-Domain QA](https://aclanthology.org/2023.findings-emnlp.772/).”
+  Findings of EMNLP 2023, 11526–11544.
+  DOI 10.18653/v1/2023.findings-emnlp.772. *(CAmbigNQ separates ambiguity
+  detection, clarification generation and clarification-based answering.)*
+- **[Yao 2019]** Ziyu Yao, Yu Su, Huan Sun, Wen-tau Yih.
+  “[Model-based Interactive Semantic Parsing: A Unified Framework and A
+  Text-to-SQL Case Study](https://aclanthology.org/D19-1547/).” EMNLP-IJCNLP
+  2019, 5447–5458. DOI 10.18653/v1/D19-1547. *(Maintains a semantic-parse
+  state, localizes uncertain components and asks targeted questions.)*
+- **[Dong 2025]** Mingwen Dong, Nischal Ashok Kumar, Yiqun Hu, Anuj Chauhan,
+  Chung-Wei Hang, Shuaichen Chang, Lin Pan, Wuwei Lan, Henghui Zhu, Jiarong
+  Jiang, Patrick Ng, Zhiguo Wang. “[PRACTIQ: A Practical Conversational
+  Text-to-SQL dataset with Ambiguous and Unanswerable
+  Queries](https://aclanthology.org/2025.naacl-long.13/).” NAACL 2025,
+  255–273. DOI 10.18653/v1/2025.naacl-long.13. *(Four categories each of
+  ambiguity and unanswerability, with full clarification conversations.)*
+- **[Sarwar 2026]** Tabinda Sarwar, Farhad Moghimifar, Cong Duy Vu Hoang,
+  Xiaoxiao Ma, Shawn Chang Xu, Fahimeh Saleh, Poorya Zaremoodi, Avirup Sil,
+  Katrin Kirchhoff. “[CLARITY: A Framework and Benchmark for Conversational
+  Language Ambiguity and Unanswerability in Interactive NL2SQL
+  Systems](https://aclanthology.org/2026.acl-industry.86/).” ACL Industry
+  Track 2026, 1218–1250. DOI 10.18653/v1/2026.acl-industry.86.
+  *(Multi-faceted schema ambiguity and incomplete clarification.)*
+- **[Rahmani 2024]** Hossein A. Rahmani, Xi Wang, Mohammad Aliannejadi,
+  Mohammadmehdi Naghiaei, Emine Yilmaz. “[Clarifying the Path to User
+  Satisfaction: An Investigation into Clarification
+  Usefulness](https://aclanthology.org/2024.findings-eacl.84/).” Findings of
+  EACL 2024, 1266–1277. DOI 10.18653/v1/2024.findings-eacl.84. *(Specific
+  questions are more useful than generic questions.)*
+- **[Zhu 2023]** Fangwei Zhu, Jifan Yu, Hailong Jin, Lei Hou, Juanzi Li,
+  Zhifang Sui. “[Learn to Not Link: Exploring NIL Prediction in Entity
+  Linking](https://aclanthology.org/2023.findings-acl.690/).” Findings of ACL
+  2023, 10846–10860. DOI 10.18653/v1/2023.findings-acl.690. *(Separates
+  missing entities from non-entity phrases and shows both matter in training.)*
+
 ## H. Additional geometry references
 
 Checked for title, venue and year against

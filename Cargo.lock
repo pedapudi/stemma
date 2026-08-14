@@ -1466,6 +1466,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stemma-parse"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "stemma-lm",
+ "stemma-resolve",
+ "stemmadb",
+ "thiserror",
+]
+
+[[package]]
 name = "stemma-proto"
 version = "0.1.0"
 dependencies = [
@@ -1502,6 +1515,7 @@ dependencies = [
  "stemma-ingest",
  "stemma-kg",
  "stemma-lm",
+ "stemma-parse",
  "stemma-proto",
  "stemma-resolve",
  "stemmadb",
