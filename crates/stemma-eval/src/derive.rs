@@ -162,8 +162,7 @@ pub fn dataset(
 ) -> anyhow::Result<()> {
     let all = load_questions(&questions, &db_ids)?;
     anyhow::ensure!(!all.is_empty(), "no questions selected");
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
     let mut by_db: BTreeMap<String, Vec<BirdQuestion>> = BTreeMap::new();
     for q in all {
@@ -406,8 +405,10 @@ impl Visitor for AliasCollector {
             if let Some(last) = name.0.last() {
                 let table = strip_quotes(&last.to_string());
                 if let Some(a) = alias {
-                    self.map
-                        .insert(strip_quotes(&a.name.to_string()).to_lowercase(), table.clone());
+                    self.map.insert(
+                        strip_quotes(&a.name.to_string()).to_lowercase(),
+                        table.clone(),
+                    );
                 }
                 self.map.insert(table.to_lowercase(), table);
             }
@@ -537,7 +538,8 @@ fn literal(expr: &Expr) -> Option<(String, bool)> {
 }
 
 fn strip_quotes(s: &str) -> String {
-    s.trim_matches(|c| c == '`' || c == '"' || c == '\'').to_string()
+    s.trim_matches(|c| c == '`' || c == '"' || c == '\'')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -599,8 +601,7 @@ mod tests {
     fn denotation_verification_records_gold_rows() {
         let conn = test_conn();
         let tables: BTreeSet<String> = ["offices".to_string(), "people".to_string()].into();
-        let aliases: BTreeMap<String, String> =
-            [("t1".to_string(), "offices".to_string())].into();
+        let aliases: BTreeMap<String, String> = [("t1".to_string(), "offices".to_string())].into();
         let mut stats = VerifyStats::default();
         let vt = ValueTarget {
             column: "city".into(),

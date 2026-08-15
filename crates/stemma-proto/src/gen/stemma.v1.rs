@@ -19,6 +19,9 @@ pub struct ExplainResponse {
     /// The best deterministic question, when the outcome is ambiguous.
     #[prost(message, optional, tag = "7")]
     pub clarification: ::core::option::Option<Clarification>,
+    /// Opaque identity used to attach explicit feedback to this trajectory.
+    #[prost(string, tag = "8")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResolutionOutcome {
@@ -209,6 +212,77 @@ pub struct ResolveResponse {
     pub outcome: ::core::option::Option<ResolutionOutcome>,
     #[prost(message, optional, tag = "3")]
     pub clarification: ::core::option::Option<Clarification>,
+    /// Opaque identity used to attach explicit feedback to this resolution.
+    #[prost(string, tag = "4")]
+    pub episode_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FeedbackRequest {
+    #[prost(string, tag = "1")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub episode_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "FeedbackCategory", tag = "3")]
+    pub category: i32,
+    #[prost(enumeration = "FeedbackScope", tag = "4")]
+    pub scope: i32,
+    #[prost(uint32, optional, tag = "5")]
+    pub span_id: ::core::option::Option<u32>,
+    /// Candidate position within the recorded span, when the user selects a
+    /// concrete reading.
+    #[prost(uint32, optional, tag = "6")]
+    pub candidate_index: ::core::option::Option<u32>,
+    /// Option position within the recorded clarification question.
+    #[prost(uint32, optional, tag = "7")]
+    pub clarification_option: ::core::option::Option<u32>,
+    /// User-supplied meaning or correction when the offered choices are wrong.
+    #[prost(string, tag = "8")]
+    pub correction: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Feedback {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(string, tag = "2")]
+    pub episode_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "FeedbackCategory", tag = "3")]
+    pub category: i32,
+    #[prost(enumeration = "FeedbackScope", tag = "4")]
+    pub scope: i32,
+    #[prost(uint32, optional, tag = "5")]
+    pub span_id: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub candidate_index: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "7")]
+    pub clarification_option: ::core::option::Option<u32>,
+    #[prost(string, tag = "8")]
+    pub correction: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub recorded_at: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListFeedbackRequest {
+    #[prost(string, tag = "1")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub episode_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FeedbackList {
+    #[prost(message, repeated, tag = "1")]
+    pub feedback: ::prost::alloc::vec::Vec<Feedback>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteFeedbackRequest {
+    #[prost(string, tag = "1")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub feedback_id: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteFeedbackResponse {
+    #[prost(bool, tag = "1")]
+    pub deleted: bool,
 }
 /// A span of the query believed to reference something in the database.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -319,7 +393,7 @@ pub struct Candidate {
     /// The canonical stored value that matched.
     #[prost(string, tag = "4")]
     pub value: ::prost::alloc::string::String,
-    /// Calibrated confidence in \[0, 1\].
+    /// Heuristic fused ranking score in \[0, 1\].
     #[prost(double, tag = "5")]
     pub score: f64,
     #[prost(message, repeated, tag = "6")]
@@ -435,6 +509,78 @@ impl ResolutionStatus {
             "RESOLUTION_STATUS_AMBIGUOUS" => Some(Self::Ambiguous),
             "RESOLUTION_STATUS_UNKNOWN" => Some(Self::Unknown),
             "RESOLUTION_STATUS_UNANSWERABLE" => Some(Self::Unanswerable),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FeedbackCategory {
+    Unspecified = 0,
+    Approved = 1,
+    Rejected = 2,
+    WrongMeaning = 3,
+    MissingInterpretation = 4,
+    WrongQueryOperation = 5,
+    WrongRows = 6,
+}
+impl FeedbackCategory {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FEEDBACK_CATEGORY_UNSPECIFIED",
+            Self::Approved => "FEEDBACK_CATEGORY_APPROVED",
+            Self::Rejected => "FEEDBACK_CATEGORY_REJECTED",
+            Self::WrongMeaning => "FEEDBACK_CATEGORY_WRONG_MEANING",
+            Self::MissingInterpretation => "FEEDBACK_CATEGORY_MISSING_INTERPRETATION",
+            Self::WrongQueryOperation => "FEEDBACK_CATEGORY_WRONG_QUERY_OPERATION",
+            Self::WrongRows => "FEEDBACK_CATEGORY_WRONG_ROWS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FEEDBACK_CATEGORY_UNSPECIFIED" => Some(Self::Unspecified),
+            "FEEDBACK_CATEGORY_APPROVED" => Some(Self::Approved),
+            "FEEDBACK_CATEGORY_REJECTED" => Some(Self::Rejected),
+            "FEEDBACK_CATEGORY_WRONG_MEANING" => Some(Self::WrongMeaning),
+            "FEEDBACK_CATEGORY_MISSING_INTERPRETATION" => {
+                Some(Self::MissingInterpretation)
+            }
+            "FEEDBACK_CATEGORY_WRONG_QUERY_OPERATION" => Some(Self::WrongQueryOperation),
+            "FEEDBACK_CATEGORY_WRONG_ROWS" => Some(Self::WrongRows),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FeedbackScope {
+    Unspecified = 0,
+    Session = 1,
+    Database = 2,
+}
+impl FeedbackScope {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FEEDBACK_SCOPE_UNSPECIFIED",
+            Self::Session => "FEEDBACK_SCOPE_SESSION",
+            Self::Database => "FEEDBACK_SCOPE_DATABASE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FEEDBACK_SCOPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FEEDBACK_SCOPE_SESSION" => Some(Self::Session),
+            "FEEDBACK_SCOPE_DATABASE" => Some(Self::Database),
             _ => None,
         }
     }
@@ -647,6 +793,75 @@ pub mod resolve_service_client {
                 .insert(GrpcMethod::new("stemma.v1.ResolveService", "Parse"));
             self.inner.unary(req, path, codec).await
         }
+        /// Record an explicit judgment about one exact resolution or parse episode.
+        pub async fn submit_feedback(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FeedbackRequest>,
+        ) -> std::result::Result<tonic::Response<super::Feedback>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/stemma.v1.ResolveService/SubmitFeedback",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("stemma.v1.ResolveService", "SubmitFeedback"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Retrieve explicit judgments for inspection or deletion.
+        pub async fn list_feedback(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListFeedbackRequest>,
+        ) -> std::result::Result<tonic::Response<super::FeedbackList>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/stemma.v1.ResolveService/ListFeedback",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("stemma.v1.ResolveService", "ListFeedback"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Permanently remove one explicit judgment.
+        pub async fn delete_feedback(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteFeedbackRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteFeedbackResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/stemma.v1.ResolveService/DeleteFeedback",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("stemma.v1.ResolveService", "DeleteFeedback"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -681,6 +896,24 @@ pub mod resolve_service_server {
             &self,
             request: tonic::Request<super::ParseRequest>,
         ) -> std::result::Result<tonic::Response<super::ParseResponse>, tonic::Status>;
+        /// Record an explicit judgment about one exact resolution or parse episode.
+        async fn submit_feedback(
+            &self,
+            request: tonic::Request<super::FeedbackRequest>,
+        ) -> std::result::Result<tonic::Response<super::Feedback>, tonic::Status>;
+        /// Retrieve explicit judgments for inspection or deletion.
+        async fn list_feedback(
+            &self,
+            request: tonic::Request<super::ListFeedbackRequest>,
+        ) -> std::result::Result<tonic::Response<super::FeedbackList>, tonic::Status>;
+        /// Permanently remove one explicit judgment.
+        async fn delete_feedback(
+            &self,
+            request: tonic::Request<super::DeleteFeedbackRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteFeedbackResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct ResolveServiceServer<T> {
@@ -877,6 +1110,143 @@ pub mod resolve_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ParseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/stemma.v1.ResolveService/SubmitFeedback" => {
+                    #[allow(non_camel_case_types)]
+                    struct SubmitFeedbackSvc<T: ResolveService>(pub Arc<T>);
+                    impl<
+                        T: ResolveService,
+                    > tonic::server::UnaryService<super::FeedbackRequest>
+                    for SubmitFeedbackSvc<T> {
+                        type Response = super::Feedback;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FeedbackRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResolveService>::submit_feedback(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SubmitFeedbackSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/stemma.v1.ResolveService/ListFeedback" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListFeedbackSvc<T: ResolveService>(pub Arc<T>);
+                    impl<
+                        T: ResolveService,
+                    > tonic::server::UnaryService<super::ListFeedbackRequest>
+                    for ListFeedbackSvc<T> {
+                        type Response = super::FeedbackList;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListFeedbackRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResolveService>::list_feedback(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListFeedbackSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/stemma.v1.ResolveService/DeleteFeedback" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteFeedbackSvc<T: ResolveService>(pub Arc<T>);
+                    impl<
+                        T: ResolveService,
+                    > tonic::server::UnaryService<super::DeleteFeedbackRequest>
+                    for DeleteFeedbackSvc<T> {
+                        type Response = super::DeleteFeedbackResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteFeedbackRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResolveService>::delete_feedback(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteFeedbackSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

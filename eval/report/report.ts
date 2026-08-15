@@ -2,7 +2,7 @@
  *
  * Reads the run JSON injected by stemma-eval into #run-data and renders the
  * full report: header, the mechanism × tier matrix (recall@5 with delta and
- * CI per cell, click-through per-query lists), NIL panel, calibration
+ * CI per cell, click-through per-query lists), NIL panel, score buckets
  * curves (inline SVG), cost tables, and named failures.
  *
  * The chrome (16-theme color picker, 12-face typeface picker, size control)
@@ -513,13 +513,13 @@ function calibrationSection(run: RunFile): HTMLElement {
       el("div", { class: "subhead" }, ab),
       calibrationSvg(buckets),
       el("div", { class: "callabel" },
-        "P(gold | score bucket) — dashed identity is perfect calibration")));
+        "observed gold-link rate within each fused-score bucket")));
   }
   return el("div", { class: "section" },
-    el("div", { class: "h2" }, "calibration"),
+    el("div", { class: "h2" }, "score-conditioned accuracy"),
     el("div", { class: "lede" },
-      "the fused scores claim absolute meaning (bands at 0.35 / 0.85 / 0.9); this curve is the ",
-      "direct test. bucket area scales with sample count."),
+      "this descriptive view does not treat fused scores as probabilities. point area scales ",
+      "with sample count."),
     grid);
 }
 
@@ -543,11 +543,7 @@ function calibrationSvg(buckets: CalibrationBucket[]): SVGElement {
       x: x(v), y: H - 8, "text-anchor": "middle",
       "font-size": 8, fill: "var(--ink-faint)", "font-family": "var(--mono)" }, String(v)));
   }
-  // identity reference
-  svg.append(svgEl("line", {
-    x1: x(0), y1: y(0), x2: x(1), y2: y(1),
-    stroke: "var(--flat)", "stroke-width": 1, "stroke-dasharray": "3 3" }));
-  // curve over non-empty buckets
+  // Observed rates over non-empty score buckets.
   const pts = buckets.filter((b) => b.n > 0);
   if (pts.length > 0) {
     const path = pts.map((b, i) =>

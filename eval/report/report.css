@@ -383,7 +383,7 @@ table.matrix td { padding: 0; }
 .drawer { margin: 10px 0 16px; }
 .drawer table.grid td.q { font-family: var(--sans); max-width: 46ch; overflow-wrap: anywhere; }
 
-/* calibration */
+/* score-conditioned accuracy */
 .calgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 .calcard svg { display: block; width: 100%; height: auto; }
 .callabel { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); color: var(--ink-soft); margin-top: 4px; }

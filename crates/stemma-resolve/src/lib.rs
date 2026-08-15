@@ -16,6 +16,13 @@
 use serde::Serialize;
 use stemmadb::StemmaDb;
 
+#[cfg(feature = "usearch-sidecar")]
+mod dense;
+#[cfg(not(feature = "usearch-sidecar"))]
+#[path = "dense_stub.rs"]
+mod dense;
+pub use dense::{DenseSearch, Error as DenseSearchError};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("sqlite error: {0}")]
@@ -24,6 +31,8 @@ pub enum Error {
     Kg(#[from] stemma_kg::Error),
     #[error("store error: {0}")]
     Store(#[from] stemmadb::Error),
+    #[error("dense search error: {0}")]
+    Dense(#[from] DenseSearchError),
     #[error("lexical index missing — run ingest first")]
     IndexMissing,
 }
@@ -179,7 +188,7 @@ pub struct Candidate {
     /// document candidates, which keep per-row identity.
     pub row_count: u32,
     /// The best semantic-channel cosine (dense or interp) for this
-    /// candidate, calibrated against the corpus's derived geometry: 0.0 at
+    /// candidate, normalized against the corpus's derived geometry: 0.0 at
     /// the null-pair mean (what unrelated rows score on THIS corpus), 1.0
     /// at the nearest-neighbor mean. `None` when the candidate has no
     /// semantic evidence or the corpus has no derived geometry.
@@ -227,7 +236,7 @@ pub struct Span {
     pub divergence: f64,
     /// Which rule, other than the fused-score threshold, admitted this span
     /// into `mentions`. `None` for ordinary selection. "dense_geometry": the
-    /// span's only evidence is semantic (dense or interp) and its calibrated
+    /// span's only evidence is semantic (dense or interp) and its normalized
     /// confidence sits above the corpus's null-pair mean — surfaced as a
     /// nomination (status stays "weak", candidates stay unselected) rather
     /// than a confident mention, so NIL semantics are untouched.
@@ -346,6 +355,16 @@ pub fn resolve_full(
     embedder: Option<&dyn stemma_embed::Embedder>,
     lm: Option<&dyn stemma_lm::LmBackend>,
 ) -> Result<Trace> {
+    resolve_full_with_dense_search(db, query, embedder, lm, &DenseSearch::exact())
+}
+
+pub fn resolve_full_with_dense_search(
+    db: &StemmaDb,
+    query: &str,
+    embedder: Option<&dyn stemma_embed::Embedder>,
+    lm: Option<&dyn stemma_lm::LmBackend>,
+    dense_search: &DenseSearch,
+) -> Result<Trace> {
     let started = std::time::Instant::now();
     let conn = db.conn();
 
@@ -397,6 +416,7 @@ pub fn resolve_full(
         _ => query.to_string(),
     };
     let mut query_vec: Option<Vec<f32>> = None;
+    let mut span_vectors = std::collections::HashMap::new();
 
     // KG-assisted mention detection: spans matching a compiled phrase/term
     // entity are marked and favored in selection — multi-word entities like
@@ -492,8 +512,9 @@ pub fn resolve_full(
                             query_vec = Some(v.clone());
                         }
                         if has_dense {
-                            let hits = dense_hits(db, &v)?;
+                            let hits = dense_hits(db, &v, dense_search, false)?;
                             raw.entry(id).or_default().extend(hits);
+                            span_vectors.insert(id, v.clone());
                         }
                         if interp_ready && !strong.contains(&id) {
                             let hits = interp_hits(db, &v)?;
@@ -506,7 +527,7 @@ pub fn resolve_full(
         }
     }
 
-    // Phase 3: fuse and refine. The dense channel's cosines calibrate
+    // Phase 3: fuse and refine. The dense channel's cosines normalize
     // against the corpus's own derived geometry (see
     // stemma_ingest::derive_dense_geometry); absent geometry, dense
     // participates by rank alone.
@@ -515,10 +536,48 @@ pub fn resolve_full(
         if span.status == "skipped" {
             continue;
         }
-        let hits = raw.remove(&span.id).unwrap_or_default();
-        let mut candidates = fuse(&span.text, hits, geometry);
+        let mut hits = raw.remove(&span.id).unwrap_or_default();
+        let approximate = hits.iter().any(|hit| hit.channel == "dense_approximate");
+        let mut candidates = fuse(&span.text, hits.clone(), geometry);
         apply_kg_coherence(db, &span.text, &mut candidates)?;
         apply_context_coherence(db, &tokens, span.start, span.end, &mut candidates)?;
+        if approximate && approximate_requires_exact(&candidates) {
+            let proposed: std::collections::HashMap<_, _> = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .channels
+                        .iter()
+                        .find(|channel| channel.channel == "dense_approximate")
+                        .map(|channel| {
+                            (
+                                (
+                                    candidate.table.clone(),
+                                    candidate.column.clone(),
+                                    candidate.rowid,
+                                ),
+                                channel.clone(),
+                            )
+                        })
+                })
+                .collect();
+            hits.retain(|hit| hit.channel != "dense_approximate");
+            if let Some(vector) = span_vectors.get(&span.id) {
+                hits.extend(dense_hits(db, vector, dense_search, true)?);
+            }
+            candidates = fuse(&span.text, hits, geometry);
+            apply_kg_coherence(db, &span.text, &mut candidates)?;
+            apply_context_coherence(db, &tokens, span.start, span.end, &mut candidates)?;
+            for candidate in &mut candidates {
+                if let Some(channel) = proposed.get(&(
+                    candidate.table.clone(),
+                    candidate.column.clone(),
+                    candidate.rowid,
+                )) {
+                    candidate.channels.push(channel.clone());
+                }
+            }
+        }
         span.candidates = candidates;
         if span.candidates.is_empty() {
             span.status = "no_candidates".into();
@@ -573,6 +632,18 @@ pub fn resolve_full(
     }
     plan_clarification(&mut trace);
     Ok(trace)
+}
+
+fn approximate_requires_exact(candidates: &[Candidate]) -> bool {
+    candidates
+        .first()
+        .is_some_and(|candidate| candidate.score >= SELECT_THRESHOLD)
+        || candidates.iter().any(|candidate| {
+            candidate
+                .channels
+                .iter()
+                .any(|channel| channel.channel != "dense_approximate")
+        })
 }
 
 /// Builds one minimal, deterministic ask-back for each ambiguous mention.
@@ -1268,24 +1339,13 @@ fn fts_channel_hits(
 /// [`DOC_COLUMN_QUOTA`] window the FTS channels apply, and the result is
 /// truncated to [`PER_CHANNEL_LIMIT`]. Dense and lexical candidates report
 /// the same shape, and `row_count` means the same thing in every channel.
-fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
+fn dense_hits(db: &StemmaDb, v: &[f32], search: &DenseSearch, exact: bool) -> Result<Vec<RawHit>> {
     let conn = db.conn();
-    let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let mut stmt = conn.prepare_cached(
-        "SELECT src_table, src_column, src_rowid, distance FROM vec_dense
-         WHERE embedding MATCH ?1 AND k = ?2",
-    )?;
-    let rows = stmt.query_map(
-        stemmadb::rusqlite::params![blob, (PER_CHANNEL_LIMIT * DENSE_OVERFETCH) as i64],
-        |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, f64>(3)?,
-            ))
-        },
-    );
+    let neighbors = if exact {
+        search.search_exact(db, v, PER_CHANNEL_LIMIT * DENSE_OVERFETCH)?
+    } else {
+        search.search(db, v, PER_CHANNEL_LIMIT * DENSE_OVERFETCH)?
+    };
 
     /// One interpretation's collapsed KNN members, nearest first.
     struct Group {
@@ -1295,6 +1355,7 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
         rowid: i64,
         value: String,
         cosine: f64,
+        approximate: bool,
         is_doc: bool,
         row_count: u32,
         member_rowids: Vec<i64>,
@@ -1302,47 +1363,52 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
     let mut groups: Vec<Group> = Vec::new();
     let mut index: std::collections::HashMap<(String, String, String), usize> =
         std::collections::HashMap::new();
-    if let Ok(rows) = rows {
-        // vec0 returns ascending distance, so the first member of each
-        // interpretation seen is its nearest — the representative.
-        for row in rows {
-            let Ok((table, column, rowid, dist)) = row else {
-                continue;
-            };
-            let cosine = 1.0 - (dist * dist) / 2.0;
-            let looked: Option<(String, String, i64)> = conn
-                .query_row(
-                    "SELECT value, value_norm, is_doc FROM lex_values
+    // Search returns authoritative score order, so the first member of each
+    // interpretation seen is its nearest — the representative.
+    for neighbor in neighbors {
+        let looked_up: Option<(String, String, i64)> = conn
+            .query_row(
+                "SELECT src_table, src_column, src_rowid FROM vec_dense WHERE rowid = ?1",
+                [neighbor.rowid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+        let Some((table, column, rowid)) = looked_up else {
+            continue;
+        };
+        let looked: Option<(String, String, i64)> = conn
+            .query_row(
+                "SELECT value, value_norm, is_doc FROM lex_values
                      WHERE src_table = ?1 AND src_column = ?2 AND src_rowid = ?3",
-                    stemmadb::rusqlite::params![table, column, rowid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .ok();
-            // A vector whose lex row vanished has no collapse key; keep it
-            // as its own group (rowid-keyed) rather than merging unknowns.
-            let (value, norm, is_doc) = match looked {
-                Some((v, n, d)) => (v, n, d != 0),
-                None => (String::new(), format!("\u{0}missing:{rowid}"), true),
-            };
-            let key = (table.clone(), column.clone(), norm);
-            match index.get(&key) {
-                Some(&i) => {
-                    groups[i].row_count += 1;
-                    groups[i].member_rowids.push(rowid);
-                }
-                None => {
-                    index.insert(key, groups.len());
-                    groups.push(Group {
-                        table,
-                        column,
-                        rowid,
-                        value,
-                        cosine,
-                        is_doc,
-                        row_count: 1,
-                        member_rowids: vec![rowid],
-                    });
-                }
+                stemmadb::rusqlite::params![table, column, rowid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        // A vector whose lex row vanished has no collapse key; keep it
+        // as its own group (rowid-keyed) rather than merging unknowns.
+        let (value, norm, is_doc) = match looked {
+            Some((v, n, d)) => (v, n, d != 0),
+            None => (String::new(), format!("\u{0}missing:{rowid}"), true),
+        };
+        let key = (table.clone(), column.clone(), norm);
+        match index.get(&key) {
+            Some(&i) => {
+                groups[i].row_count += 1;
+                groups[i].member_rowids.push(rowid);
+            }
+            None => {
+                index.insert(key, groups.len());
+                groups.push(Group {
+                    table,
+                    column,
+                    rowid,
+                    value,
+                    cosine: neighbor.cosine,
+                    approximate: neighbor.approximate,
+                    is_doc,
+                    row_count: 1,
+                    member_rowids: vec![rowid],
+                });
             }
         }
     }
@@ -1380,7 +1446,11 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
             column: g.column,
             rowid: g.rowid,
             value: g.value,
-            channel: "dense",
+            channel: if g.approximate {
+                "dense_approximate"
+            } else {
+                "dense"
+            },
             rank: 0, // assigned below
             raw: g.cosine,
             is_doc: g.is_doc,
@@ -1413,7 +1483,7 @@ fn dense_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
 /// readings — and for stale cards whose lexical row has vanished, which are
 /// dropped (a card describes an interpretation; without the interpretation
 /// it describes nothing). L2 on unit vectors → cos = 1 − d²/2, exactly as
-/// in [`dense_hits`], and the cosines calibrate downstream against the same
+/// in [`dense_hits`], and the cosines normalize downstream against the same
 /// corpus geometry (see [`fuse`]).
 ///
 /// Hits carry full interpretation semantics: the stored `src_rowid` IS the
@@ -3065,7 +3135,7 @@ fn apply_column_affinity(
 /// that merely contain it.
 /// The corpus's derived dense geometry (null-pair mean, nearest-neighbor
 /// mean), written by ingest with the other derivation receipts. One row;
-/// absent or unparsable means "no calibration", never a default constant.
+/// absent or unparsable means "no geometry normalization", never a default.
 fn dense_geometry(db: &StemmaDb) -> Option<(f64, f64)> {
     let json: String = db
         .conn()
@@ -3170,12 +3240,14 @@ fn fuse(span: &str, hits: Vec<RawHit>, geometry: Option<(f64, f64)>) -> Vec<Cand
             // correct anchored candidates: legal L1 recall@5 fell 0.68→0.48
             // the day the dense index filled.
             //
-            // The interp channel's cosines calibrate through the SAME
+            // The interp channel's cosines normalize through the same
             // derived geometry: its vectors live in the same registry-
-            // guarded encoder space, and one calibration law for all
+            // guarded encoder space, and one normalization rule for all
             // semantic evidence beats a second derivation with a second
             // failure mode.
-            let semantic = |c: &&ChannelScore| c.channel == "dense" || c.channel == "interp";
+            let semantic = |c: &&ChannelScore| {
+                c.channel == "dense" || c.channel == "dense_approximate" || c.channel == "interp"
+            };
             let mut dense_confidence = None;
             if let (Some((null_mean, nn_mean)), Some(best_cos)) = (
                 geometry,
@@ -3295,7 +3367,7 @@ fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
 /// Dense nomination: the honest surfacing of dense-only evidence that the
 /// fused-score threshold cannot admit and must not certify.
 ///
-/// SELECT_THRESHOLD arbitrates lexical evidence, and calibration bounds a
+/// SELECT_THRESHOLD arbitrates lexical evidence, and normalization bounds a
 /// dense-only candidate at confidence × 0.5667 (two lexical channels at
 /// rank 0 on a document) — so under the fused threshold a span whose only
 /// evidence is dense can never become a mention, and the paraphrase tier
@@ -3309,9 +3381,9 @@ fn select_mentions(spans: &mut [Span]) -> Vec<usize> {
 ///
 /// So semantic-only evidence is admitted as a *nomination*, not a mention
 /// claim: the longest weak span whose top candidate's evidence is entirely
-/// semantic — dense or interp, which share the calibration law and the
+/// semantic — dense or interp, which share the normalization rule and the
 /// structural ceiling, so they share nomination eligibility — and whose
-/// calibrated confidence is positive — its best cosine is
+/// geometry-normalized evidence is positive — its best cosine is
 /// above the corpus's own null-pair mean, the one bar the geometry actually
 /// derives — joins `mentions` with status still "weak", candidates still
 /// unselected, and `admitted_by = "dense_geometry"` naming the rule. It
@@ -3329,9 +3401,11 @@ fn dense_nomination(spans: &[Span]) -> Option<usize> {
         .filter(|s| {
             s.candidates.first().is_some_and(|c| {
                 !c.channels.is_empty()
-                    && c.channels
-                        .iter()
-                        .all(|ch| ch.channel == "dense" || ch.channel == "interp")
+                    && c.channels.iter().all(|ch| {
+                        ch.channel == "dense"
+                            || ch.channel == "dense_approximate"
+                            || ch.channel == "interp"
+                    })
                     && c.dense_confidence.is_some_and(|x| x > 0.0)
             })
         })
@@ -3402,27 +3476,25 @@ pub fn trace_to_proto(trace: &Trace) -> stemma_proto::v1::ResolveResponse {
         mentions,
         outcome: Some(outcome_to_proto(trace)),
         clarification: clarification_to_proto(trace),
+        episode_id: String::new(),
     }
 }
 
 fn clarification_to_proto(trace: &Trace) -> Option<stemma_proto::v1::Clarification> {
     use stemma_proto::v1 as pb;
-    trace
-        .clarification
-        .as_ref()
-        .map(|plan| pb::Clarification {
-            span_id: plan.span_id as u32,
-            dimension: plan.dimension.clone(),
-            question: plan.question.clone(),
-            options: plan
-                .options
-                .iter()
-                .map(|option| pb::ClarificationOption {
-                    label: option.label.clone(),
-                    candidate_indices: option.candidate_indices.iter().map(|&i| i as u32).collect(),
-                })
-                .collect(),
-        })
+    trace.clarification.as_ref().map(|plan| pb::Clarification {
+        span_id: plan.span_id as u32,
+        dimension: plan.dimension.clone(),
+        question: plan.question.clone(),
+        options: plan
+            .options
+            .iter()
+            .map(|option| pb::ClarificationOption {
+                label: option.label.clone(),
+                candidate_indices: option.candidate_indices.iter().map(|&i| i as u32).collect(),
+            })
+            .collect(),
+    })
 }
 
 fn outcome_to_proto(trace: &Trace) -> stemma_proto::v1::ResolutionOutcome {
@@ -3510,6 +3582,7 @@ pub fn trace_to_explain_proto(trace: &Trace) -> stemma_proto::v1::ExplainRespons
         mentions: trace.mentions.iter().map(|&i| i as u32).collect(),
         outcome: Some(outcome_to_proto(trace)),
         clarification: clarification_to_proto(trace),
+        episode_id: String::new(),
     }
 }
 
@@ -3890,7 +3963,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_only_calibrates_against_corpus_geometry_and_defers_to_lexical() {
+    fn dense_only_normalizes_against_corpus_geometry_and_defers_to_lexical() {
         let hit = |channel: &'static str, rank: usize, raw: f64, rowid: i64| RawHit {
             table: "docs".into(),
             column: "text".into(),
@@ -3938,7 +4011,7 @@ mod tests {
         let out_mid = fuse("span", vec![hit("dense", 0, 0.45, 4)], geometry);
         let out_none = fuse("span", vec![hit("dense", 0, 0.45, 4)], None);
         assert!(out_mid[0].score > out_none[0].score);
-        // The calibrated confidence itself is carried on the candidate —
+        // The geometry-normalized score itself is carried on the candidate —
         // the dense-nomination rule and the trace both read it.
         assert!(
             out_mid[0]
@@ -3949,7 +4022,7 @@ mod tests {
         );
         assert_eq!(
             out_none[0].dense_confidence, None,
-            "no geometry, no calibration — never a default constant"
+            "no geometry normalization — never a default constant"
         );
     }
 
@@ -3969,7 +4042,7 @@ mod tests {
         }
     }
 
-    /// An unselected dense-only candidate at the given calibrated confidence,
+    /// An unselected dense-only candidate at the given normalized score,
     /// scored exactly as fuse scores a dense-only document (conf × 0.5667).
     fn dense_cand(rowid: i64, conf: f64) -> Candidate {
         let mut c = cand(
@@ -3985,7 +4058,7 @@ mod tests {
     }
 
     /// The paraphrase-tier mechanism: a span whose ONLY evidence is dense
-    /// cannot reach SELECT_THRESHOLD under calibration (ceiling 0.5667), so
+    /// cannot reach SELECT_THRESHOLD after normalization (ceiling 0.5667), so
     /// it surfaces as a nomination — in `mentions`, status still "weak",
     /// candidates unselected, the admitting rule named on the span — while
     /// lexical selection is untouched.
@@ -4032,7 +4105,7 @@ mod tests {
     /// before: no lexical span is nominated, corroborated or not. Absent
     /// geometry (dense_confidence None) dense spans are not nominated either.
     #[test]
-    fn nomination_requires_dense_only_evidence_and_calibration() {
+    fn nomination_requires_dense_only_evidence_and_geometry() {
         let weak_lex = {
             let mut c = cand(1, "docs", 0.283, &["bm25"]);
             c.selected = false;
@@ -4044,7 +4117,7 @@ mod tests {
             c.dense_confidence = Some(0.9);
             c
         };
-        let uncalibrated = {
+        let rank_only = {
             let mut c = cand(3, "docs", 0.283, &["dense"]);
             c.selected = false;
             c.dense_confidence = None;
@@ -4053,7 +4126,7 @@ mod tests {
         let mut spans = vec![
             span_at(0, 0, 6, "weak", vec![weak_lex]),
             span_at(1, 8, 14, "weak", vec![mixed]),
-            span_at(2, 16, 22, "weak", vec![uncalibrated]),
+            span_at(2, 16, 22, "weak", vec![rank_only]),
         ];
         let mentions = select_mentions(&mut spans);
         assert!(mentions.is_empty(), "got {mentions:?}");
@@ -4146,7 +4219,13 @@ mod tests {
             .unwrap();
         assert_eq!(vectors, 11, "8 copies + 3 distinct documents");
 
-        let hits = dense_hits(&db, &HashEmbedder::vector(&repeated)).unwrap();
+        let hits = dense_hits(
+            &db,
+            &HashEmbedder::vector(&repeated),
+            &DenseSearch::exact(),
+            false,
+        )
+        .unwrap();
         for h in &hits {
             println!(
                 "{}.{} #{} rank={} cos={:.4} row_count={} samples={:?} '{}…'",
@@ -4815,6 +4894,42 @@ mod tests {
             sample_rowids: vec![rowid],
             reach: 0,
         }
+    }
+
+    #[test]
+    fn approximate_proposals_cannot_select_without_exact_confirmation() {
+        let omitted_rival = vec![cand(
+            1,
+            "proposed",
+            SELECT_THRESHOLD,
+            &["dense_approximate"],
+        )];
+        assert!(approximate_requires_exact(&omitted_rival));
+
+        let weak_nomination = vec![cand(
+            1,
+            "proposed",
+            SELECT_THRESHOLD - 0.01,
+            &["dense_approximate"],
+        )];
+        assert!(!approximate_requires_exact(&weak_nomination));
+
+        let kg_reachable = vec![cand(
+            1,
+            "proposed",
+            SELECT_THRESHOLD,
+            &["dense_approximate", "kg"],
+        )];
+        assert!(approximate_requires_exact(&kg_reachable));
+
+        let exact_confirmation = vec![
+            cand(1, "proposed", SELECT_THRESHOLD, &["dense"]),
+            cand(2, "close rival", SELECT_THRESHOLD, &["dense"]),
+        ];
+        assert_eq!(exact_confirmation.len(), 2);
+        assert!(exact_confirmation
+            .iter()
+            .all(|candidate| candidate.channels[0].channel == "dense"));
     }
 
     /// One mention whose top two candidates sit inside the margin with no
@@ -6121,7 +6236,7 @@ mod tests {
     /// MIN(src_rowid) representative (the dense-geometry test's pattern),
     /// restricted to the category columns as the vocabulary gate would
     /// leave it. `geometry` writes the corpus-geometry receipt fuse
-    /// calibrates against; without it the channel participates by rank
+    /// normalizes against; without it the channel participates by rank
     /// alone.
     fn category_db(geometry: bool) -> StemmaDb {
         let db = StemmaDb::open_in_memory().unwrap();
@@ -6177,7 +6292,7 @@ mod tests {
         }
         if geometry {
             // Null above the bias-only baseline cosine (≈ 0.24), so junk
-            // spans calibrate to zero confidence like unrelated rows do.
+            // spans normalize to zero like unrelated rows do.
             conn.execute(
                 "INSERT INTO derivations
                      (artifact, input_fingerprint, derivation_version, value_json)
@@ -6217,7 +6332,7 @@ mod tests {
             .find(|c| c.table == "products" && c.column == "category")
             .expect("the category reading");
         assert_eq!(c.value, "Outerwear & Coats");
-        assert!(c.selected, "calibrated semantic evidence selects: {c:?}");
+        assert!(c.selected, "normalized semantic evidence selects: {c:?}");
         assert!(
             c.channels.iter().any(|ch| ch.channel == "interp"),
             "the reading is the interp channel's"
@@ -6236,7 +6351,7 @@ mod tests {
         assert_eq!(c.sample_rowids, vec![1, 2]);
         assert!(
             c.dense_confidence.is_some_and(|x| x > 0.99),
-            "same-axis cosine calibrates to full confidence: {:?}",
+            "same-axis cosine normalizes to full strength: {:?}",
             c.dense_confidence
         );
     }
@@ -6395,7 +6510,7 @@ mod tests {
         assert!(!interp_fired(&db));
     }
 
-    /// No geometry receipt = no calibration: the channel participates by
+    /// No geometry receipt means no normalization: the channel participates by
     /// rank alone (base 1/3, under SELECT_THRESHOLD), never a default
     /// constant, and rank-only evidence neither selects nor nominates.
     #[test]
@@ -6428,7 +6543,7 @@ mod tests {
         assert!(!c.selected);
     }
 
-    /// An unselected interp-only value candidate at the given calibrated
+    /// An unselected interp-only value candidate at the given normalized
     /// confidence, scored as fuse scores rank-only interp evidence (base
     /// 1/3, under the threshold) — the paraphrase tier's weak shape.
     fn interp_only_cand(rowid: i64, conf: f64) -> Candidate {
@@ -6439,7 +6554,7 @@ mod tests {
     }
 
     /// Nomination eligibility extends to interp-only spans exactly as to
-    /// dense-only ones: the calibration law and the structural ceiling are
+    /// dense-only ones: the normalization rule and structural ceiling are
     /// shared, so the honest-surfacing rule is too — and any lexical
     /// evidence in the mix keeps SELECT_THRESHOLD in charge.
     #[test]
@@ -6472,7 +6587,7 @@ mod tests {
         assert!(select_mentions(&mut spans).is_empty());
         assert!(spans[0].admitted_by.is_none());
 
-        // Uncalibrated interp evidence (no geometry) never nominates.
+        // Interp evidence without geometry normalization never nominates.
         let mut c = interp_only_cand(4, 0.0);
         c.dense_confidence = None;
         let mut spans = vec![span_at(0, 0, 20, "weak", vec![c])];

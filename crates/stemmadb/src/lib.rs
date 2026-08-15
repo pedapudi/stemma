@@ -16,7 +16,7 @@ use rusqlite::Connection;
 pub use rusqlite;
 
 /// Schema version of the .stemmadb store, kept in `PRAGMA user_version`.
-pub const STORE_SCHEMA_VERSION: i32 = 5;
+pub const STORE_SCHEMA_VERSION: i32 = 7;
 
 /// Name under which the user database is attached.
 pub const SRC_SCHEMA: &str = "src";
@@ -204,6 +204,47 @@ impl StemmaDb {
             "card_format",
             "ALTER TABLE model_registry ADD COLUMN card_format TEXT NOT NULL DEFAULT ''",
         )?;
+        let has_query_log: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'query_log'",
+            [],
+            |row| row.get(0),
+        )?;
+        for (column, ddl) in [
+            (
+                "episode_id",
+                "ALTER TABLE query_log ADD COLUMN episode_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "episode_kind",
+                "ALTER TABLE query_log ADD COLUMN episode_kind TEXT NOT NULL DEFAULT 'resolve'",
+            ),
+            (
+                "database_revision",
+                "ALTER TABLE query_log ADD COLUMN database_revision TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "vector_revision",
+                "ALTER TABLE query_log ADD COLUMN vector_revision TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "evidence_json",
+                "ALTER TABLE query_log ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'",
+            ),
+            (
+                "parse_json",
+                "ALTER TABLE query_log ADD COLUMN parse_json TEXT NOT NULL DEFAULT '{}'",
+            ),
+        ] {
+            if has_query_log != 0 {
+                self.ensure_column("query_log", column, ddl)?;
+            }
+        }
+        if has_query_log != 0 {
+            self.conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS query_log_episode
+                     ON query_log(episode_id) WHERE episode_id != '';",
+            )?;
+        }
         Ok(())
     }
 
@@ -337,15 +378,59 @@ CREATE INDEX IF NOT EXISTS embed_queue_status_attempts_id
 -- server; chat history by the console/agents. Both are per-database working
 -- memory — queryable like everything else in the store.
 CREATE TABLE IF NOT EXISTS query_log (
-    id         INTEGER PRIMARY KEY,
-    query      TEXT NOT NULL,
-    mentions   INTEGER NOT NULL,
-    elapsed_ms REAL NOT NULL,
-    asked_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    source     TEXT NOT NULL DEFAULT '',
-    session    TEXT NOT NULL DEFAULT ''
+    id                INTEGER PRIMARY KEY,
+    query             TEXT NOT NULL,
+    mentions          INTEGER NOT NULL,
+    elapsed_ms        REAL NOT NULL,
+    asked_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    source            TEXT NOT NULL DEFAULT '',
+    session           TEXT NOT NULL DEFAULT '',
+    episode_id        TEXT NOT NULL DEFAULT '',
+    episode_kind      TEXT NOT NULL DEFAULT 'resolve',
+    database_revision TEXT NOT NULL DEFAULT '',
+    vector_revision   TEXT NOT NULL DEFAULT '',
+    evidence_json     TEXT NOT NULL DEFAULT '{}',
+    parse_json        TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 CREATE INDEX IF NOT EXISTS query_log_at ON query_log(asked_at);
+
+-- Explicit user judgments retain the resolution episode that made them
+-- meaningful. Candidate and clarification selectors refer to the presentation
+-- order recorded on query_log; source data remains in the attached database.
+CREATE TABLE IF NOT EXISTS grounding_feedback (
+    id                   INTEGER PRIMARY KEY,
+    query_id             INTEGER NOT NULL REFERENCES query_log(id) ON DELETE CASCADE,
+    category             TEXT NOT NULL,
+    scope                TEXT NOT NULL,
+    span_id              INTEGER,
+    candidate_index      INTEGER,
+    clarification_option INTEGER,
+    correction           TEXT NOT NULL DEFAULT '',
+    recorded_at          TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+CREATE INDEX IF NOT EXISTS grounding_feedback_query
+    ON grounding_feedback(query_id, id);
+
+-- A monotonic token avoids hashing every stored vector before each search.
+CREATE TABLE IF NOT EXISTS vector_generations (
+    vector_table TEXT PRIMARY KEY,
+    generation   INTEGER NOT NULL
+) STRICT;
+
+-- SQLite authorizes every optional vector sidecar generation. The external
+-- file is disposable; this receipt binds it to the live corpus and vector
+-- space before it can propose candidates.
+CREATE TABLE IF NOT EXISTS vector_sidecar_receipts (
+    vector_table       TEXT PRIMARY KEY,
+    corpus_fingerprint TEXT NOT NULL,
+    vector_revision    TEXT NOT NULL,
+    vector_generation  INTEGER NOT NULL,
+    vector_count       INTEGER NOT NULL,
+    dimension          INTEGER NOT NULL,
+    metric             TEXT NOT NULL,
+    checksum           TEXT NOT NULL,
+    built_at           TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
 CREATE TABLE IF NOT EXISTS chat_log (
     id           INTEGER PRIMARY KEY,
     conversation TEXT NOT NULL DEFAULT 'default',
@@ -377,7 +462,14 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, STORE_SCHEMA_VERSION);
-        for t in ["model_registry", "embed_queue"] {
+        for t in [
+            "model_registry",
+            "embed_queue",
+            "query_log",
+            "grounding_feedback",
+            "vector_sidecar_receipts",
+            "vector_generations",
+        ] {
             let n: i64 = db
                 .conn()
                 .query_row(
@@ -596,6 +688,59 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, STORE_SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_query_history_to_feedback_episodes() {
+        let dir = std::env::temp_dir().join(format!("stemmadb-migrate6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let store = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&store);
+        Connection::open(&user).unwrap();
+        {
+            let db = StemmaDb::open(&store, &user).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO query_log (query, mentions, elapsed_ms) VALUES ('who', 1, 2.0)",
+                    [],
+                )
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&store).unwrap();
+            conn.execute_batch(
+                "DROP TABLE grounding_feedback;
+                 DROP INDEX query_log_episode;
+                 ALTER TABLE query_log DROP COLUMN parse_json;
+                 ALTER TABLE query_log DROP COLUMN evidence_json;
+                 ALTER TABLE query_log DROP COLUMN vector_revision;
+                 ALTER TABLE query_log DROP COLUMN database_revision;
+                 ALTER TABLE query_log DROP COLUMN episode_kind;
+                 ALTER TABLE query_log DROP COLUMN episode_id;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&store, &user).unwrap();
+        let (query, evidence): (String, String) = db
+            .conn()
+            .query_row("SELECT query, evidence_json FROM query_log", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((query.as_str(), evidence.as_str()), ("who", "{}"));
+        let feedback_table: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'grounding_feedback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(feedback_table, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

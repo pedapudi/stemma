@@ -109,6 +109,14 @@ of "minimal surgery within SQLite". SQLite itself is stock; capability comes
 from core modules plus the statically linked sqlite-vec extension registered
 through `sqlite3_auto_extension`.
 
+An optional USearch file is a rebuildable dense-candidate
+accelerator for larger scopes. SQLite remains authoritative and stores the
+generation receipt. Invalid files fall back to exact SQLite search.
+Approximate results map to SQLite identities and receive exact rescoring.
+Every span that could become a mention retains an exact-search safeguard. The
+operator contract is in
+[design/03-resolution.md](design/03-resolution.md#optional-approximate-vector-sidecar).
+
 ## Modularity contracts
 
 Every model- or store-shaped dependency sits behind a trait with a registry,

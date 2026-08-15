@@ -19,8 +19,8 @@ Sources: [`crates/stemmadb/src/lib.rs`](../../crates/stemmadb/src/lib.rs),
 | SQLite schema name | `src` (attached) | `main` (opened) |
 | owner | the user | stemmadb |
 | access | `file:…?mode=ro` — read-only, always | read-write |
-| contents | arbitrary user tables | every derived artifact |
-| disposable | never | always |
+| contents | arbitrary user tables | derived artifacts, history, and feedback |
+| rebuildability | source of truth | derived indexes can be rebuilt; history and feedback require backup or retention policy |
 
 `StemmaDb::open(store_path, user_db_path)` opens the store as the main
 database of the connection and then attaches the user database:
@@ -70,7 +70,7 @@ batch, `SCHEMA_SQL` in `crates/stemmadb/src/lib.rs`. Index tables (FTS5,
 `vec0`) and knowledge tables are created on demand by the subsystem that
 owns them, so they are documented in their own sections below.
 
-All four fixed tables are `STRICT`: SQLite enforces the declared column
+All seven fixed tables are `STRICT`: SQLite enforces the declared column
 types rather than applying its usual affinity coercions.
 
 ### `model_registry`
@@ -209,6 +209,65 @@ Four honest observations about this shape:
   Retrieval stays correct (unembedded rows simply never appear as dense
   hits), but dense recall is capped with nothing recording that it was.
 
+### `vector_generations` and `vector_sidecar_receipts`
+
+The optional USearch file is a rebuildable projection of one SQLite vector
+generation. SQLite remains authoritative for vectors and source identities.
+The file contains a search structure and opaque identity keys. Every returned
+key is mapped back to SQLite before it can become a candidate.
+
+```sql
+CREATE TABLE IF NOT EXISTS vector_generations (
+    vector_table TEXT PRIMARY KEY,
+    generation   INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS vector_sidecar_receipts (
+    vector_table       TEXT PRIMARY KEY,
+    corpus_fingerprint TEXT NOT NULL,
+    vector_revision    TEXT NOT NULL,
+    vector_generation  INTEGER NOT NULL,
+    vector_count       INTEGER NOT NULL,
+    dimension          INTEGER NOT NULL,
+    metric             TEXT NOT NULL,
+    checksum           TEXT NOT NULL,
+    built_at           TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+```
+
+One receipt binds one active file to all of the following:
+
+- the source-corpus fingerprint;
+- the vector-space revision digest;
+- the vector table's monotonic generation token;
+- the vector count and dimension;
+- the distance metric;
+- the approximate-file checksum; and
+- the build time.
+
+The corpus fingerprint detects changes to eligible records. The vector-space
+digest distinguishes encoders, revisions, query conventions, and card formats
+whose coordinates cannot be mixed. Ingest increments `vector_generations`
+whenever promotion or a queue drain changes a vector table. This token detects
+in-place vector changes without hashing every stored vector before each search.
+Count and dimension reject incomplete or structurally incompatible files. The
+metric prevents interpreting one distance as another. The checksum detects
+accidental truncation and corruption. It is a 64-bit file hash and is not an
+authenticity check against deliberate tampering.
+
+Activation validates the receipt and file before the first approximate query.
+A missing receipt, missing file, checksum mismatch, revision mismatch, count or
+dimension mismatch, unsupported metric, or unreadable index leaves the
+generation inactive. Retrieval then uses the exact SQLite implementation. The
+builder writes a temporary generation in SQLite rowid order, saves it, computes
+its checksum, renames it into place, and writes the receipt. A crash before the
+receipt update leaves a mismatched generation that falls back to exact search.
+
+The receipt is operational metadata. Its presence proves that the file matches
+a known vector generation. Candidate recall and safe resolution behavior need
+separate measurement. Shadow comparison and measured deployment gates are in
+[03-resolution.md](03-resolution.md#shadow-measurement-and-deployment-gates).
+
 ### `vec_interp`
 
 The second `vec0` table, created by `stemma_ingest::drain_embed_queue` on
@@ -346,30 +405,54 @@ the queue back up.
 
 ```sql
 CREATE TABLE IF NOT EXISTS query_log (
-    id         INTEGER PRIMARY KEY,
-    query      TEXT NOT NULL,
-    mentions   INTEGER NOT NULL,
-    elapsed_ms REAL NOT NULL,
-    asked_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    source     TEXT NOT NULL DEFAULT '',
-    session    TEXT NOT NULL DEFAULT ''
+    id                INTEGER PRIMARY KEY,
+    query             TEXT NOT NULL,
+    mentions          INTEGER NOT NULL,
+    elapsed_ms        REAL NOT NULL,
+    asked_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    source            TEXT NOT NULL DEFAULT '',
+    session           TEXT NOT NULL DEFAULT '',
+    episode_id        TEXT NOT NULL DEFAULT '',
+    episode_kind      TEXT NOT NULL DEFAULT 'resolve',
+    database_revision TEXT NOT NULL DEFAULT '',
+    vector_revision   TEXT NOT NULL DEFAULT '',
+    evidence_json     TEXT NOT NULL DEFAULT '{}',
+    parse_json        TEXT NOT NULL DEFAULT '{}'
 ) STRICT;
 CREATE INDEX IF NOT EXISTS query_log_at ON query_log(asked_at);
+CREATE UNIQUE INDEX IF NOT EXISTS query_log_episode
+    ON query_log(episode_id) WHERE episode_id != '';
 ```
 
 Written by `stemma-server` on every non-empty query, in `Resolver::trace_for`
-— so both `Resolve` and `Explain` are recorded, and a query that came in
+— so `Resolve`, `Explain`, and `Parse` are recorded, and a query that came in
 through the MCP tool is recorded exactly once even though the MCP layer calls
 `Explain` and then derives its digest locally.
 
-`source` and `session` come straight from `ResolveOptions` and are the v3
-addition. `source` is a free-text provenance tag the caller sets
+`source` and `session` come straight from `ResolveOptions`. `source` is a
+free-text provenance tag the caller sets
 (`"console"`, `"agent"`, `"mcp"`); `session` is a conversation or agent
 session id. They exist so that history is attributable: "what did this agent
 session actually ask" is a question you answer with a `WHERE session = ?`,
 not by correlating timestamps. Empty strings are the honest default for
 callers that pass no options — the columns are `NOT NULL DEFAULT ''` rather
 than nullable so that grouping never has to special-case `NULL`.
+
+The episode columns are the provenance anchor for explicit feedback.
+`episode_id` is an opaque random identifier. `episode_kind` distinguishes
+Resolve, Explain, and Parse. The two revision strings identify the ingested
+corpus receipts and vector registry. `evidence_json` retains candidate
+identities in presentation order plus clarification partitions. `parse_json`
+retains parse status, accepted output, and validation failures. These compact
+snapshots let feedback selectors remain meaningful without copying the full
+resolution trajectory.
+
+The revision receipt does not include the knowledge-graph compiler version or
+the contents of `kg_nodes` and `kg_edges`. A corpus change that is ingested
+changes the corpus receipt. Recompiling the graph against unchanged corpus
+receipts does not expire an episode. Graph-sensitive feedback export must
+therefore verify graph evidence again before deriving a fixture, preference, or
+training example.
 
 The write is deliberately best-effort:
 
@@ -379,12 +462,41 @@ The write is deliberately best-effort:
 let _ = db.conn().execute("INSERT INTO query_log …", …);
 ```
 
+If the insert fails, resolution still returns with an empty `episode_id`.
+Feedback submission then rejects the response because no verifiable episode
+exists.
+
 A live store from the legal corpus shows the shape:
 
 | source | rows |
 |---|---|
 | `console` | 9 |
 | `""` (grpcurl / the example binary) | 7 |
+
+### `grounding_feedback`
+
+```sql
+CREATE TABLE IF NOT EXISTS grounding_feedback (
+    id                   INTEGER PRIMARY KEY,
+    query_id             INTEGER NOT NULL REFERENCES query_log(id) ON DELETE CASCADE,
+    category             TEXT NOT NULL,
+    scope                TEXT NOT NULL,
+    span_id              INTEGER,
+    candidate_index      INTEGER,
+    clarification_option INTEGER,
+    correction           TEXT NOT NULL DEFAULT '',
+    recorded_at          TEXT NOT NULL DEFAULT (datetime('now'))
+) STRICT;
+CREATE INDEX IF NOT EXISTS grounding_feedback_query
+    ON grounding_feedback(query_id, id);
+```
+
+Each row is one deliberate user judgment about the episode referenced by
+`query_id`. Candidate and clarification indices address the recorded
+`evidence_json` order. The server validates the selectors and indexed-corpus
+and vector-registry revisions before insertion. Events can be listed and
+permanently deleted through the public service. Deleting a query-history row
+cascades to its feedback.
 
 ### `chat_log`
 
@@ -429,7 +541,7 @@ store deletes the history with the rest of the derived state.
 ## Migration discipline
 
 The store schema version lives in `PRAGMA user_version`, exposed as
-`stemmadb::STORE_SCHEMA_VERSION` (currently **5**). `init_store_schema()`
+`stemmadb::STORE_SCHEMA_VERSION` (currently **7**). `init_store_schema()`
 implements the whole policy in a few lines:
 
 ```rust
@@ -446,6 +558,8 @@ if found < STORE_SCHEMA_VERSION {
     if /* embed_queue exists without content_hash */ {
         /* guarded ALTER (v5: content_hash, additive) */
     }
+    /* SCHEMA_SQL creates grounding_feedback (v6),
+       vector_generations, and vector_sidecar_receipts (v7). */
     conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
 }
 ```
@@ -467,7 +581,8 @@ The rules:
    store never had `query_log` at all, so `SCHEMA_SQL` creates it already
    carrying the new columns and the `ALTER` must not run. The other guard
    flavor is *shape*: the additive `model_registry` columns
-   (`query_template`, `card_format`) and v5's `embed_queue.content_hash`
+   (`query_template`, `card_format`), v5's `embed_queue.content_hash`, and
+   v6's query-episode columns
    are applied by probing `pragma_table_info` and `ALTER`ing only when the
    column is missing — exact across every upgrade path (a fresh store gets
    the column from `SCHEMA_SQL`, an old store gets the `ALTER`, a pre-v4
@@ -913,7 +1028,8 @@ not reflected here.
 
 ## Evidence and trace model
 
-Two RPCs, two levels of detail, one underlying `Trace`.
+`Resolve` and `Explain` project two levels of detail from one underlying
+`Trace`. `Parse` consumes the same trace.
 
 ### `Trace` — the internal artifact
 
@@ -925,15 +1041,18 @@ pub struct Trace {
     pub tokens: Vec<Token>,      // text, byte start/end, stopword
     pub spans: Vec<Span>,        // EVERY span enumerated, including skipped
     pub mentions: Vec<usize>,    // indices into spans, in query order
+    pub clarification: Option<Clarification>,
     pub elapsed_ms: f64,
 }
 ```
 
 Each `Span` carries its `status` (`selected` | `overlapped` | `no_candidates`
 | `weak` | `skipped`), whether it matched a knowledge-graph entity
-(`kg_alias`), and every `Candidate` gathered for it — selected and rejected
-alike. Each `Candidate` carries `(table, column, rowid, value,
-value_truncated, score, channels, selected, reject_reason, is_doc, snippet)`.
+(`kg_alias`), ambiguity and reach-divergence fields, and every `Candidate`
+gathered for it. Selected and rejected candidates remain together. Each
+`Candidate` carries record identity, value, score, channel evidence, selection
+state, rejection reason, document fields, coherence, interpretation counts,
+sample rowids, and reach.
 It is `serde::Serialize`, which is what makes
 [`examples/trace_dump.rs`](../../crates/stemma-resolve/examples/trace_dump.rs)
 a two-line program.
@@ -953,7 +1072,9 @@ candidates:
 ```protobuf
 message ResolveResponse {
   repeated Mention mentions = 1;
-  string rewritten_query = 2;   // empty until substitution is implemented
+  ResolutionOutcome outcome = 2;
+  Clarification clarification = 3;
+  string episode_id = 4;
 }
 
 message Mention {
@@ -981,14 +1102,10 @@ Byte offsets, not character offsets, and they are asserted round-trippable:
 `query[m.start..m.end] == m.text` for every mention.
 
 `nil` distinguishes *"the pipeline concluded nothing matches"* from *"nothing
-was found"* — the explicit-NIL discipline from the entity-linking literature.
-It is a field in the wire format and always `false` today, because the stage
-that would set it affirmatively (LM adjudication) is unbuilt.
-
-`rewritten_query` is the designed substitution artifact — the query with
-mentions replaced by canonical values, ready to feed a downstream generator.
-It is always empty today. See
-[05-encoders-decoders.md](05-encoders-decoders.md#the-rewritten_query-artifact).
+was found"*. A no-record adjudication emits `nil = true`. `outcome` summarizes
+the query as resolved, ambiguous, or unknown under current trace evidence.
+`clarification` partitions candidates for one ambiguous span. `episode_id`
+links later explicit feedback to the compact evidence snapshot.
 
 ### `Evidence` — why a candidate is believed
 
@@ -1004,26 +1121,26 @@ message Evidence {
 }
 ```
 
-Every candidate carries at least one; a test enforces it. The five variants
-map one-to-one onto the five ways stemma can come to believe something, and
-the union is closed deliberately — a candidate whose support cannot be
-expressed as one of these five is a candidate the system should not be
-returning.
+Every candidate carries at least one evidence value; a test enforces that
+invariant. The protocol reserves distinct variants for lexical, semantic,
+graph-path, database-probe, and adjudication evidence.
 
 **Only `LexicalMatch` is produced today**, one per channel that fired, with
-`channel ∈ {exact, bm25, trigram, dense, kg, context}`. Three of those are
-not lexical at all: `kg` records the knowledge-coherence bonus, `dense`
-records a vec0 KNN hit whose `score` is a cosine similarity, and `context`
-records the query-conditioned interpretation-card cosine that separates tied
-value interpretations. All ride in
+`channel ∈ {exact, bm25, trigram, dense, dense_approximate, kg, context}`.
+Several are not lexical. `kg` records the knowledge-coherence bonus. `dense`
+and `dense_approximate` carry exact and approximate vector provenance,
+respectively, with authoritative cosine scores. `context` records the
+query-conditioned interpretation-card cosine that separates tied value
+interpretations. All ride in
 `LexicalMatch` because `trace_to_proto` maps every `ChannelScore` through the
 same constructor. **`dense` hits should be emitting `SemanticMatch`** — the
 message exists, carries exactly the right fields (`model`, `similarity`), and
 would let a consumer tell a cosine from a BM25 score without string-matching
 the channel name. That is a wire-format gap, listed in
-[03-resolution.md](03-resolution.md#known-limitations). `ProbeResult` waits on
-verification probes and `Adjudication` on the LM band; the richer `KgPath`
-evidence belongs to collective disambiguation.
+[03-resolution.md](03-resolution.md#known-limitations). The internal trace
+already records collective-coherence paths, probe-derived reach, and
+adjudication marks. The structured `ProbeResult`, `KgPath`, and `Adjudication`
+protocol variants remain unimplemented projections.
 
 `LexicalMatch.matched_text` is the document snippet when there is one and the
 stored value otherwise — the point being that evidence should show *what
@@ -1047,14 +1164,19 @@ flagged `value_truncated` — transport economy, with the full value always one
 | Field | Status |
 |---|---|
 | `Candidate.{table, column, rowid, value, score, is_doc, snippet}` | live |
-| `Candidate.evidence[].lexical` | live (`exact`/`bm25`/`trigram`/`dense`/`kg`/`context`) |
+| `Candidate.evidence[].lexical` | live (`exact`/`bm25`/`trigram`/`dense`/`dense_approximate`/`kg`/`context`) |
 | `Candidate.evidence[].semantic` | declared, never emitted — **dense hits use `lexical` instead** |
 | `Candidate.evidence[].{kg_path, probe, adjudication}` | declared, never emitted |
-| `Mention.nil` | declared, always `false` |
-| `ResolveResponse.rewritten_query` | declared, always `""` |
+| `Mention.nil` | live — emitted after an affirmative no-record adjudication |
+| `ResolveResponse.episode_id`, `ExplainResponse.episode_id` | live — opaque feedback provenance when episode persistence succeeds |
 | `ResolveOptions.{source, session}` | live — written to `query_log` |
-| `ResolveOptions.{max_candidates_per_mention, allow_lm, min_confidence}` | declared, **accepted and ignored by the server** |
+| `ResolveOptions.allow_lm` | live — permits the bounded language-service bands |
+| `ResolveOptions.{max_candidates_per_mention, min_confidence}` | declared, accepted and ignored by the server |
+| `SubmitFeedback`, `ListFeedback`, `DeleteFeedback` | live — revision-checked event storage, inspection, and deletion |
+| `Parse` | live — bounded proposal followed by deterministic SQLite and grounding validation |
 | `model_registry` | live — `vec_dense` row written at promotion or first drain; `vec_interp` row at first interpretation drain |
+| `vector_generations` | live — incremented whenever promotion or queue drain changes a vector table |
+| `vector_sidecar_receipts` | live — binds an optional approximate document index to the current SQLite vector generation |
 | `vec_staging` → `vec_dense` | live (external staging, promoted at startup) |
 | `vec_interp` | live — interpretation cards, created and filled by the drain |
 | `embed_queue` | live — filled by `enqueue_missing_embeddings` + `enqueue_missing_interpretations`, drained through the `Embedder` at server startup |

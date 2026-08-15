@@ -1,10 +1,8 @@
 # stemma console
 
-The optional web UI: navigate the data, the metadata and knowledge graph,
-query the store, and — the centerpiece — watch the full resolution
-trajectory: how each span of a natural-language query was considered, which
-retrieval channels fired, and every candidate record, chosen and near-miss
-alike.
+The optional web UI supports data, metadata, graph, and store queries. Its main
+view renders the complete resolution trajectory. The trajectory shows every
+considered span, retrieval channel, selected candidate, and near-miss.
 
 Entirely optional: a separate process; nothing in the core depends on it.
 
@@ -30,12 +28,14 @@ gRPC.
   the database's own knowledge graph. *sql*: read-only console over `main`
   (the store) + `src` (the user DB) — every query ships with its
   EXPLAIN QUERY PLAN tree (full scans flagged in caution).
-- **chat** — a right-hand rail beside the work, not a page of its own: any
-  OpenAI-compatible model (`--lm-endpoint http://host:port/v1 --lm-model
-  <name>`, bearer via `LM_API_KEY`) is given resolve/sql/schema as tools and
-  must pin every mention through stemma before querying. tool calls render
-  collapsibly in the rail, and each resolution's trajectory opens in the main
-  query view — chat drives the visual.
+- **chat** — a right-hand rail beside the work. Any compatible language
+  service configured through `console.lm` is given
+  resolve/sql/schema as tools and must pin every mention through stemma before
+  querying. Tool calls render collapsibly in the rail. Each resolution appears
+  in situ as a compact reasoning trajectory and can open in the main query
+  view. Whole-episode approval and rejection controls sit directly under the
+  trajectory, preserving the connection between a judgment and the evidence a
+  person saw.
 - **data** — table browser with keyset pagination (no OFFSET degradation on
   big tables) and a substring filter served by the store's trigram index.
 - **graph** — the compiled knowledge graph: schema layer, discovered
@@ -47,13 +47,17 @@ gRPC.
 
 ## Design
 
-Follows the zicato design language: sixteen terminal-derived themes over
-fixed semantic role tokens (default `paper`) and the twelve-face typeface
-picker (technical / editorial / display groups, default T9, with the s/m/l
-text-size control), both in the top bar with the family's swatch-strip and
-true-specimen presentation; sans for prose and controls with mono reserved for data, hairline
-borders instead of shadows, one accent color earned by structure. All tokens live in
-`static/ui.css`; no hex anywhere else.
+The console follows the zicato design language. Sixteen terminal-derived themes
+map through fixed semantic role tokens and default to `paper`. The top bar also
+offers twelve typefaces in technical, editorial, and display groups, plus three
+text sizes. Prose and controls use sans faces; data uses monospace. Hairline
+borders replace shadows, and structure earns the single accent color. All theme
+tokens live in `static/ui.css`; other files contain no color literals.
+
+Feedback controls reuse the trajectory card, border, type scale, and semantic
+status tokens. They do not introduce a detached review dashboard. Candidate
+selection and graph-and-geometry ambiguity annotations remain designed work;
+the current console records approval or rejection for the whole episode.
 
 ## Development
 

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+usearch-sidecar = ["dep:usearch"]
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -15,6 +18,7 @@ stemma-proto = { version = "0.1.0", path = "../stemma-proto" }
 stemmadb = { version = "0.1.0", path = "../stemmadb" }
 thiserror = "2.0.19"
 tracing = "0.1.44"
+usearch = { version = "2.26.0", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.151"

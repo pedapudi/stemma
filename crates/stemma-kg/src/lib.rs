@@ -938,7 +938,10 @@ fn compute_centrality(db: &StemmaDb) -> Result<()> {
     for (i, &id) in ids.iter().enumerate() {
         conn.execute(
             "UPDATE kg_nodes SET props = json_set(props, '$.centrality', ?1) WHERE id = ?2",
-            stemmadb::rusqlite::params![format!("{:.5}", rank[i]).parse::<f64>().unwrap_or(0.0), id],
+            stemmadb::rusqlite::params![
+                format!("{:.5}", rank[i]).parse::<f64>().unwrap_or(0.0),
+                id
+            ],
         )?;
     }
     Ok(())
@@ -1006,9 +1009,9 @@ fn compile_phrase_entities(
         .map(|(p, &n)| (p.clone(), n))
         .collect();
     phrases.retain(|(p, n)| {
-        !counts.iter().any(|(longer, &ln)| {
-            longer != p && longer.starts_with(p.as_str()) && ln * 2 >= *n
-        })
+        !counts
+            .iter()
+            .any(|(longer, &ln)| longer != p && longer.starts_with(p.as_str()) && ln * 2 >= *n)
     });
     phrases.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -1018,7 +1021,10 @@ fn compile_phrase_entities(
             key: key.clone(),
             kind: KIND_TERM.into(),
             label: phrase,
-            props: format!("{{\"count\":{n},\"phrase\":true,\"sampled\":{}}}", docs.len()),
+            props: format!(
+                "{{\"count\":{n},\"phrase\":true,\"sampled\":{}}}",
+                docs.len()
+            ),
         })?;
         store.upsert_edge(&Edge {
             src_key: format!("table:{table}"),
@@ -1137,7 +1143,7 @@ fn compile_inferred_joins(
 
     // Candidate key columns: single-column INTEGER PKs.
     let mut keys: Vec<(String, String)> = Vec::new(); // (table, pk column)
-    // Candidate referencing columns: INTEGER, not the table's own pk.
+                                                      // Candidate referencing columns: INTEGER, not the table's own pk.
     let mut refs: Vec<(String, String)> = Vec::new();
     // Declared FK pairs to skip (already in the schema layer).
     let mut declared: Vec<(String, String)> = Vec::new(); // (from table.col, to table)
@@ -1325,7 +1331,8 @@ mod tests {
                     "whereof the {theme} whereof provisions apply {theme} whereof. {}",
                     "Additional procedural language follows to reach document length                      comfortably past the classification threshold for documents."
                 );
-                c.execute("INSERT INTO docs(body) VALUES (?1)", [body]).unwrap();
+                c.execute("INSERT INTO docs(body) VALUES (?1)", [body])
+                    .unwrap();
             }
         }
         let db = StemmaDb::open(&storef, &user).unwrap();
@@ -1498,8 +1505,14 @@ mod tests {
             .iter()
             .any(|p| p.len() == 2 && p.iter().all(|h| h.src_table == "team_members")));
         // The hop bound and the trivial cases hold.
-        assert!(store.table_paths("people", "teams", 0, 8).unwrap().is_empty());
-        assert!(store.table_paths("people", "people", 2, 8).unwrap().is_empty());
+        assert!(store
+            .table_paths("people", "teams", 0, 8)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .table_paths("people", "people", 2, 8)
+            .unwrap()
+            .is_empty());
         assert_eq!(store.table_paths("people", "teams", 2, 1).unwrap().len(), 1);
     }
 

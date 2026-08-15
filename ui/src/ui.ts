@@ -51,6 +51,7 @@ interface TraceSpan {
 }
 
 interface Trace {
+  episode_id: string;
   query: string;
   elapsed_ms: number;
   tokens: TraceToken[];
@@ -1423,6 +1424,7 @@ function renderTrace(out: HTMLElement, trace: Trace): void {
     el("div", { class: "sql-caption" },
       `resolved in ${trace.elapsed_ms.toFixed(1)} ms · ${trace.spans.length} spans enumerated · channels: exact, bm25, trigram, dense, kg`),
     lineage,
+    feedbackControls(trace),
     modeBar,
     panels.anatomy.node,
     panels.space.node,
@@ -1479,7 +1481,55 @@ function renderMiniTrace(trace: Trace): HTMLElement {
   if (!mentionSpans.length) {
     box.append(el("div", { class: "empty" }, "— nothing resolved"));
   }
+  box.append(feedbackControls(trace));
   return box;
+}
+
+/* Explicit feedback stays attached to the reasoning trajectory that the user
+ * judged. The service validates this opaque episode id against its recorded
+ * candidate order and active evidence revisions. */
+function feedbackControls(trace: Trace): HTMLElement {
+  const database = state.db;
+  const status = el("span", { class: "feedback-status", "aria-live": "polite" });
+  const row = el("div", { class: "feedback-row" },
+    el("span", { class: "feedback-label" }, "was this grounding right?"));
+  if (!trace.episode_id || !database) {
+    row.append(el("span", { class: "feedback-status" }, "feedback unavailable"));
+    return row;
+  }
+  const send = async (category: "approved" | "rejected"): Promise<void> => {
+    row.querySelectorAll("button").forEach((button) => button.setAttribute("disabled", ""));
+    status.textContent = "saving…";
+    try {
+      const response = await fetch(`/api/db/${encodeURIComponent(database)}/feedback`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ episode_id: trace.episode_id, category }),
+      });
+      const body = await response.json() as { detail?: string };
+      if (!response.ok) throw new Error(body.detail ?? response.statusText);
+      status.textContent = category;
+    } catch (error) {
+      row.querySelectorAll("button").forEach((button) => button.removeAttribute("disabled"));
+      status.textContent = (error as Error).message;
+    }
+  };
+  row.append(
+    el("button", {
+      class: "feedback-button",
+      title: "approve this grounding",
+      "aria-label": "approve this grounding",
+      onclick: () => send("approved"),
+    }, "↑"),
+    el("button", {
+      class: "feedback-button",
+      title: "reject this grounding",
+      "aria-label": "reject this grounding",
+      onclick: () => send("rejected"),
+    }, "↓"),
+    status,
+  );
+  return row;
 }
 
 /* ---------- the chat rail ----------

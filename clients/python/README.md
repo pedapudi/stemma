@@ -13,6 +13,11 @@ from stemmadb import StemmaClient, StoreBrowser
 with StemmaClient("127.0.0.1:50051") as c:
     resp = c.resolve("the Q3 numbers for the Seattle office", database="mini")
     trace = c.explain_dict("what did Chen's team ship", database="mini")
+    parsed = c.parse("show the Seattle office reports", database="mini")
+    event = c.submit_feedback(
+        "mini", resp.episode_id, "approved", scope="database")
+    feedback = c.list_feedback("mini", episode_id=resp.episode_id)
+    c.delete_feedback("mini", event.id)
 
 # browsing straight off the SQLite files, read-only — no server needed
 b = StoreBrowser("/tmp/mini.db")
@@ -23,9 +28,12 @@ b.store_meta()      # inside the .stemmadb: lexical index, model registry, queue
 b.query("SELECT ... ")  # read-only SQL over store (main) + user DB (src)
 ```
 
-`StemmaClient.explain*` returns the full resolution trajectory — every span
+`StemmaClient.explain*` returns the full resolution trajectory: every span
 considered, every candidate with per-channel scores, and why each near-miss
-lost. `StoreBrowser` opens everything with `mode=ro`; it cannot write.
+lost. `parse` returns parameterized SQL only after resolution and deterministic
+validation. Feedback methods attach typed judgments to the recorded
+`episode_id`; see the [feedback guide](../../docs/user-guide/06-feedback.md).
+`StoreBrowser` opens everything with `mode=ro`; it cannot write.
 
 Generated gRPC stubs are checked in under `stemmadb/_proto`; regenerate with
 `clients/python/gen_protos.sh` after proto changes (requires grpcio-tools).

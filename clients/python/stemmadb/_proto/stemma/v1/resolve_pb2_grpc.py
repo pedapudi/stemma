@@ -49,6 +49,21 @@ class ResolveServiceStub:
                 request_serializer=stemma_dot_v1_dot_resolve__pb2.ParseRequest.SerializeToString,
                 response_deserializer=stemma_dot_v1_dot_resolve__pb2.ParseResponse.FromString,
                 _registered_method=True)
+        self.SubmitFeedback = channel.unary_unary(
+                '/stemma.v1.ResolveService/SubmitFeedback',
+                request_serializer=stemma_dot_v1_dot_resolve__pb2.FeedbackRequest.SerializeToString,
+                response_deserializer=stemma_dot_v1_dot_resolve__pb2.Feedback.FromString,
+                _registered_method=True)
+        self.ListFeedback = channel.unary_unary(
+                '/stemma.v1.ResolveService/ListFeedback',
+                request_serializer=stemma_dot_v1_dot_resolve__pb2.ListFeedbackRequest.SerializeToString,
+                response_deserializer=stemma_dot_v1_dot_resolve__pb2.FeedbackList.FromString,
+                _registered_method=True)
+        self.DeleteFeedback = channel.unary_unary(
+                '/stemma.v1.ResolveService/DeleteFeedback',
+                request_serializer=stemma_dot_v1_dot_resolve__pb2.DeleteFeedbackRequest.SerializeToString,
+                response_deserializer=stemma_dot_v1_dot_resolve__pb2.DeleteFeedbackResponse.FromString,
+                _registered_method=True)
 
 
 class ResolveServiceServicer:
@@ -79,6 +94,27 @@ class ResolveServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SubmitFeedback(self, request, context):
+        """Record an explicit judgment about one exact resolution or parse episode.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListFeedback(self, request, context):
+        """Retrieve explicit judgments for inspection or deletion.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteFeedback(self, request, context):
+        """Permanently remove one explicit judgment.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ResolveServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -96,6 +132,21 @@ def add_ResolveServiceServicer_to_server(servicer, server):
                     servicer.Parse,
                     request_deserializer=stemma_dot_v1_dot_resolve__pb2.ParseRequest.FromString,
                     response_serializer=stemma_dot_v1_dot_resolve__pb2.ParseResponse.SerializeToString,
+            ),
+            'SubmitFeedback': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitFeedback,
+                    request_deserializer=stemma_dot_v1_dot_resolve__pb2.FeedbackRequest.FromString,
+                    response_serializer=stemma_dot_v1_dot_resolve__pb2.Feedback.SerializeToString,
+            ),
+            'ListFeedback': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListFeedback,
+                    request_deserializer=stemma_dot_v1_dot_resolve__pb2.ListFeedbackRequest.FromString,
+                    response_serializer=stemma_dot_v1_dot_resolve__pb2.FeedbackList.SerializeToString,
+            ),
+            'DeleteFeedback': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteFeedback,
+                    request_deserializer=stemma_dot_v1_dot_resolve__pb2.DeleteFeedbackRequest.FromString,
+                    response_serializer=stemma_dot_v1_dot_resolve__pb2.DeleteFeedbackResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -179,6 +230,87 @@ class ResolveService:
             '/stemma.v1.ResolveService/Parse',
             stemma_dot_v1_dot_resolve__pb2.ParseRequest.SerializeToString,
             stemma_dot_v1_dot_resolve__pb2.ParseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitFeedback(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/stemma.v1.ResolveService/SubmitFeedback',
+            stemma_dot_v1_dot_resolve__pb2.FeedbackRequest.SerializeToString,
+            stemma_dot_v1_dot_resolve__pb2.Feedback.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListFeedback(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/stemma.v1.ResolveService/ListFeedback',
+            stemma_dot_v1_dot_resolve__pb2.ListFeedbackRequest.SerializeToString,
+            stemma_dot_v1_dot_resolve__pb2.FeedbackList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteFeedback(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/stemma.v1.ResolveService/DeleteFeedback',
+            stemma_dot_v1_dot_resolve__pb2.DeleteFeedbackRequest.SerializeToString,
+            stemma_dot_v1_dot_resolve__pb2.DeleteFeedbackResponse.FromString,
             options,
             channel_credentials,
             insecure,

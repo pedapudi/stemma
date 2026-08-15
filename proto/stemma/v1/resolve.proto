@@ -19,6 +19,15 @@ service ResolveService {
 
   // Resolve the query and propose a validated, parameterized read-only query.
   rpc Parse(ParseRequest) returns (ParseResponse);
+
+  // Record an explicit judgment about one exact resolution or parse episode.
+  rpc SubmitFeedback(FeedbackRequest) returns (Feedback);
+
+  // Retrieve explicit judgments for inspection or deletion.
+  rpc ListFeedback(ListFeedbackRequest) returns (FeedbackList);
+
+  // Permanently remove one explicit judgment.
+  rpc DeleteFeedback(DeleteFeedbackRequest) returns (DeleteFeedbackResponse);
 }
 
 // ---------- Explain (full trajectory) ----------
@@ -35,6 +44,8 @@ message ExplainResponse {
   ResolutionOutcome outcome = 6;
   // The best deterministic question, when the outcome is ambiguous.
   Clarification clarification = 7;
+  // Opaque identity used to attach explicit feedback to this trajectory.
+  string episode_id = 8;
 }
 
 enum ResolutionStatus {
@@ -181,6 +192,71 @@ message ResolveResponse {
   repeated Mention mentions = 1;
   ResolutionOutcome outcome = 2;
   Clarification clarification = 3;
+  // Opaque identity used to attach explicit feedback to this resolution.
+  string episode_id = 4;
+}
+
+// ---------- Feedback (explicit user judgment) ----------
+
+enum FeedbackCategory {
+  FEEDBACK_CATEGORY_UNSPECIFIED = 0;
+  FEEDBACK_CATEGORY_APPROVED = 1;
+  FEEDBACK_CATEGORY_REJECTED = 2;
+  FEEDBACK_CATEGORY_WRONG_MEANING = 3;
+  FEEDBACK_CATEGORY_MISSING_INTERPRETATION = 4;
+  FEEDBACK_CATEGORY_WRONG_QUERY_OPERATION = 5;
+  FEEDBACK_CATEGORY_WRONG_ROWS = 6;
+}
+
+enum FeedbackScope {
+  FEEDBACK_SCOPE_UNSPECIFIED = 0;
+  FEEDBACK_SCOPE_SESSION = 1;
+  FEEDBACK_SCOPE_DATABASE = 2;
+}
+
+message FeedbackRequest {
+  string database = 1;
+  string episode_id = 2;
+  FeedbackCategory category = 3;
+  FeedbackScope scope = 4;
+  optional uint32 span_id = 5;
+  // Candidate position within the recorded span, when the user selects a
+  // concrete reading.
+  optional uint32 candidate_index = 6;
+  // Option position within the recorded clarification question.
+  optional uint32 clarification_option = 7;
+  // User-supplied meaning or correction when the offered choices are wrong.
+  string correction = 8;
+}
+
+message Feedback {
+  uint64 id = 1;
+  string episode_id = 2;
+  FeedbackCategory category = 3;
+  FeedbackScope scope = 4;
+  optional uint32 span_id = 5;
+  optional uint32 candidate_index = 6;
+  optional uint32 clarification_option = 7;
+  string correction = 8;
+  string recorded_at = 9;
+}
+
+message ListFeedbackRequest {
+  string database = 1;
+  optional string episode_id = 2;
+}
+
+message FeedbackList {
+  repeated Feedback feedback = 1;
+}
+
+message DeleteFeedbackRequest {
+  string database = 1;
+  uint64 feedback_id = 2;
+}
+
+message DeleteFeedbackResponse {
+  bool deleted = 1;
 }
 
 // A span of the query believed to reference something in the database.
@@ -263,7 +339,7 @@ message Candidate {
   string column = 3;
   // The canonical stored value that matched.
   string value = 4;
-  // Calibrated confidence in [0, 1].
+  // Heuristic fused ranking score in [0, 1].
   double score = 5;
   repeated Evidence evidence = 6;
   // For document-shaped values: a match snippet with ⟨⟩ marking hit terms.

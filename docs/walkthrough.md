@@ -97,14 +97,11 @@ The sidecar is a normal SQLite database — inspect it like one:
 sqlite3 eval/mini/data/mini.stemmadb "PRAGMA user_version; .tables"
 ```
 
-```
-1
-embed_queue     model_registry
-```
-
-Version-stamped schema, the embedding queue, and the model registry —
-currently empty, populated by ingest (milestone 2+). Deleting this file is
-always safe; it is entirely derived state.
+`PRAGMA user_version` prints `7`. The version-stamped store contains derived
+indexes and bookkeeping alongside
+`query_log`, `chat_log`, and `grounding_feedback`. The indexes can be rebuilt.
+History and feedback cannot, so preserve them according to the deployment's
+retention policy before replacing the store.
 
 Meanwhile the user database was attached read-only the whole time — the server
 physically cannot write to it.

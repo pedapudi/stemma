@@ -453,6 +453,98 @@ length-penalized against an empty value.
 **Phase 3** fuses the union of lexical and dense hits per span, applies the
 knowledge-graph coherence bonus, and refines span status.
 
+### Optional approximate vector sidecar
+
+Status: built behind the `usearch-sidecar` Cargo feature. Exact retrieval
+remains the default. Native Bazel sidecar support is open.
+
+Exact `vec0` search is the correctness oracle for the dense channel. The
+optional USearch sidecar accelerates document-candidate generation for larger
+eligible scopes. It does not hold authoritative vectors or alter the meaning
+of a dense score. `DenseSearch` keeps both paths behind one focused interface:
+`exact()` and `usearch(root)` choose the backend, `rebuild` creates a sidecar,
+`search` uses the selected backend, and `search_exact` reaches the oracle. The
+underlying graph-index family is described by [Malkov 2020].
+
+The `server.dense_search` setting accepts `exact` or `usearch` and defaults to
+`exact`. The `usearch` value requires a server built with the
+`usearch-sidecar` Cargo feature; an unsupported build rejects it at startup.
+Approximate mode uses a separate sidecar directory for each registered database.
+It activates only after validating the SQLite receipt, source-corpus
+fingerprint, vector-space revision, vector-generation token, vector count,
+dimension, metric, and file checksum. A missing, stale, corrupt, or incompatible
+generation emits a visible degradation event and uses exact SQLite search.
+Resolution remains available.
+
+Approximate search over-fetches identity keys from the same eligible document
+scope used by exact search. The server maps those keys to SQLite rows, loads
+the authoritative vectors, computes exact distances, applies deterministic tie
+breaking, and then performs the existing interpretation collapse and channel
+limit. An identity that no longer maps to SQLite is discarded.
+
+Approximate trace hits use the `dense_approximate` channel so evidence retains
+its provenance. Every span whose approximate evidence could produce a mention
+is rerun through exact SQLite search before fusion. Final mention selection
+therefore depends on exact dense candidates. An approximate margin cannot
+establish that an omitted interpretation is absent, and an approximate miss
+cannot create a resolved outcome solely by widening that margin.
+
+The first approximate scope contains document vectors only. Interpretation
+vectors continue through exact search. Lexical retrieval, graph evidence,
+database probes, scoring, and outcome construction keep their current
+authoritative sources.
+
+#### Shadow measurement and deployment gates
+
+Shadow validation sends sampled live query vectors through approximate and
+exact retrieval over the same scope. It records:
+
+- exact top-set candidate recall;
+- leading-candidate agreement;
+- missed ambiguity, where exact search retains a competitor that approximate
+  search omits;
+- false wide margins created by an approximate omission; and
+- resolution outcome changes after the exact safeguard.
+
+These comparisons need no semantic label because exact retrieval supplies the
+reference candidate set. They measure fidelity to the current dense channel.
+They do not measure end-to-end grounding accuracy.
+
+The implemented
+[`dense_shadow_compare.py`](../../tools/dense_shadow_compare.py) tool computes
+these metrics from paired JSON Lines exports and reports latency summaries. Its
+input binds each observation to corpus, vector, sidecar, query-vector, and
+eligible-scope fingerprints. Runtime export of those paired observations
+remains designed. The complete file contract and commands are in
+[`tools/dense_shadow_compare.md`](../../tools/dense_shadow_compare.md).
+
+An operator should evaluate the sidecar when a frequently searched scope is
+near 100,000 vectors and exact scans materially affect latency. Deployment
+requires release-mode measurements at several corpus sizes and dimensions.
+Candidate and latency budgets, ambiguity-preservation thresholds, the sampling
+window, and the eligible scopes must be declared before the comparison. The
+sidecar becomes eligible for normal traffic only when it improves the target
+latency percentile and passes every fidelity gate. The sampled release record
+requires zero missed ambiguity and zero guarded outcome changes. A false wide
+margin is acceptable only when the exact safeguard preserves the final outcome.
+A failed or inconclusive run keeps exact retrieval active. Reporting recall and
+query performance together follows the reproducible comparison discipline of
+[Aumüller 2020].
+
+Operational recovery is rebuild, validate, and reactivate. Copying a file from
+another store, editing its receipt, or bypassing checksum validation is unsafe
+because vector coordinates and identity keys are generation-specific. A larger
+external vector store remains a separate design decision if an embedded index
+cannot meet measured scale or filtering requirements.
+
+When a rebuild is required, the implementation rebuilds the whole document
+index; it has no incremental sidecar update. Checksum-named files from older
+generations are not removed automatically. Exact confirmation limits the
+acceleration available to mention-producing spans by design. The 64-bit
+checksum detects accidental corruption and is not an authenticity mechanism.
+Release measurements and runtime paired-export automation remain outstanding.
+The Bazel build does not yet compile the native sidecar dependency.
+
 ## Stage 5 — reciprocal rank fusion
 
 Hits from all channels are grouped by `(src_table, src_column, rowid)`, where
@@ -1085,8 +1177,9 @@ whose first four graph neighbours are its own tokens gets no coherence signal
 at all even when useful neighbours exist.
 
 **Dense hits are reported as `LexicalMatch`.** `trace_to_proto` maps every
-channel score through the same constructor, so a vec0 cosine arrives over the
-wire tagged as a lexical match with `channel = "dense"`. The `SemanticMatch`
+channel score through the same constructor, so a vector cosine arrives over the
+wire tagged as a lexical match with `channel = "dense"` or
+`"dense_approximate"`. The `SemanticMatch`
 message exists and has the right fields (`model`, `similarity`); nothing
 emits it. A consumer must string-match the channel name to know it is looking
 at a similarity rather than a BM25 score, and the model identity is not on
@@ -1102,12 +1195,13 @@ the same person appears twice and consumes two of the five `TOP_K` slots.
 Merging across columns needs the designed instance layer's per-record
 entities.
 
-**Scores are not calibrated.** `Candidate.score` is documented in the proto
-as *"Calibrated confidence in [0, 1]"*. It is a fused heuristic in [0, 1]
-with sensible ordering properties; it is not a probability, and 0.567 does
-not mean "57% likely correct". `SELECT_THRESHOLD = 0.35` is a tuned
-constant, not a calibrated operating point. Calibration needs the evaluation
-harness of [06-evaluation.md](06-evaluation.md) closed against labelled data.
+**Scores are heuristic rankings.** `Candidate.score` is a fused value in
+[0, 1] with useful ordering properties. It is not a probability, and 0.567
+does not mean "57% likely correct". `SELECT_THRESHOLD = 0.35` is a tuned
+constant. The evaluation report shows observed gold-link rate by score bucket
+for each evaluated population; it does not convert the threshold into a
+probabilistic operating point. See
+[06-evaluation.md](06-evaluation.md#ambiguity-evaluation-without-representative-calibration).
 
 **Corpus-wide document frequencies.** The knowledge compiler's term
 statistics come from `fts5vocab`, which cannot partition by source table, so
@@ -1115,29 +1209,27 @@ in a multi-table store the document-frequency ceiling that filters corpus
 stopwords is computed against the whole index. Documented in the compiler;
 exact for the common single-document-table case.
 
-**`ResolveOptions` are ignored.** `max_candidates_per_mention`, `allow_lm`
-and `min_confidence` are accepted by the server and have no effect;
-`TOP_K` and `SELECT_THRESHOLD` are compile-time constants. Only `source` and
-`session` are honoured.
+**Two `ResolveOptions` are ignored.** `max_candidates_per_mention` and
+`min_confidence` are accepted but have no effect; `TOP_K` and
+`SELECT_THRESHOLD` are compile-time constants. `allow_lm` gates the optional
+language-service bands. `source` and `session` are persisted with the episode.
 
 **Resolution is serialized per database.** `stemma-server` holds
 `Mutex<StemmaDb>` per registered database because `rusqlite::Connection` is
 not `Sync`. Concurrent requests to the same database queue behind each other
-— and now they queue behind a synchronous HTTP call to the embedding endpoint
-as well, since `OpenAiEmbedder::embed` is blocking `ureq` with a 60-second
-timeout called from inside the lock. The Python client's default timeout was
-raised from 10 s to 30 s to accommodate this.
+— and now they queue behind a synchronous call to the configured embedding
+service as well. The remote client uses blocking I/O with a 60-second timeout
+inside the lock. The Python client allows 30 seconds by default.
 
 **Fusion constants were not re-derived for four channels.** Documented above
 under [reachable score bands](#reachable-score-bands): the `3/K` normalizer
 is unchanged, so the document ceiling moved from 0.567 to 0.85 and a
 non-exact value can now reach 1.0.
 
-**One dense table per store.** `vec_dense` is a single fixed table name with
-a single `model_registry` row, so a store holds one vector generation for one
-`(table, column)` pair at a time. Comparing two encoder checkpoints means
-re-staging and restarting, not querying both — which is safe (spaces are
-never mixed) but is not the side-by-side A/B the registry design allows for.
+**One active document-vector space per store.** `vec_dense` has one fixed name
+and one `model_registry` row even when it contains documents from several
+source columns. Comparing two vector generations requires re-staging and
+restarting. The store cannot query them side by side.
 
 **Dense promotion happens only at server startup**, and staging must be
 written while the server is stopped. (Queue-fed vectors are different:
@@ -1148,11 +1240,17 @@ generation swap still means a restart.)
 
 ## References
 
+- [Aumüller 2020] Martin Aumüller, Erik Bernhardsson, Alexander Faithfull.
+  "ANN-Benchmarks: A Benchmarking Tool for Approximate Nearest Neighbor
+  Algorithms." *Information Systems* 87, 2020.
 - [Cormack 2009] Gordon V. Cormack, Charles L. A. Clarke, Stefan
   Buettcher. "Reciprocal Rank Fusion Outperforms Condorcet and Individual
   Rank Learning Methods." SIGIR 2009.
 - [Hoffart 2011] Johannes Hoffart et al. "Robust Disambiguation of
   Named Entities in Text." EMNLP 2011.
+- [Malkov 2020] Yu. A. Malkov, D. A. Yashunin. "Efficient and Robust
+  Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World
+  Graphs." *IEEE TPAMI* 42(4), 2020.
 - [Paulsen 2023] Derek Paulsen, Yash Govind, AnHai Doan. "Sparkly: A
   Simple yet Surprisingly Strong TF/IDF Blocker for Entity Matching."
   PVLDB 16(6), 2023.

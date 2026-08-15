@@ -31,11 +31,17 @@ Same job here. Many surface forms, one referent.
 
 ## Status
 
-Early. Nothing to install yet.
+The grounding pipeline, graph-assisted disambiguation, deterministic
+clarification, first validated read-only parser slice, trace-linked feedback,
+console, and evaluation harness are implemented. Complete SQLite coverage,
+multi-turn clarification, ambiguity evaluation, and usage-guided learning
+remain open. See the [query-level design](docs/design/08-query-disambiguation.md)
+for the exact boundary.
 
 ## Documentation
 
-- [docs/](docs/README.md) — user guide (setup, concepts, server, corpora),
+- [docs/](docs/README.md) — user guide (setup, concepts, server, corpora,
+  feedback),
   a verified [walkthrough](docs/walkthrough.md), and the
   [architecture](docs/architecture.md) with the literature review behind it
 - [crates/stemmadb/README.md](crates/stemmadb/README.md) — the storage layer
@@ -47,12 +53,13 @@ Early. Nothing to install yet.
 The design and the literature behind it are in
 [docs/architecture.md](docs/architecture.md). In short: a grounding-first Rust
 semantic parser beside a stock SQLite database. The storage layer is **stemmadb**
-(`crates/stemmadb`): the user's database is attached read-only, and every
-derived artifact — lexical and vector indexes, the knowledge store, the embed
-queue, the model registry — lives in a sidecar `.stemmadb` file. Retrieval is
-hybrid (FTS5 BM25 + trigram + sqlite-vec) fused in SQL; embedders and LMs are
-pluggable backends behind traits, reached over gRPC and the OpenAI-compatible
-protocol respectively.
+(`crates/stemmadb`): the user's database is attached read-only. Lexical and
+vector indexes, the knowledge store, the embed queue, the model registry,
+history, and feedback live in a sidecar `.stemmadb` file. Retrieval combines
+FTS5 BM25, trigram matching, and sqlite-vec through SQL. A Cargo-featured,
+opt-in approximate document-vector sidecar accelerates candidate generation
+while exact SQLite search protects mention decisions. Embedding and language
+services are pluggable backends behind traits and configured endpoints.
 
 - `proto/` — the gRPC Resolve and Embedder APIs (source of truth; generated
   code is checked into `crates/stemma-proto/src/gen`, refreshed by

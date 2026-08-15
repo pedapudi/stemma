@@ -710,6 +710,18 @@ button.chip:hover { background: var(--rule-soft); color: var(--ink); }
 .mini-val, .mini-cand .snippet { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .mini-cand .meter { width: 46px; flex: none; }
 .mini-more { font-family: var(--mono); font-size: calc(9.5px * var(--fs)); color: var(--ink-faint); font-style: italic; }
+.feedback-row {
+  display: flex; align-items: center; gap: 5px; margin: 7px 0 3px;
+  font-family: var(--mono); font-size: calc(9.5px * var(--fs)); color: var(--ink-soft);
+}
+.feedback-label { margin-right: 2px; }
+.feedback-button {
+  width: 22px; height: 20px; padding: 0; border: 1px solid var(--rule);
+  border-radius: 4px; background: var(--panel); color: var(--ink-soft); cursor: pointer;
+}
+.feedback-button:hover { border-color: var(--accent); color: var(--accent); }
+.feedback-button:disabled { cursor: default; opacity: .45; }
+.feedback-status { color: var(--ink-faint); margin-left: 3px; }
 
 /* ============ knowledge map: typographic, pannable, zoomable ============ */
 .kg-viewport {

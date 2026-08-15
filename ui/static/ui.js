@@ -1671,7 +1671,7 @@ function renderTrace(out, trace) {
   }
   out.append(el("div", {
     class: "sql-caption"
-  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, dense, kg`), lineage, modeBar, panels.anatomy.node, panels.space.node, card, alsoBox);
+  }, `resolved in ${trace.elapsed_ms.toFixed(1)} ms \xB7 ${trace.spans.length} spans enumerated \xB7 channels: exact, bm25, trigram, dense, kg`), lineage, feedbackControls(trace), modeBar, panels.anatomy.node, panels.space.node, card, alsoBox);
 }
 var MAX_LAT_N = 4;
 function renderMiniTrace(trace) {
@@ -1729,7 +1729,60 @@ function renderMiniTrace(trace) {
       class: "empty"
     }, "\u2014 nothing resolved"));
   }
+  box.append(feedbackControls(trace));
   return box;
+}
+function feedbackControls(trace) {
+  const database = state.db;
+  const status = el("span", {
+    class: "feedback-status",
+    "aria-live": "polite"
+  });
+  const row = el("div", {
+    class: "feedback-row"
+  }, el("span", {
+    class: "feedback-label"
+  }, "was this grounding right?"));
+  if (!trace.episode_id || !database) {
+    row.append(el("span", {
+      class: "feedback-status"
+    }, "feedback unavailable"));
+    return row;
+  }
+  const send = async (category) => {
+    row.querySelectorAll("button").forEach((button) => button.setAttribute("disabled", ""));
+    status.textContent = "saving\u2026";
+    try {
+      const response = await fetch(`/api/db/${encodeURIComponent(database)}/feedback`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          episode_id: trace.episode_id,
+          category
+        })
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail ?? response.statusText);
+      status.textContent = category;
+    } catch (error) {
+      row.querySelectorAll("button").forEach((button) => button.removeAttribute("disabled"));
+      status.textContent = error.message;
+    }
+  };
+  row.append(el("button", {
+    class: "feedback-button",
+    title: "approve this grounding",
+    "aria-label": "approve this grounding",
+    onclick: () => send("approved")
+  }, "\u2191"), el("button", {
+    class: "feedback-button",
+    title: "reject this grounding",
+    "aria-label": "reject this grounding",
+    onclick: () => send("rejected")
+  }, "\u2193"), status);
+  return row;
 }
 var pendingTrace = null;
 function showTraceInMain(trace) {

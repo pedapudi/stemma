@@ -9,6 +9,8 @@ fn main() {
         .compile("sqlite_vec");
     println!(
         "cargo:rerun-if-changed={}",
-        repo_root.join("third_party/sqlite_vec/sqlite-vec.c").display()
+        repo_root
+            .join("third_party/sqlite_vec/sqlite-vec.c")
+            .display()
     );
 }

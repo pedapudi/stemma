@@ -28,11 +28,10 @@ The measurement that carries the argument is an ablation, not an error
 taxonomy. BIRD [J. Li 2023] ships human-written "evidence" hints alongside
 each question — hints that pre-solve exactly the linking step. Remove them and
 the loss is large and directly measured on the benchmark's own metric:
-execution accuracy collapses by more than 10 points (CodeS-7B 57.17 → 45.24,
-CodeS-3B 55.02 → 43.42) [Nan 2026], and a second study puts the cost at 8.35
-to 20.86 points across systems (RSL-SQL/GPT-4o 65.78 → 54.50, DAIL-SQL/GPT-4
-56.32 → 35.46), with automatically generated evidence recovering much of it
-[Yun 2025]. Tellingly, only 5 of 52 BIRD leaderboard methods report
+execution accuracy collapses by more than 10 points (57.17 → 45.24 and
+55.02 → 43.42) [Nan 2026]. A second study puts the cost at 8.35 to 20.86
+points across systems (65.78 → 54.50 and 56.32 → 35.46), with automatically
+generated evidence recovering much of it [Yun 2025]. Only 5 of 52 BIRD methods report
 no-evidence numbers at all [Nan 2026]. Spider 2.0's enterprise databases,
 often exceeding a thousand columns, make the linking step harder still
 [Lei 2025].
@@ -72,20 +71,16 @@ requirements produce the trace model, the candidate-set output, and the
 
 ## System decomposition
 
-Nine Rust crates, one Python client, two integrations, one optional UI.
+Ten Rust crates, one Python client, two integrations, one optional UI.
 
 ```
-                         stemma-server
-                    (gRPC front door, one process)
-                    ┌────────┬────────┬─────────┐
-                    ▼        ▼        ▼         ▼
-            stemma-resolve  stemma-kg  stemma-ingest  stemma-proto
-                    │        │        │              ▲
-                    ├────────┴────────┤              │
-                    ▼                 ▼              │
-                 stemmadb ────────────────────────── proto/ (source of truth)
-                    │
-              rusqlite + sqlite-vec (static)
+stemma-server
+├── stemma-resolve ── stemma-kg · stemma-embed · stemma-lm · stemmadb
+├── stemma-parse ──── stemma-resolve · stemma-lm · stemmadb
+├── stemma-ingest ─── stemmadb
+└── stemma-proto ◄─── proto/ (source of truth)
+
+stemmadb ── rusqlite + sqlite-vec
 ```
 
 | Crate | Role | Depends on |
@@ -93,39 +88,35 @@ Nine Rust crates, one Python client, two integrations, one optional UI.
 | [`stemmadb`](../../crates/stemmadb) | Storage layer: opens the store, attaches the user DB read-only, registers sqlite-vec, owns the versioned store schema | rusqlite |
 | [`stemma-ingest`](../../crates/stemma-ingest) | Builds the lexical index (`lex_values`, `lex_fts`, `lex_trigram`) from the attached user DB | stemmadb |
 | [`stemma-kg`](../../crates/stemma-kg) | `KnowledgeStore` trait, SQLite backend, the layered knowledge compiler | stemmadb |
-| [`stemma-resolve`](../../crates/stemma-resolve) | The resolution pipeline and the `Trace`; proto projection | stemmadb, stemma-ingest, stemma-embed, stemma-proto |
-| [`stemma-server`](../../crates/stemma-server) | gRPC service, database registry, startup ingest + compile, query history | all of the above, tonic, tokio |
+| [`stemma-resolve`](../../crates/stemma-resolve) | Resolution pipeline, optional approximate dense retrieval, `Trace`, and protocol projection | stemmadb, ingest, KG, embedder, language service, proto |
+| [`stemma-parse`](../../crates/stemma-parse) | Bounded query proposal and deterministic validation into a grounded SQLite syntax tree | resolver, language service, stemmadb |
+| [`stemma-server`](../../crates/stemma-server) | gRPC service, database registry, startup maintenance, episodes, feedback, and parsing | workspace crates, tonic, tokio |
 | [`stemma-proto`](../../crates/stemma-proto) | Generated prost/tonic types, checked in under `src/gen` | prost, tonic |
-| [`stemma-eval`](../../crates/stemma-eval) | BIRD target derivation from gold SQL | sqlparser |
-| [`stemma-embed`](../../crates/stemma-embed) | The `Embedder` trait, the OpenAI-compatible `/v1/embeddings` backend, and the query-instruction formatter | serde, ureq |
-| [`stemma-lm`](../../crates/stemma-lm) | **Placeholder.** One doc-comment line; the LM backend trait is designed, not written | — |
+| [`stemma-eval`](../../crates/stemma-eval) | Gold-target derivation, ablation runs, grading, paired statistics, and report data | resolver, sqlparser |
+| [`stemma-embed`](../../crates/stemma-embed) | `Embedder` trait, configured remote backend, cooldown behavior, and query formatter | serde, ureq |
+| [`stemma-lm`](../../crates/stemma-lm) | Optional bounded language-service trait, remote backend, structured output, and validated retry | serde, ureq |
 
 Outside the workspace:
 
 | Component | Role |
 |---|---|
-| [`clients/python/stemmadb`](../../clients/python/stemmadb) | `StemmaClient` (gRPC resolve/explain) and `StoreBrowser` (direct read-only SQLite access) |
+| [`clients/python/stemmadb`](../../clients/python/stemmadb) | `StemmaClient` (resolution, parsing, feedback) and `StoreBrowser` (direct read-only SQLite access) |
 | [`integrations/mcp`](../../integrations/mcp) | MCP server exposing `resolve`, `sql`, `schema`, `knowledge_graph` |
-| [`agents/stemma_agent`](../../agents/stemma_agent) | Reference ADK agent — the smallest complete consumer |
-| [`ui/`](../../ui) | Optional console: FastAPI + TypeScript, resolution trajectory visualization |
+| [`agents/stemma_agent`](../../agents/stemma_agent) | Reference tool-using agent — the smallest complete consumer |
+| [`ui/`](../../ui) | Optional console: data browser, chat, resolution trajectory, and episode feedback |
 | [`eval/`](../../eval) | Corpus builders (careg, eCFR, combined legal) and the BIRD fetcher |
 
-**Two structural notes.** First, `stemma-resolve` does *not* depend on
-`stemma-kg` — it reaches the two knowledge tables it needs directly through
-`stemmadb`, guarded by existence checks. This keeps the dependency graph a
-tree but violates the "graph SQL stays in its backend" invariant; the correct
-fix is read-side methods on `KnowledgeStore`, and it is
-[named as a deviation](04-knowledge-graph.md#a-note-on-the-layering-exception)
-rather than quietly tolerated.
+**Two structural notes.** First, `stemma-resolve` depends on `stemma-kg` for
+collective path search. Mention detection, term coherence, and context
+coherence still query `kg_nodes` and `kg_edges` directly through `stemmadb`.
+That exception to the `KnowledgeStore` boundary is
+[documented with its removal condition](04-knowledge-graph.md#a-note-on-the-layering-exception).
 
-Second, `stemma-lm` is still a one-line placeholder crate. It exists so the
-workspace shape and the Bazel targets are settled before the implementation
-lands, and so nothing accidentally grows a model-vendor dependency in the
-wrong crate. Treat every statement about the **LM backend trait** in this
-document set as design, not description. `stemma-embed` has crossed that line
-— the `Embedder` trait and its first backend are real — so statements about
-the *trait* are description, while statements about the queue-driven
-index-time embedding path remain design.
+Second, `stemma-parse` consumes the resolver's public trace structures and
+produces a validated SQLite syntax tree. It does not introduce a second
+grounding representation. The server coordinates proposal, validation,
+episode persistence, and protocol projection without merging parser logic into
+the resolution pipeline.
 
 ### Build
 
@@ -137,6 +128,12 @@ is a checked-in artifact under `crates/stemma-proto/src/gen`, refreshed by
 source of truth. Wiring the prost/tonic toolchain into Bazel directly is
 future work. sqlite-vec and the SQLite headers are vendored under
 [`third_party/`](../../third_party) and statically linked.
+
+The native approximate vector dependency is an explicit Cargo feature. Build
+the server with `--features usearch-sidecar` before selecting
+`dense_search = "usearch"`. The generated native bridge is not yet compatible
+with Bazel's read-only external-repository output path, so Bazel retains the
+exact backend. A Bazel-built server rejects approximate mode at startup.
 
 ## Process topology
 
@@ -152,10 +149,12 @@ Today, in the minimum useful configuration, there is exactly **one process**:
 │   per database: Mutex<StemmaDb>                          │
 │     main = legal.stemmadb  (rw)                          │
 │     src  = legal.db        (ro, ATTACHed)                │
+│     approximate index = optional derived file            │
 │                                                          │
 │   startup: build_lexical_index() → kg::compile()         │
 │            → build_dense_index()  (promote vec_staging)  │
-│   serving: Resolve, Explain                              │
+│            → rebuild approximate index (when selected)   │
+│   serving: Resolve, Explain, Parse, feedback             │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -167,17 +166,18 @@ Around it, all optional and all separate processes:
        │  └─ direct file read (ro) ──► *.db, *.stemmadb    (browse/SQL/graph)
        │  └─ writes chat_log ────────► *.stemmadb          (the one outside write)
        │
-   ADK agent (in-process with ui, or standalone via `adk run`)
+   reference agent (in-process with ui, or standalone)
        └─ stdio ──► stemmadb_mcp.py ──┬─ gRPC ──► stemma-server
                     (MCP server)      └─ direct file read (ro)
-       └─ HTTP ──► OpenAI-compatible endpoint (vLLM / llama.cpp / LiteLLM)
+       └─ HTTP ──► configured language service
 
-   stemma-server ──HTTP──► OpenAI-compatible /v1/embeddings   (dense channel)
+   stemma-server ──HTTP──► configured embedding service
+                 └─HTTP──► configured language service
 
    load_vectors.py ──► writes vec_staging into *.stemmadb (server stopped)
 ```
 
-Four properties of this topology are load-bearing.
+Six properties of this topology are load-bearing.
 
 **Browsing does not go through the server.** `StoreBrowser` opens both SQLite
 files directly with `mode=ro`. Listing tables, paginating rows, running a
@@ -193,20 +193,27 @@ server address and database registrations as command-line arguments
 `StemmaClient` for resolution and a `StoreBrowser` per database for
 everything else.
 
-**Models are out of process, on their own protocols.** The *embedder* is
-reached by `stemma-server` over the OpenAI-compatible `/v1/embeddings`
-protocol, configured with `--embed-endpoint` and `--embed-model`; absent
-either flag, the dense channel is simply off and resolution is lexical + KG.
-The *LM* is reached over the OpenAI-compatible chat-completions protocol by
-the agent, not by the server. The designed LM band inside the pipeline
-(expansion, adjudication) would add a second LM caller, still over the same
-protocol and still out of process.
+**Model services are out of process.** The server reaches the configured
+embedding service for query vectors and queue drains. Without an embedding
+service, lexical and graph resolution remain available. The server reaches the
+optional language service for bounded mention expansion, adjudication, and
+query proposals. The console's reference agent can use a separately configured
+language service. Service failures degrade only the stages that need them.
 
 **Vector loading is an offline step.** External vectors are staged into the
 store by a loader that does not need the sqlite-vec extension, and promoted
 into a `vec0` table by the server at startup. The loader runs with the server
 stopped. See
 [02-data-model.md](02-data-model.md#vec_staging-and-vec_dense).
+
+**Approximate vector search is a derived accelerator.** The optional USearch
+file proposes dense candidates and never becomes a second vector authority.
+SQLite retains vectors, source identities, model metadata, graph evidence,
+feedback, and the receipt that binds the file to one vector generation. A
+missing or invalid file leaves the exact SQLite path available. Resolution
+also retains exact-search safeguards for ambiguity-sensitive decisions. The
+full lifecycle and deployment gate are specified in
+[03-resolution.md](03-resolution.md#optional-approximate-vector-sidecar).
 
 **Resolution is serialized per database.** `rusqlite::Connection` is not
 `Sync`, so each registered database sits behind a `Mutex`. This is
@@ -233,12 +240,22 @@ user's file keeps its original bytes, keeps working with every other SQLite
 tool, and can be replaced underneath stemma at any time. It also means stemma
 can be pointed at a database it has no write permission on at all.
 
-### The disposable-state boundary
+### The sidecar-state boundary
 
-Everything stemma derives lives in the sidecar `.stemmadb` file: lexical
-indexes, the compiled knowledge store, the embed queue, the model registry,
-and operational history. Deleting it is always safe. This is what makes
-several other decisions affordable:
+The sidecar `.stemmadb` file contains derived state: lexical indexes, the
+compiled knowledge store, the embed queue, and the model registry. It also
+contains operational history and explicit feedback. Deleting the sidecar does
+not affect the attached user database, but it permanently removes that history
+and feedback. Operators must apply their backup and retention policy before
+deletion.
+
+The approximate vector file is separate from `.stemmadb` and is
+fully rebuildable. Its validity depends on a receipt stored in SQLite. Moving
+or restoring the approximate file without the matching SQLite store cannot
+activate it. Deleting only the approximate file changes performance and leaves
+resolution available through exact search.
+
+The rebuildable portion makes several decisions affordable:
 
 - Schema shape changes in derived tables are handled by *drop and rebuild*
   rather than by migration ([02-data-model.md](02-data-model.md#shape-change-self-healing-below-the-version)).
@@ -248,17 +265,16 @@ several other decisions affordable:
 - A store from a *newer* build is a hard error with a "re-ingest" message,
   because re-ingesting costs minutes and correctness costs more.
 
-The one nuance: operational history (`query_log`, `chat_log`) lives in the
-disposable file and is therefore itself disposable. That is intentional —
-history is *about* a corpus and should die with it — but it means the store
-is not purely a cache, and it is worth knowing before someone writes a
-"delete all stores to reclaim disk" script.
+Operational history (`query_log`, `chat_log`, and `grounding_feedback`) makes
+the sidecar more than a cache. A rebuild restores derived indexes and graph
+state. It cannot restore prior queries, conversations, or judgments.
 
 ### The write boundary
 
 | Writer | Writes | Via |
 |---|---|---|
-| `stemma-server` | indexes, KG, `query_log` | `StemmaDb` (rw) |
+| `stemma-server` | indexes, KG, `query_log`, `grounding_feedback` | `StemmaDb` (rw) |
+| `stemma-server` | optional approximate vector file | deterministic build from SQLite vectors |
 | `ui/agent_backend.py` | `chat_log` | direct `sqlite3` connection (rw) |
 | everything else | nothing | `mode=ro` |
 
@@ -290,14 +306,14 @@ pub trait KnowledgeStore {
     fn upsert_edge(&self, edge: &Edge) -> Result<()>;
     fn remove_by_key_prefixes(&self, prefixes: &[String]) -> Result<()>;
     fn stats(&self) -> Result<KgStats>;
+    fn table_paths(&self, from: &str, to: &str,
+                   max_hops: usize, limit: usize) -> Result<Vec<Vec<PathHop>>>;
 }
 ```
 
 Implemented by `SqliteKnowledgeStore` over three tables in the store, with
-recursive-CTE traversal as the designed query mechanism. Query-side methods
-(neighbours, bounded path search, subgraph extraction) are named in the
-trait's documentation as the additions that land with collective
-disambiguation, and are deliberately not stubbed.
+bounded table-path search over declared and inferred relations. Neighbor and
+subgraph extraction methods remain reserved for the instance layer.
 
 `remove_by_key_prefixes` is on the trait because incremental recompilation is
 a property of the *design*, not of the SQLite backend: any substitute store
@@ -308,26 +324,22 @@ must be able to delete everything derived from one source table.
 ```rust
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;   // order-preserving
-    fn identity(&self) -> ModelIdentity;                          // backend, model, dimension
+    fn identity(&self) -> ModelIdentity;
+    fn format_query(&self, mention: &str) -> String;
 }
 ```
 
-Two methods, and the pipeline holds it as `Option<&dyn Embedder>` — the type
+The pipeline holds the trait as `Option<&dyn Embedder>` — the type
 states that the embedder is optional, and `Result` states that it is
 fallible. Absent or failing, resolution degrades to the lexical and knowledge
 channels. That is the modularity contract doing real work: the resolver has
 no idea what is on the other side and no way to require that anything is.
 
-The first backend, `OpenAiEmbedder`, speaks the OpenAI-compatible
-`/v1/embeddings` protocol, which covers vLLM, `llama.cpp --embeddings`,
-LiteLLM proxies and hosted compatibility endpoints with one implementation.
-It reports `backend = "openai-compat"` and learns its own dimension from the
-first response (`OnceLock`), since the protocol has no dimension query. The
-trait also owns `format_query()`, which renders the query side of the
-asymmetric retrieval scheme through the backend's own template
-(`ModelIdentity::query_template`) — model-specific knowledge that belongs
-behind the seam, configured beside the endpoint and model it must agree
-with, rather than compiled into the pipeline.
+The implemented remote backend learns its dimension from the first response.
+The trait owns `format_query()`, which renders the query side of the asymmetric
+retrieval scheme through `ModelIdentity::query_template`. The query convention
+therefore travels with the vector-space identity instead of living in the
+pipeline.
 
 A richer wire shape is already specified in
 [`embedder.proto`](../../proto/stemma/v1/embedder.proto) — `Embed`, `Rerank`,
@@ -336,23 +348,23 @@ gRPC sidecar backend. `Rerank` and `revision` have no Rust counterpart yet.
 
 The registry is not a nicety: `model_registry` records
 `(vector_table, backend, model, revision, dimension, quantization)`, keyed by
-vector table, so an embedder change triggers a blue-green re-embed rather
-than a silent mix of vector spaces. See
+vector table. Promotion and queue drains reject an incompatible identity, so
+vectors from distinct spaces cannot mix silently. Online blue-green swaps
+remain designed. See
 [05-encoders-decoders.md](05-encoders-decoders.md).
 
-### LM backends — designed
+### Language-service backends — built
 
-A backend trait with request/response normalization and
-registry-by-model-string, modelled on agent-framework model layers. The
-primary backend speaks the OpenAI-compatible chat-completions protocol, which
-covers vLLM, llama.cpp, LiteLLM proxies and Vertex's compatibility endpoint
-with one implementation. Structured output (JSON-schema, enum over candidate
-ids) is a capability flag with validate-and-retry fallback.
+A `LmBackend` trait exposes one chat-completion call, structured-output
+capability, and a stable identity. The implemented remote backend requests a
+schema-constrained reply when the service supports one. Otherwise it includes
+the schema in the instruction, validates the response, and allows one
+corrective retry.
 
-The reference agent already demonstrates the protocol choice paying off:
-`agents/stemma_agent/agent.py` takes an endpoint and model (from
-`config.json`'s `console.lm` or as explicit arguments) and works against any
-of those servers unchanged.
+Resolution uses the backend only for bounded mention expansion and candidate
+adjudication. Parsing uses it to propose a small set of parameterized queries
+for deterministic validation. The reference agent uses the same configuration
+boundary for its conversational layer.
 
 ## External surfaces
 
@@ -362,15 +374,20 @@ of those servers unchanged.
 service ResolveService {
   rpc Resolve(ResolveRequest) returns (ResolveResponse);
   rpc Explain(ResolveRequest) returns (ExplainResponse);
+  rpc Parse(ParseRequest) returns (ParseResponse);
+  rpc SubmitFeedback(FeedbackRequest) returns (Feedback);
+  rpc ListFeedback(ListFeedbackRequest) returns (FeedbackList);
+  rpc DeleteFeedback(DeleteFeedbackRequest) returns (DeleteFeedbackResponse);
 }
 ```
 
-Two RPCs over one request type. `Resolve` returns selected mentions with
-their candidates and evidence; `Explain` returns the full trajectory — every
-span considered, every candidate from every channel with per-channel scores,
-and the reason each near-miss lost.
+`Resolve` returns selected mentions with their candidates and evidence.
+`Explain` returns every span and candidate, channel scores, and near-miss
+reasons. `Parse` starts from the same grounding path and returns a validated,
+parameterized, read-only SQLite query when one proposal survives. The feedback
+RPCs attach typed judgments to persisted resolution or parse episodes.
 
-Both are served from the same `Trace` by the same code path
+Resolve and Explain are served from the same `Trace` by the same code path
 (`Resolver::trace_for`), so `Explain` can never disagree with `Resolve`. That
 is the difference between an explanation and a reconstruction: a
 reconstruction is a second implementation that drifts.
@@ -418,11 +435,12 @@ framework.
 
 ### Query history as a first-class surface
 
-`ResolveOptions.source` and `ResolveOptions.session` are written to
-`query_log` on every query. The console passes `"console"`, the MCP tool
-passes `"mcp"` plus its `--session` tag. History is therefore attributable per
-caller and per conversation, queryable with ordinary SQL, and stored beside
-the corpus it is about. See
+Each non-empty Resolve, Explain, or Parse request attempts a `query_log` write.
+The row carries `ResolveOptions.source`, `ResolveOptions.session`, revision
+receipts, compact evidence selectors, and an opaque episode identifier. A
+history-write failure leaves resolution available and returns an empty episode
+identifier. Typed feedback can attach only to a persisted episode. History is
+queryable with ordinary SQL and stored beside the corpus it describes. See
 [02-data-model.md](02-data-model.md#query_log).
 
 ## Why this shape
@@ -507,12 +525,13 @@ floor. Constrained decoding forces *validity*, not *correctness* — and a
 confidently wrong-but-valid record is worse than an explicit no-match,
 because it is undetectable downstream.
 
-So the encoder is the workhorse (embedding rows at index time and mentions at
-query time), and the LM is invoked at exactly two points and only for the
-ambiguous band: mention expansion before retrieval, and constrained
-select-among-k with an explicit NIL after it. The LM is never the retrieval
-mechanism. This is why the model services sit outside the core and why the
-pipeline's shape is a cheap-first cascade rather than a model call.
+So the encoder is the workhorse, embedding rows at index time and mentions at
+query time. Resolution invokes the optional language service in two bounded
+places: mention expansion before retrieval and constrained select-among-k with
+an explicit NIL afterward. Parsing may invoke it again for query proposals,
+which deterministic validation can reject. The language service is never the
+retrieval mechanism. This division keeps the grounding pipeline a cheap-first
+cascade.
 
 ## Current state
 
@@ -523,19 +542,23 @@ pipeline's shape is a cheap-first cascade rather than a model call.
 | Resolution pipeline (spans, three channels, RRF, greedy selection, full trace) | built |
 | Knowledge compiler (schema, inclusion mining, value/term/phrase profile, centrality) | built |
 | KG-assisted mention detection and coherence bonus | built |
-| gRPC Resolve + Explain; query history with source/session | built |
+| gRPC Resolve, Explain, Parse, and typed feedback; episode history with source/session | built |
 | Python client, MCP server, reference agent, console | built |
 | BIRD target derivation | built |
-| `Embedder` trait + OpenAI-compatible backend | built |
+| `Embedder` trait + configured remote backend | built |
 | Dense channel: `vec_staging` → `vec0` promotion, targeted KNN, model-registry write | built |
-| Index-time embedding (embed-queue drain), online blue-green swap, `Rerank` | designed |
+| Revision-checked approximate vector sidecar with exact mention safeguards | built behind a Cargo feature; native Bazel parity open; exact by default |
+| Index-time embedding and content-hashed queue drain | built |
+| Online blue-green vector swap and `Rerank` | designed |
 | Fusion constants re-derived for four channels; `SemanticMatch` evidence | outstanding |
 | Collective disambiguation and verification probes | built |
-| Instance layer and mention expansion | designed |
-| Constrained adjudication, `rewritten_query`, `nil` | built |
+| Verified mention expansion for spans with no candidates | built |
+| Persisted instance-alias layer | designed |
+| Constrained adjudication and explicit `nil` | built |
 | Scoring resolver output against BIRD targets | built |
-| Query-level interpretation, five outcomes and clarification | initial vertical slice built; full gate staged |
-| Grounded SQLite parser and deterministic validation | staged |
+| Query-level outcomes and deterministic grounding clarification | built; alternative-recall and dialogue evaluation open |
+| Grounded SQLite parser and deterministic validation | first read-only slice built; broader coverage open |
+| Trace-linked typed feedback | built; learning from feedback unsupported |
 
 The table distinguishes shipping paths from staged work. Detailed evaluation
 status is in [07-eval-harness.md](07-eval-harness.md); the query-level vertical

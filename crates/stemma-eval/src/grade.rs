@@ -53,9 +53,7 @@ pub fn check(run: &RunFile, baseline: &Baseline, permutations: usize) -> Vec<Fai
                 let worst: Vec<String> = cell
                     .per_query
                     .iter()
-                    .filter(|(id, v)| {
-                        base.per_query.get(*id).is_some_and(|b| **v < *b)
-                    })
+                    .filter(|(id, v)| base.per_query.get(*id).is_some_and(|b| **v < *b))
                     .map(|(id, _)| id.clone())
                     .collect();
                 failures.push(Failure {
@@ -178,7 +176,10 @@ pub fn grade(run_path: &Path, baseline_path: &Path, permutations: usize) -> anyh
     if failures.is_empty() {
         println!(
             "PASS: {} vs baseline {} ({} ablations, tiers {:?})",
-            run.run_id, baseline.run_id, run.ablations.len(), run.tiers
+            run.run_id,
+            baseline.run_id,
+            run.ablations.len(),
+            run.tiers
         );
         return Ok(true);
     }
@@ -227,10 +228,7 @@ mod tests {
             },
             delta_prev: None,
             delta_baseline: None,
-            per_query: per_query
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect(),
+            per_query: per_query.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             queries: Vec::new(),
         }
     }
@@ -240,22 +238,15 @@ mod tests {
             r5_strict: r5,
             grounded: r5,
             n: per_query.len(),
-            per_query: per_query
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect(),
+            per_query: per_query.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }
     }
 
     fn scaffold(run_r5: f64, base_r5: f64, n: usize) -> (RunFile, Baseline) {
-        let run_pq: Vec<(String, f64)> =
-            (0..n).map(|i| (format!("q{i}"), run_r5)).collect();
-        let base_pq: Vec<(String, f64)> =
-            (0..n).map(|i| (format!("q{i}"), base_r5)).collect();
-        let run_pq_ref: Vec<(&str, f64)> =
-            run_pq.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-        let base_pq_ref: Vec<(&str, f64)> =
-            base_pq.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let run_pq: Vec<(String, f64)> = (0..n).map(|i| (format!("q{i}"), run_r5)).collect();
+        let base_pq: Vec<(String, f64)> = (0..n).map(|i| (format!("q{i}"), base_r5)).collect();
+        let run_pq_ref: Vec<(&str, f64)> = run_pq.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let base_pq_ref: Vec<(&str, f64)> = base_pq.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let run = RunFile {
             run_id: "r".into(),
             corpus: "c".into(),
@@ -359,7 +350,13 @@ mod tests {
     #[test]
     fn latency_budget_violation_fails() {
         let (mut run, baseline) = scaffold(0.6, 0.6, 10);
-        run.cells.get_mut("lex").unwrap().get_mut("anchor").unwrap().cell.latency_p95_ms = 5000.0;
+        run.cells
+            .get_mut("lex")
+            .unwrap()
+            .get_mut("anchor")
+            .unwrap()
+            .cell
+            .latency_p95_ms = 5000.0;
         let failures = check(&run, &baseline, 500);
         assert!(failures.iter().any(|f| f.check == "latency-budget"));
     }

@@ -43,10 +43,16 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -55,8 +61,7 @@ pub trait LmBackend: Send + Sync {
     /// With `schema` set, the content is a JSON document conforming to it
     /// (enforced natively where the backend can, by validate-and-retry where
     /// it cannot).
-    fn chat(&self, messages: &[ChatMessage], schema: Option<&serde_json::Value>)
-        -> Result<String>;
+    fn chat(&self, messages: &[ChatMessage], schema: Option<&serde_json::Value>) -> Result<String>;
     /// Whether the backend enforces `schema` natively (constrained decoding)
     /// rather than by instruction and validation.
     fn native_structured_output(&self) -> bool;
@@ -119,9 +124,11 @@ impl OpenAiChat {
         }
     }
 
-    fn request(&self, messages: &[serde_json::Value], response_format: Option<serde_json::Value>)
-        -> std::result::Result<String, ureq::Error>
-    {
+    fn request(
+        &self,
+        messages: &[serde_json::Value],
+        response_format: Option<serde_json::Value>,
+    ) -> std::result::Result<String, ureq::Error> {
         let mut body = ureq::json!({
             "model": self.model,
             "temperature": 0,
@@ -149,9 +156,11 @@ impl OpenAiChat {
 
     /// Instruction-embedded fallback: state the schema, parse the reply, and
     /// on a parse failure send the broken reply back once for correction.
-    fn chat_instructed(&self, messages: &[serde_json::Value], schema: &serde_json::Value)
-        -> Result<String>
-    {
+    fn chat_instructed(
+        &self,
+        messages: &[serde_json::Value],
+        schema: &serde_json::Value,
+    ) -> Result<String> {
         let mut messages = messages.to_vec();
         messages.push(ureq::json!({
             "role": "user",
@@ -159,7 +168,9 @@ impl OpenAiChat {
                 "Reply with a single JSON object conforming to this JSON schema and nothing else:\n{schema}"
             ),
         }));
-        let reply = self.request(&messages, None).map_err(|e| Error::Http(e.to_string()))?;
+        let reply = self
+            .request(&messages, None)
+            .map_err(|e| Error::Http(e.to_string()))?;
         if let Some(json) = extract_json(&reply) {
             return Ok(json);
         }
@@ -168,7 +179,9 @@ impl OpenAiChat {
             "role": "user",
             "content": "That was not valid JSON. Reply with only the JSON object.",
         }));
-        let retry = self.request(&messages, None).map_err(|e| Error::Http(e.to_string()))?;
+        let retry = self
+            .request(&messages, None)
+            .map_err(|e| Error::Http(e.to_string()))?;
         extract_json(&retry).ok_or(Error::Malformed(retry))
     }
 }
@@ -186,16 +199,16 @@ fn extract_json(reply: &str) -> Option<String> {
 }
 
 impl LmBackend for OpenAiChat {
-    fn chat(&self, messages: &[ChatMessage], schema: Option<&serde_json::Value>)
-        -> Result<String>
-    {
+    fn chat(&self, messages: &[ChatMessage], schema: Option<&serde_json::Value>) -> Result<String> {
         use std::sync::atomic::Ordering;
         let messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| ureq::json!({ "role": m.role, "content": m.content }))
             .collect();
         let Some(schema) = schema else {
-            return self.request(&messages, None).map_err(|e| Error::Http(e.to_string()));
+            return self
+                .request(&messages, None)
+                .map_err(|e| Error::Http(e.to_string()));
         };
         if self.native_schema.load(Ordering::Relaxed) {
             let rf = ureq::json!({
@@ -217,7 +230,8 @@ impl LmBackend for OpenAiChat {
     }
 
     fn native_structured_output(&self) -> bool {
-        self.native_schema.load(std::sync::atomic::Ordering::Relaxed)
+        self.native_schema
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn identity(&self) -> LmIdentity {

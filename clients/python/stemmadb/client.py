@@ -77,6 +77,50 @@ class StemmaClient:
         )
         return self._stub.Parse(request, timeout=self._timeout)
 
+    def submit_feedback(
+        self, database: str, episode_id: str, category: int | str,
+        scope: int | str = resolve_pb2.FEEDBACK_SCOPE_DATABASE,
+        *, span_id: int | None = None, candidate_index: int | None = None,
+        clarification_option: int | None = None, correction: str = "",
+    ) -> resolve_pb2.Feedback:
+        """Attach an explicit judgment to one recorded resolution episode."""
+        if isinstance(category, str):
+            category = getattr(resolve_pb2, f"FEEDBACK_CATEGORY_{category.upper()}")
+        if isinstance(scope, str):
+            scope = getattr(resolve_pb2, f"FEEDBACK_SCOPE_{scope.upper()}")
+        request = resolve_pb2.FeedbackRequest(
+            database=database,
+            episode_id=episode_id,
+            category=category,
+            scope=scope,
+            correction=correction,
+        )
+        for name, value in (
+            ("span_id", span_id),
+            ("candidate_index", candidate_index),
+            ("clarification_option", clarification_option),
+        ):
+            if value is not None:
+                setattr(request, name, value)
+        return self._stub.SubmitFeedback(request, timeout=self._timeout)
+
+    def list_feedback(
+        self, database: str, episode_id: str | None = None,
+    ) -> resolve_pb2.FeedbackList:
+        """Retrieve explicit judgments, optionally for one episode."""
+        request = resolve_pb2.ListFeedbackRequest(database=database)
+        if episode_id is not None:
+            request.episode_id = episode_id
+        return self._stub.ListFeedback(request, timeout=self._timeout)
+
+    def delete_feedback(self, database: str, feedback_id: int) -> bool:
+        """Permanently delete one explicit judgment."""
+        return self._stub.DeleteFeedback(
+            resolve_pb2.DeleteFeedbackRequest(
+                database=database, feedback_id=feedback_id),
+            timeout=self._timeout,
+        ).deleted
+
     def explain_dict(
         self, query: str, database: str, source: str = "", session: str = "",
         allow_lm: bool = False,

@@ -2,15 +2,14 @@
 
 Shared reference list for the [technical design](README.md) documents.
 
-Entries in sections A–G were verified against primary sources — arXiv abstract
-pages, the ACL Anthology, DBLP, AAAI/NeurIPS/ICLR/PMLR proceedings, PVLDB
-PDFs, Crossref, JMLR — rather than cited from memory. Titles, author lists,
-venues of record and identifiers are as published; where a work appeared as a
-preprint and later at a venue, the venue of record is given and the preprint
-identifier retained.
+Entries outside the additional geometry section were verified against primary
+records: abstract pages, anthology pages, proceedings, published PDFs,
+Crossref, and journal indexes. Titles, author lists, venues of record, and
+identifiers are as published. When a work appeared first as a preprint, the
+venue of record is given and the preprint identifier is retained.
 
-Section H is different, and is labelled as such: those entries were checked
-against ambit's own reference list rather than independently.
+The additional geometry entries were checked against Ambit's reference list
+rather than independently. That section states the limitation again.
 
 **Citation keys are disambiguated by first-author given name where surnames
 collide.** There are two Gaos, three Lis, two Wangs, two Lees and two
@@ -20,7 +19,7 @@ and `[C. Li 2025]`.
 
 ---
 
-## A. Entity linking
+## Entity linking
 
 - **[Wu 2020]** Ledell Wu, Fabio Petroni, Martin Josifoski, Sebastian Riedel,
   Luke Zettlemoyer. "Scalable Zero-shot Entity Linking with Dense Entity
@@ -69,7 +68,7 @@ and `[C. Li 2025]`.
   sparser than joint models assume, and that pairwise linking with a
   minimum-spanning-tree objective beats all-mention joint optimization.)*
 
-## B. The case against constrained generative retrieval
+## Limits of constrained generative retrieval
 
 - **[S. Wu 2025]** Shiguang Wu, Zhaochun Ren, Xin Xin, Jiyuan Yang, Mengqi
   Zhang, Zhumin Chen, Maarten de Rijke, Pengjie Ren. "Constrained
@@ -85,7 +84,7 @@ and `[C. Li 2025]`.
   precision/recall gap opens at the very first decoding step: R@50/P@1 of
   53.7/69.8 on DL19, 63.3/75.9 on DL20, 67.5/90.5 on MS MARCO-dev.)*
 
-## C. Text-to-SQL: schema and value linking
+## Text-to-SQL schema and value linking
 
 - **[B. Wang 2020]** Bailin Wang, Richard Shin, Xiaodong Liu, Oleksandr
   Polozov, Matthew Richardson. "RAT-SQL: Relation-Aware Schema Encoding and
@@ -171,7 +170,7 @@ and `[C. Li 2025]`.
   (Long Papers), 2261–2273. arXiv:2106.11455.
   DOI 10.18653/v1/2021.acl-long.176.
 
-## D. Keyword extraction and graph ranking
+## Keyword extraction and graph ranking
 
 - **[Mihalcea 2004]** Rada Mihalcea, Paul Tarau. "TextRank: Bringing Order
   into Text." EMNLP 2004, 404–411. ACL Anthology W04-3252. *(Singular "Text".
@@ -203,7 +202,7 @@ and `[C. Li 2025]`.
   Unsupervised Approach to Keyphrase Extraction from Scholarly Documents."
   ACL 2017 (Long Papers), 1105–1115. DOI 10.18653/v1/P17-1102.
 
-## E. Inclusion dependencies and foreign-key discovery
+## Inclusion dependencies and foreign-key discovery
 
 - **[Bauckmann 2007]** Jana Bauckmann, Ulf Leser, Felix Naumann, Véronique
   Tietz. "Efficiently Detecting Inclusion Dependencies." ICDE 2007, 1448–1450.
@@ -231,7 +230,7 @@ and `[C. Li 2025]`.
   that extract true PKs and FKs from the much larger sets of valid unique
   column combinations and inclusion dependencies.)*
 
-## F. Retrieval and fusion
+## Retrieval and fusion
 
 - **[Cormack 2009]** Gordon V. Cormack, Charles L. A. Clarke, Stefan Büttcher.
   "Reciprocal rank fusion outperforms condorcet and individual rank learning
@@ -263,7 +262,21 @@ and `[C. Li 2025]`.
   DOI 10.18653/v1/2025.findings-emnlp.568. *(Secondary sources dating this to
   EMNLP 2024 are wrong.)*
 
-## E2. Systems patterns (software)
+## Approximate vector search
+
+- **[Malkov 2020]** Yu. A. Malkov, D. A. Yashunin. "Efficient and Robust
+  Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World
+  Graphs." *IEEE Transactions on Pattern Analysis and Machine Intelligence*
+  42(4):824–836, 2020. arXiv:1603.09320.
+  DOI 10.1109/TPAMI.2018.2889473. *(The primary algorithm paper for the graph
+  index family used by the optional approximate vector sidecar.)*
+- **[Aumüller 2020]** Martin Aumüller, Erik Bernhardsson, Alexander
+  Faithfull. "ANN-Benchmarks: A Benchmarking Tool for Approximate Nearest
+  Neighbor Algorithms." *Information Systems* 87:101374, 2020.
+  DOI 10.1016/j.is.2019.02.006. *(Defines a reproducible empirical framework
+  for comparing approximate-search recall and query performance.)*
+
+## Software system patterns
 
 The storage layer descends from working systems as much as from papers;
 these are software citations, held to the same rule — cite what shaped the
@@ -291,7 +304,7 @@ design.
   readers — the property the store relies on for server-writes +
   console/browser reads, and for the drain task's separate connection.)*
 
-## F2. Evaluation methodology
+## Evaluation methodology
 
 - **[Xiang 2025]** Yilin Xiang et al. "When to use Graphs in RAG: A
   Comprehensive Analysis for Graph Retrieval-Augmented Generation"
@@ -361,7 +374,7 @@ design.
   underreporting of effect sizes and power — why every cell delta in a
   run report carries a confidence interval, not just a point value.)*
 
-## G. Embedding geometry: anisotropy, crowding, hubness
+## Embedding geometry: anisotropy, crowding, hubness
 
 - **[Ethayarajh 2019]** Kawin Ethayarajh. "How Contextual are Contextualized
   Word Representations? Comparing the Geometry of BERT, ELMo, and GPT-2
@@ -415,7 +428,7 @@ design.
   size from 32 to 1024. This is the base encoder for the legal corpus
   vectors.)*
 
-## I. Query ambiguity and clarification
+## Query ambiguity and clarification
 
 - **[Min 2020]** Sewon Min, Julian Michael, Hannaneh Hajishirzi, Luke
   Zettlemoyer. “[AmbigQA: Answering Ambiguous Open-domain
@@ -459,12 +472,73 @@ design.
   2023, 10846–10860. DOI 10.18653/v1/2023.findings-acl.690. *(Separates
   missing entities from non-entity phrases and shows both matter in training.)*
 
-## H. Additional geometry references
+## User feedback and adaptation
+
+- **[Shannon 1948]** C. E. Shannon. “[A Mathematical Theory of
+  Communication](https://doi.org/10.1002/j.1538-7305.1948.tb01338.x).” *Bell
+  System Technical Journal* 27(3):379–423 and 27(4):623–656, 1948. DOI
+  10.1002/j.1538-7305.1948.tb01338.x and
+  10.1002/j.1538-7305.1948.tb00917.x. *(Defines entropy and information for a
+  probability distribution over possible messages.)*
+- **[Iyer 2017]** Srinivasan Iyer, Ioannis Konstas, Alvin Cheung, Jayant
+  Krishnamurthy, Luke Zettlemoyer. “[Learning a Neural Semantic Parser from
+  User Feedback](https://aclanthology.org/P17-1089/).” ACL 2017, 963–973.
+  DOI 10.18653/v1/P17-1089. *(Uses binary feedback to select incorrect
+  predictions for SQL annotation; demonstrates the value of a review boundary
+  between feedback and training.)*
+- **[Elgohary 2020]** Ahmed Elgohary, Saghar Hosseini, Ahmed Hassan Awadallah.
+  “[Speak to your Parser: Interactive Text-to-SQL with Natural Language
+  Feedback](https://aclanthology.org/2020.acl-main.187/).” ACL 2020,
+  2065–2077. DOI 10.18653/v1/2020.acl-main.187. *(Studies free-form correction
+  of an incorrect SQL interpretation and reports a large gap between human and
+  automatic correction.)*
+- **[Joachims 2007]** Thorsten Joachims, Laura A. Granka, Bing Pan, Helene
+  Hembrooke, Filip Radlinski, Geri Gay. “[Evaluating the Accuracy of Implicit
+  Feedback from Clicks and Query Reformulations in Web
+  Search](https://doi.org/10.1145/1229179.1229181).” *ACM Transactions on
+  Information Systems* 25(2), article 7, 2007. DOI
+  10.1145/1229179.1229181. *(Finds that clicks are informative and biased;
+  relative preferences are more reliable than absolute judgments.)*
+- **[Zhao 2021]** Eric Zhao, Anqi Liu, Animashree Anandkumar, Yisong Yue.
+  “[Active Learning under Label
+  Shift](https://proceedings.mlr.press/v130/zhao21b.html).” AISTATS 2021,
+  PMLR 130:3412–3420. *(Formalizes the bias–variance tradeoff introduced when
+  actively sampled labels have different class proportions from the target.)*
+- **[Zhan 2022]** Xueying Zhan, Yaowei Wang, Antoni B. Chan. “[Asymptotic
+  Optimality for Active Learning
+  Processes](https://proceedings.mlr.press/v180/zhan22a.html).” UAI 2022,
+  PMLR 180:2342–2352. *(Shows how non-uniform active sampling creates sampling
+  bias and dataset shift.)*
+- **[Khosla 2020]** Prannay Khosla, Piotr Teterwak, Chen Wang, Aaron Sarna,
+  Yonglong Tian, Phillip Isola, Aaron Maschinot, Ce Liu, Dilip Krishnan.
+  “[Supervised Contrastive
+  Learning](https://proceedings.neurips.cc/paper/2020/hash/d89a66c7c80a29b1bdbab0f2a1a94af8-Abstract.html).”
+  NeurIPS 2020. *(Pulls examples of the same class together while separating
+  different classes; pair quality is therefore a direct training invariant.)*
+- **[Ovadia 2019]** Yaniv Ovadia, Emily Fertig, Jie Ren, Zachary Nado, D.
+  Sculley, Sebastian Nowozin, Joshua Dillon, Balaji Lakshminarayanan, Jasper
+  Snoek. “[Can You Trust Your Model's Uncertainty? Evaluating Predictive
+  Uncertainty under Dataset
+  Shift](https://proceedings.neurips.cc/paper/2019/hash/8558cb408c1d76621371888657d2eb1d-Abstract.html).”
+  NeurIPS 2019. *(Shows empirically that post-hoc calibration can degrade
+  under distribution shift.)*
+- **[Hu 2022]** Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu,
+  Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen. “[Low-Rank Adaptation of Large
+  Language Models](https://openreview.net/forum?id=nZeVKeeFYf9).” ICLR 2022.
+  *(Freezes base weights and trains injected low-rank matrices.)*
+- **[Kirkpatrick 2017]** James Kirkpatrick et al. “[Overcoming Catastrophic
+  Forgetting in Neural
+  Networks](https://www.pnas.org/doi/10.1073/pnas.1611835114).” *Proceedings
+  of the National Academy of Sciences* 114(13):3521–3526, 2017. DOI
+  10.1073/pnas.1611835114. *(Demonstrates loss of earlier task behavior during
+  subsequent training and evaluates a preservation method.)*
+
+## Additional geometry references
 
 Checked for title, venue and year against
 [ambit](https://github.com/pedapudi/ambit)'s own reference list, which carries
-ACL Anthology and arXiv links for each. **Not independently re-verified**
-against primary sources, unlike sections A–G.
+anthology and preprint links for each. **Not independently re-verified** against
+primary sources, unlike the rest of this bibliography.
 
 - **[Mu 2018]** Jiaqi Mu, Suma Bhat, Pramod Viswanath. "All-but-the-Top:
   Simple and Effective Postprocessing for Word Representations." ICLR 2018.

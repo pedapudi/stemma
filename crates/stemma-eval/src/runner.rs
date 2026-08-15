@@ -359,8 +359,8 @@ pub struct CheckpointCtx {
 /// FNV-1a 64 over the dataset file bytes, truncated to 8 hex chars —
 /// change detection, not cryptography; any byte edit re-runs every pass.
 pub fn dataset_hash8(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("hashing dataset {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("hashing dataset {}", path.display()))?;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in &bytes {
         h ^= b as u64;
@@ -582,10 +582,9 @@ fn drain_embeddings_batched(
     // Column cards: schema-derived, receipted, dozens of embeddings — built
     // before the queues so column affinity works even when a drain degrades.
     match stemma_ingest::build_column_cards(db, embedder) {
-        Ok(s) if s.rebuilt => notes.push(format!(
-            "column cards: {} embedded ({})",
-            s.cards, s.model
-        )),
+        Ok(s) if s.rebuilt => {
+            notes.push(format!("column cards: {} embedded ({})", s.cards, s.model))
+        }
         Ok(_) => {}
         Err(e) => notes.push(format!(
             "column card build failed: {e} (column affinity degraded)"
@@ -607,9 +606,7 @@ fn drain_embeddings_batched(
                 failed += s.failed;
                 if s.remaining == 0 {
                     if drained > 0 || failed > 0 {
-                        notes.push(format!(
-                            "embed drain: {drained} embedded, {failed} failed"
-                        ));
+                        notes.push(format!("embed drain: {drained} embedded, {failed} failed"));
                     }
                     if let Err(e) = stemma_ingest::derive_dense_geometry(db) {
                         notes.push(format!("dense geometry derivation failed: {e}"));
@@ -736,7 +733,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     };
 
     let results = execute_passes(&ckpt, &ablations, &mut notes, |ab, pass_notes| {
-        let store = prepare_store(&user_db, args.store_dir.as_deref(), ab.kg, args.fresh, pass_notes)?;
+        let store = prepare_store(
+            &user_db,
+            args.store_dir.as_deref(),
+            ab.kg,
+            args.fresh,
+            pass_notes,
+        )?;
         let db = StemmaDb::open(&store, &user_db)?;
 
         let embedder = match (&embed_cfg, ab.dense) {
@@ -787,7 +790,10 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
                 l.extra_body.clone(),
             ))),
             (None, true) => {
-                pass_notes.push(format!("{}: no LM configured; adjudication absent", ab.name));
+                pass_notes.push(format!(
+                    "{}: no LM configured; adjudication absent",
+                    ab.name
+                ));
                 None
             }
             _ => None,
@@ -816,8 +822,12 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
         }
 
         let backend_cost = BackendCost {
-            embed_calls: embedder.as_ref().map_or(0, |e| e.calls.load(Ordering::Relaxed)),
-            embed_texts: embedder.as_ref().map_or(0, |e| e.texts.load(Ordering::Relaxed)),
+            embed_calls: embedder
+                .as_ref()
+                .map_or(0, |e| e.calls.load(Ordering::Relaxed)),
+            embed_texts: embedder
+                .as_ref()
+                .map_or(0, |e| e.texts.load(Ordering::Relaxed)),
             embed_ms_total: embedder
                 .as_ref()
                 .map_or(0.0, |e| e.total_ms.load(Ordering::Relaxed) as f64),
@@ -857,8 +867,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     for (i, (name, outcomes)) in all_outcomes.iter().enumerate() {
         let mut tier_cells = BTreeMap::new();
         for tier in &run_file.tiers {
-            let subset: Vec<&QueryOutcome> =
-                outcomes.iter().filter(|o| &o.tier == tier).collect();
+            let subset: Vec<&QueryOutcome> = outcomes.iter().filter(|o| &o.tier == tier).collect();
             if subset.is_empty() {
                 continue;
             }
@@ -926,10 +935,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
         }
         run_file.cells.insert(name.clone(), tier_cells);
 
-        // absent-tier behavior + calibration across the whole run for this ablation.
-        run_file
-            .nil
-            .insert(name.clone(), nil_report(outcomes));
+        // Absence behavior and score-conditioned accuracy across this ablation.
+        run_file.nil.insert(name.clone(), nil_report(outcomes));
         let refs: Vec<&QueryOutcome> = outcomes.iter().collect();
         run_file
             .calibration
@@ -997,8 +1004,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<RunFile> {
     run_file.notes = notes;
 
     // ---- write artifacts ----
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let json_path = out_dir.join(format!("{}.json", run_file.run_id));
     std::fs::write(&json_path, serde_json::to_string_pretty(&run_file)?)?;
     let html_path = out_dir.join(format!("{}.html", run_file.run_id));
@@ -1057,8 +1063,7 @@ fn diagnose(o: &QueryOutcome) -> String {
 
 fn nil_report(outcomes: &[QueryOutcome]) -> NilReport {
     let nil_queries: Vec<&QueryOutcome> = outcomes.iter().filter(|o| o.n_targets == 0).collect();
-    let absence_outcomes: Vec<&QueryOutcome> =
-        outcomes.iter().filter(|o| o.nil_outcome).collect();
+    let absence_outcomes: Vec<&QueryOutcome> = outcomes.iter().filter(|o| o.nil_outcome).collect();
     let correct_absences = absence_outcomes.iter().filter(|o| o.n_targets == 0).count();
     let precision = (!absence_outcomes.is_empty())
         .then(|| correct_absences as f64 / absence_outcomes.len() as f64);
@@ -1117,11 +1122,7 @@ fn probe_gold(db: &StemmaDb, t: &Target, rowid: i64) -> bool {
         .unwrap_or(false)
 }
 
-fn resolve_db_path(
-    cfg: &ConfigFile,
-    corpus: &str,
-    flag: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
+fn resolve_db_path(cfg: &ConfigFile, corpus: &str, flag: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
@@ -1329,10 +1330,7 @@ mod tests {
 
     impl stemma_embed::Embedder for FakeEmbedder {
         fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
-            Ok(texts
-                .iter()
-                .map(|_| vec![1.0, 0.0, 0.0, 0.0])
-                .collect())
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
         }
         fn identity(&self) -> stemma_embed::ModelIdentity {
             stemma_embed::ModelIdentity {
@@ -1403,10 +1401,8 @@ mod tests {
     /// still find it, or the run silently comes out ungraded.
     #[test]
     fn default_baseline_resolves_against_the_run_root_not_the_process_cwd() {
-        let root = std::env::temp_dir().join(format!(
-            "stemma-eval-baseline-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("stemma-eval-baseline-test-{}", std::process::id()));
         let dir = root.join("eval").join("baseline");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1487,10 +1483,8 @@ mod tests {
     }
 
     fn test_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "stemma-eval-ckpt-{tag}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("stemma-eval-ckpt-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         root
     }
@@ -1572,21 +1566,25 @@ mod tests {
         let ckpt = ckpt_ctx(&root);
         let mut notes = Vec::new();
         let mut ran = Vec::new();
-        execute_passes(
-            &ckpt,
-            &[ablation("lex").unwrap()],
-            &mut notes,
-            |ab, _n| {
-                ran.push(ab.name.clone());
-                Ok((vec![outcome("q1")], cost(0)))
-            },
-        )
+        execute_passes(&ckpt, &[ablation("lex").unwrap()], &mut notes, |ab, _n| {
+            ran.push(ab.name.clone());
+            Ok((vec![outcome("q1")], cost(0)))
+        })
         .unwrap();
         assert_eq!(ran, vec!["lex"], "stale checkpoints must not resume");
         assert!(!old_rev.path_for("lex").exists(), "old git_rev swept");
-        assert!(!other_hash.path_for("lex").exists(), "old dataset hash swept");
+        assert!(
+            !other_hash.path_for("lex").exists(),
+            "old dataset hash swept"
+        );
         assert!(other_corpus.path_for("lex").exists(), "other corpus kept");
-        assert!(notes.iter().filter(|n| n.starts_with("removed stale checkpoint")).count() == 2);
+        assert!(
+            notes
+                .iter()
+                .filter(|n| n.starts_with("removed stale checkpoint"))
+                .count()
+                == 2
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

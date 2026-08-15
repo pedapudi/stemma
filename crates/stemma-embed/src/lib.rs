@@ -216,9 +216,7 @@ impl Embedder for OpenAiEmbedder {
             }
             Err(e) => return Err(Error::Http(e.to_string())),
         };
-        let resp: EmbeddingsResponse = resp
-            .into_json()
-            .map_err(|e| Error::Http(e.to_string()))?;
+        let resp: EmbeddingsResponse = resp.into_json().map_err(|e| Error::Http(e.to_string()))?;
         if resp.data.len() != texts.len() {
             return Err(Error::CountMismatch {
                 got: resp.data.len(),
@@ -292,7 +290,10 @@ mod tests {
     fn bare_spellings_are_one_convention() {
         assert!(query_templates_agree("", "{query}"));
         assert!(query_templates_agree("{query}", ""));
-        assert!(query_templates_agree(QWEN3_QUERY_TEMPLATE, QWEN3_QUERY_TEMPLATE));
+        assert!(query_templates_agree(
+            QWEN3_QUERY_TEMPLATE,
+            QWEN3_QUERY_TEMPLATE
+        ));
         assert!(!query_templates_agree("", QWEN3_QUERY_TEMPLATE));
         assert!(!query_templates_agree("{query}", QWEN3_QUERY_TEMPLATE));
     }

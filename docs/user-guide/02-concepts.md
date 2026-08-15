@@ -13,8 +13,9 @@ Before any query can run, each mention must be pinned to an actual record:
 `'Seattle - Northgate'`. stemma does that pinning — it **spans** the mentions,
 **links** them to candidate records, and returns a **resolution with
 evidence**. That grounding artifact is independently useful and is the first
-stage of the planned semantic parser. Parsing will produce a parameterized,
-read-only SQLite syntax tree only after grounding ambiguity is settled. The
+stage of the semantic parser. The implemented parser slice produces a
+parameterized, read-only SQLite syntax tree only after grounding ambiguity is
+settled. The
 published error analyses say this linking step is a dominant source of
 natural-language database failures (the
 numbers, with their caveats, in
@@ -27,17 +28,17 @@ numbers, with their caveats, in
 |---|---|---|
 | example | `careg.db` | `careg.stemmadb` |
 | owned by | you | stemmadb |
-| contents | your tables | derived indexes, knowledge store, queues, registries |
+| contents | your tables | derived indexes, knowledge store, queues, registries, history, feedback |
 | mutability | attached **read-only** | read-write |
-| deletable? | it's your data | always — fully rebuildable\* |
+| deletable? | it is your data | yes, after applying your history and feedback retention policy\* |
 
 Both are ordinary SQLite files. stemma never modifies the user database, and
 SQLite itself is stock — the vector extension (sqlite-vec) is statically
 linked and registered through the sanctioned auto-extension mechanism.
 
 \* One caveat: the store also carries operational history (`query_log`,
-`chat_log`), which is yours and *not* rebuildable — back it up like data if
-the history matters.
+`chat_log`, and `grounding_feedback`), which is yours and *not* rebuildable.
+Back it up like data if the history matters.
 
 ## The resolution pipeline
 
@@ -52,13 +53,16 @@ constants is [design/03-resolution.md](../design/03-resolution.md).
 2. **Candidate generation** — always hybrid: exact/normalized match, FTS5
    BM25, trigram fuzzy match, and targeted vector KNN, fused with
    reciprocal rank fusion. A dense cosine additionally floors the fused
-   score after calibration — semantic evidence survives having no lexical
-   company.
+   score through a fixed heuristic mapping, so semantic evidence can survive
+   without lexical support. Fused scores are rankings and are not
+   probabilities. Exact vector search is the default. An optional approximate
+   document index proposes rows, which are exactly rescored. Every
+   mention-producing span is then confirmed through the exact path.
 3. **Collective disambiguation** — candidates for co-occurring mentions are
-   scored *jointly*: a pair whose tables connect through a foreign-key path
-   is verified with a probe against the read-only user DB, and the winning
-   tuple carries the path as evidence — the right "Chen" for *Chen's
-   Billing team* is the one who leads it.
+   scored together. The resolver probes candidate pairs whose tables connect
+   through a foreign-key path. A winning pair carries that verified path as
+   evidence. In *Chen's Billing team*, the connected team record can separate
+   people who share the surname.
 4. **LM adjudication** — only for near-ties the channels could not order: a
    language model chooses among the presented candidates (constrained
    output, explicit "none of the above"). The LM is never the retrieval
@@ -80,12 +84,11 @@ resolution code:
   bounded path search between tables, subgraph extraction). First backend:
   SQLite tables + recursive CTEs inside the store. A dedicated graph
   database can replace it.
-- **Embedder** (stemma-embed): batch embedding + model identity. First
-  backend: the OpenAI-compatible `/v1/embeddings` client (vLLM, llama.cpp,
-  LiteLLM in one implementation).
-- **LM backends** (stemma-lm): chat completion with optional structured
-  output, registry-by-model-string. The OpenAI-compatible client covers
-  vLLM, llama.cpp, LiteLLM, and hosted compatibility endpoints.
+- **Embedder** (stemma-embed): batch embedding and model identity. The
+  implemented remote client uses the configured embedding-service endpoint.
+- **Language-service backends** (stemma-lm): chat completion with optional
+  structured output and registry-by-model-string. The implemented remote
+  client uses the configured language-service endpoint.
 
 The **model registry** in the store records which backend/model produced
 every vector table. Vector spaces from different models are never mixed —
@@ -96,16 +99,18 @@ a mismatched identity is a hard error, not a warning.
 | Component | Status |
 |---|---|
 | Bazel/Cargo dual build, all tests | ✅ |
-| stemmadb storage layer (store schema v4, migrations, history) | ✅ |
+| stemmadb storage layer (store schema v7, migrations, history, feedback) | ✅ |
 | Lexical resolution (exact/FTS5/trigram + RRF) | ✅ |
-| Dense channel (openai-compat embedder, vec0, queue drain) | ✅ |
+| Dense channel (remote embedder, vec0, queue drain) | ✅ |
+| Optional approximate document-vector sidecar with exact mention safeguards | built behind a Cargo feature; exact remains the default |
 | Knowledge graph (terms, phrases, joins, centrality) + coherence | ✅ |
 | Collective disambiguation over join paths | ✅ |
 | LM adjudication band (`allow_lm`) | ✅ |
 | MCP server, reference agent, console with trajectories | ✅ |
-| Mention expansion | designed ([design/05](../design/05-encoders-decoders.md)) |
+| Verified mention expansion for spans with no candidates | built ([design/05](../design/05-encoders-decoders.md)) |
 | Evaluation harness | built ([design/07](../design/07-eval-harness.md)) |
-| Query-level interpretation and clarification | initial vertical slice built; calibration and dialogue evaluation staged ([design/08](../design/08-query-disambiguation.md)) |
-| Grounded SQLite semantic parser | staged; grounding completion is the release gate ([design/08](../design/08-query-disambiguation.md)) |
+| Query-level outcomes and grounding clarification | first deterministic slice built; alternative-recall and dialogue evaluation remain open ([design/08](../design/08-query-disambiguation.md)) |
+| Grounded SQLite semantic parser | first validated read-only slice built; broader SQLite coverage and query-structure clarification remain open ([design/08](../design/08-query-disambiguation.md)) |
+| Explicit trace-linked feedback | built; runtime learning is unsupported ([feedback guide](06-feedback.md)) |
 
 The deep reference for each piece is [docs/design/](../design/README.md).

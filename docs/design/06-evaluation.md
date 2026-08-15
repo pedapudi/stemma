@@ -3,9 +3,9 @@
 > The runnable harness built on this protocol — tiers, ablations, grading —
 > is designed in [07-eval-harness.md](07-eval-harness.md).
 
-The built harness evaluates the resolution artifact. The staged semantic
-parser adds execution accuracy as a separate downstream layer without
-replacing grounding metrics. This document specifies the grounding evaluation
+The built harness evaluates the resolution artifact. The implemented parser
+slice still needs a separate execution-accuracy layer; parser scores do not
+replace grounding metrics. This document specifies the grounding evaluation
 protocol: why the no-evidence setting is the only honest one, how ground
 truth is derived from gold SQL instead of hand-labelled, why the metrics are
 recall-weighted, what the corpora are for, and what each milestone gate has
@@ -232,7 +232,27 @@ Execution accuracy is not attributed to grounding because it also measures
 query construction. Parser evaluation therefore runs twice: once with gold
 traces and once with predicted traces. The gap attributes grounding debt while
 syntax validity, safe compilation, and denotation accuracy measure parsing.
-See [08-query-disambiguation.md](08-query-disambiguation.md#evaluation-layers).
+See [08-query-disambiguation.md](08-query-disambiguation.md#evaluation-contract).
+
+### Ambiguity evaluation without representative calibration
+
+A small gold SQL set is an immutable regression and adversarial set. It does
+not estimate deployment accuracy when its sampling process differs from usage.
+Controlled ambiguity fixtures, gold SQL cases, and reviewed usage events are
+reported as separate populations.
+
+The grounding report treats scores as rankings unless representative labels
+demonstrate probabilistic reliability. Its score-conditioned accuracy plot
+shows the observed gold-link rate within each fused-score bucket for the
+evaluated population. The plot describes that population and does not turn a
+score into a deployment probability.
+
+Safety measures are false commitment rate, supported-alternative recall, gold
+candidate survival, clarification localization, and candidate-set cost.
+Worst-case alternative elimination and verified denotation divergence grade
+clarification without requiring candidate probabilities. The complete policy
+is in
+[08-query-disambiguation.md](08-query-disambiguation.md#decision-policy-without-held-out-calibration).
 
 ## Corpora
 
@@ -399,14 +419,15 @@ while column-strict recall@5 was 0.40. Layer 2 correlation and the separately
 gated agent-grounding cases remain incomplete; see
 [07-eval-harness.md](07-eval-harness.md).
 
-**Gate — query-level disambiguation.** *Initial vertical slice built; gate not
-yet met.* Outcome contracts and deterministic first-pass grounding
-clarification exist. Ambiguity localization, risk–coverage, decision
-equivalence, and multi-turn clarification must pass before complete grounding
-can be claimed. Parser acceptance then measures syntax validity, grounded
-identifier compliance, safe compilation, and denotation accuracy using both
-gold and predicted traces. See
-[08-query-disambiguation.md](08-query-disambiguation.md#evaluation-layers).
+**Gate — query-level disambiguation.** *The protocol and persistence slice is
+built; the evaluation gate is open.* Outcome contracts, deterministic
+first-pass clarification, validated parsing, and trace-linked typed feedback
+exist. Supported-alternative recall, false commitment, decision equivalence,
+and multi-turn clarification must pass before complete grounding can be
+claimed. Parser acceptance measures syntax validity, grounded identifier
+compliance, safe compilation, and denotation accuracy using both gold and
+predicted traces. See
+[08-query-disambiguation.md](08-query-disambiguation.md#evaluation-contract).
 
 ## References
 

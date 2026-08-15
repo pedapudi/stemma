@@ -71,7 +71,11 @@ pub struct QueryOutcome {
 }
 
 fn norm(s: &str) -> String {
-    s.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    s.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn strip_wildcards(s: &str) -> String {
@@ -163,10 +167,7 @@ pub fn locate_gold_span(question: &str, target: &Target) -> Option<(usize, usize
             break;
         }
         let start = chars[w].0;
-        let end = chars
-            .get(w + nchars)
-            .map(|c| c.0)
-            .unwrap_or(question.len());
+        let end = chars.get(w + nchars).map(|c| c.0).unwrap_or(question.len());
         if question[start..end].to_lowercase() == needle {
             return Some((start, end));
         }
@@ -210,9 +211,7 @@ pub fn score_query(
                 } else {
                     c.value.clone()
                 };
-                if value_matches(target, &val, c.is_doc)
-                    && loose_rank.is_none_or(|r| rank < r)
-                {
+                if value_matches(target, &val, c.is_doc) && loose_rank.is_none_or(|r| rank < r) {
                     loose_rank = Some(rank);
                 }
                 if is_gold_row(target, &c.table, &c.column, c.rowid, probe)
@@ -500,8 +499,8 @@ pub fn aggregate(outcomes: &[&QueryOutcome]) -> Cell {
     }
 }
 
-/// Calibration curve: P(candidate links a gold row | fused-score bucket),
-/// ten buckets over [0, 1].
+/// Observed gold-link rate within each of ten fused-score buckets over [0, 1].
+/// The result is descriptive and does not treat fused scores as probabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationBucket {
     pub lo: f64,

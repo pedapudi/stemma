@@ -390,7 +390,7 @@ table.matrix td { padding: 0; }
 .drawer { margin: 10px 0 16px; }
 .drawer table.grid td.q { font-family: var(--sans); max-width: 46ch; overflow-wrap: anywhere; }
 
-/* calibration */
+/* score-conditioned accuracy */
 .calgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 .calcard svg { display: block; width: 100%; height: auto; }
 .callabel { font-family: var(--mono); font-size: calc(10.5px * var(--fs)); color: var(--ink-soft); margin-top: 4px; }
@@ -1152,15 +1152,15 @@ function calibrationSection(run) {
       class: "subhead"
     }, ab), calibrationSvg(buckets), el("div", {
       class: "callabel"
-    }, "P(gold | score bucket) \u2014 dashed identity is perfect calibration")));
+    }, "observed gold-link rate within each fused-score bucket")));
   }
   return el("div", {
     class: "section"
   }, el("div", {
     class: "h2"
-  }, "calibration"), el("div", {
+  }, "score-conditioned accuracy"), el("div", {
     class: "lede"
-  }, "the fused scores claim absolute meaning (bands at 0.35 / 0.85 / 0.9); this curve is the ", "direct test. bucket area scales with sample count."), grid);
+  }, "this descriptive view does not treat fused scores as probabilities. point area scales ", "with sample count."), grid);
 }
 function calibrationSvg(buckets) {
   const W = 260, H = 180, L = 34, B = 24, T = 8, R = 8;
@@ -1207,15 +1207,6 @@ function calibrationSvg(buckets) {
       "font-family": "var(--mono)"
     }, String(v)));
   }
-  svg.append(svgEl("line", {
-    x1: x(0),
-    y1: y(0),
-    x2: x(1),
-    y2: y(1),
-    stroke: "var(--flat)",
-    "stroke-width": 1,
-    "stroke-dasharray": "3 3"
-  }));
   const pts = buckets.filter((b) => b.n > 0);
   if (pts.length > 0) {
     const path = pts.map((b, i) => `${i === 0 ? "M" : "L"}${x((b.lo + b.hi) / 2).toFixed(1)},${y(b.p_gold).toFixed(1)}`).join(" ");

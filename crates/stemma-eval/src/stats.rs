@@ -158,7 +158,9 @@ mod tests {
     #[test]
     fn noise_is_not_significant() {
         // Alternating ±0.1 sums to zero.
-        let diffs: Vec<f64> = (0..40).map(|i| if i % 2 == 0 { 0.1 } else { -0.1 }).collect();
+        let diffs: Vec<f64> = (0..40)
+            .map(|i| if i % 2 == 0 { 0.1 } else { -0.1 })
+            .collect();
         let p = paired_randomization_p(&diffs, 10_000);
         assert!(p > 0.5, "p = {p}");
     }
@@ -178,7 +180,11 @@ mod tests {
         let scores: Vec<Vec<f64>> = (0..40)
             .map(|i| {
                 let base = 0.5 + 0.01 * ((i % 5) as f64);
-                vec![base, base + if i % 2 == 0 { 0.01 } else { -0.01 }, base + 0.3]
+                vec![
+                    base,
+                    base + if i % 2 == 0 { 0.01 } else { -0.01 },
+                    base + 0.3,
+                ]
             })
             .collect();
         let ps = randomized_tukey_hsd(&scores, 3, 5_000);

@@ -61,7 +61,7 @@ returns), FTS5 is present, and user databases attach read-only.
 
 ```
 your-data.db            # your SQLite database — never modified
-your-data.stemmadb      # created next to it: all derived state
+your-data.stemmadb      # derived indexes plus retained history and feedback
 ```
 
 Point the server at a database and the sidecar store is created automatically:
@@ -83,7 +83,8 @@ Continue with the [walkthrough](../walkthrough.md) or the
   databases; the `database` field of ResolveRequest must match a registered
   name exactly.
 - **Store version mismatch error on open** — the `.stemmadb` file was written
-  by a different schema version. Delete the `.stemmadb` file (it is derived
-  state) and re-run; it will be rebuilt.
+  by a newer schema version. Use a compatible server build, or preserve its
+  query, chat, and feedback records before moving the file aside and
+  re-ingesting. Older stores migrate in place when opened.
 - **Slow first build** — expected; crate_universe fetches all workspace
   dependencies once. Subsequent builds hit the Bazel cache.

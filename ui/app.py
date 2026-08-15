@@ -32,6 +32,16 @@ class ChatRequest(BaseModel):
     conversation: str = "default"
 
 
+class FeedbackRequest(BaseModel):
+    episode_id: str
+    category: str
+    scope: str = "database"
+    span_id: int | None = None
+    candidate_index: int | None = None
+    clarification_option: int | None = None
+    correction: str = ""
+
+
 def create_app(
     dbs: dict[str, str],
     grpc_target: str,
@@ -130,6 +140,26 @@ def create_app(
             return client.explain_dict(q, database=name, source="console", allow_lm=True)
         except grpc.RpcError as e:
             raise HTTPException(502, f"stemma-server: {e.code().name}: {e.details()}") from e
+
+    @app.post("/api/db/{name}/feedback")
+    def feedback(name: str, req: FeedbackRequest):
+        browser(name)
+        try:
+            stored = client.submit_feedback(
+                name,
+                req.episode_id,
+                req.category,
+                req.scope,
+                span_id=req.span_id,
+                candidate_index=req.candidate_index,
+                clarification_option=req.clarification_option,
+                correction=req.correction,
+            )
+            return {"id": stored.id, "episode_id": stored.episode_id}
+        except (AttributeError, ValueError) as e:
+            raise HTTPException(400, str(e)) from e
+        except grpc.RpcError as e:
+            raise HTTPException(400, e.details()) from e
 
     @app.post("/api/db/{name}/chat")
     async def chat(name: str, req: ChatRequest):

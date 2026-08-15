@@ -2,7 +2,11 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 rust_library(
     name = "stemma-resolve",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/dense.rs",
+        "src/dense_stub.rs",
+        "src/lib.rs",
+    ],
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [

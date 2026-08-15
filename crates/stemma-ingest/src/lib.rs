@@ -273,8 +273,7 @@ pub fn build_lexical_index(db: &StemmaDb, force: bool) -> Result<IndexStats> {
     // whenever any table moved, or when their own receipt is stale (new
     // store, or LEX_DERIVATION_VERSION bumped).
     let corpus_fp = corpus_fingerprint(conn)?;
-    if !dirty.is_empty() || !gone.is_empty() || read_receipt(conn, "profiles")? != Some(corpus_fp)
-    {
+    if !dirty.is_empty() || !gone.is_empty() || read_receipt(conn, "profiles")? != Some(corpus_fp) {
         profile_columns(db)?;
     }
 
@@ -353,10 +352,7 @@ fn ingest_table(
 /// Reads the `derivations` receipt for one artifact, returning its input
 /// fingerprint only when the derivation version also matches — a receipt
 /// from an older algorithm is stale by definition.
-fn read_receipt(
-    conn: &stemmadb::rusqlite::Connection,
-    artifact: &str,
-) -> Result<Option<String>> {
+fn read_receipt(conn: &stemmadb::rusqlite::Connection, artifact: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT input_fingerprint FROM derivations
@@ -731,10 +727,7 @@ pub fn vocabulary_columns(db: &StemmaDb) -> Result<Vec<(String, String)>> {
     Ok(column_profiles(db)?
         .into_iter()
         .filter(|p| {
-            is_vocabulary_column(p)
-                && !boundary
-                    .as_ref()
-                    .is_some_and(|b| is_document_column(p, b))
+            is_vocabulary_column(p) && !boundary.as_ref().is_some_and(|b| is_document_column(p, b))
         })
         .map(|p| (p.src_table, p.src_column))
         .collect())
@@ -748,9 +741,7 @@ fn boundary_json(b: &DocBoundary) -> String {
 }
 
 /// The adopted document boundary from the `doc_cut` receipt, if one exists.
-fn read_adopted_boundary(
-    conn: &stemmadb::rusqlite::Connection,
-) -> Result<Option<DocBoundary>> {
+fn read_adopted_boundary(conn: &stemmadb::rusqlite::Connection) -> Result<Option<DocBoundary>> {
     let row: Option<(String, Option<f64>)> = conn
         .query_row(
             "SELECT json_extract(value_json, '$.adopted.kind'),
@@ -860,8 +851,7 @@ pub fn profile_columns(db: &StemmaDb) -> Result<usize> {
                  idlike_ratio, idlike_lcb, avg_len, median_len)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )?;
-        for (table, column, n, n_distinct, alpha, numeric, temporal, idlike, avg_len) in &profiles
-        {
+        for (table, column, n, n_distinct, alpha, numeric, temporal, idlike, avg_len) in &profiles {
             let ratio = |k: i64| k as f64 / (*n).max(1) as f64;
             let median = medians
                 .get(&(table.clone(), column.clone()))
@@ -1045,6 +1035,7 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         _ => panic!("vec_staging holds mixed model identities: {identities:?}"),
     };
 
+    bump_vector_generation(conn, "vec_dense")?;
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS vec_dense;
          CREATE VIRTUAL TABLE vec_dense USING vec0(
@@ -1151,11 +1142,10 @@ pub fn derive_dense_geometry(db: &StemmaDb) -> Result<Option<(f64, f64)>> {
     // Evenly-strided rowid probes: vec0 assigns rowids sequentially, so a
     // stride over [min, max] samples the corpus without scanning it. Gaps
     // (deleted rows) just shrink the sample.
-    let (lo, hi): (i64, i64) = conn.query_row(
-        "SELECT min(rowid), max(rowid) FROM vec_dense",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (lo, hi): (i64, i64) =
+        conn.query_row("SELECT min(rowid), max(rowid) FROM vec_dense", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
     let stride = ((hi - lo) / GEOMETRY_SAMPLE as i64).max(1);
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(GEOMETRY_SAMPLE);
     let mut probe = conn.prepare("SELECT embedding FROM vec_dense WHERE rowid = ?1")?;
@@ -1201,9 +1191,8 @@ pub fn derive_dense_geometry(db: &StemmaDb) -> Result<Option<(f64, f64)>> {
 
     // Nearest-neighbor scale: KNN k=2 (self + nearest distinct) for a
     // quarter of the sample — 32 brute-force scans, bounded and fast.
-    let mut knn = conn.prepare(
-        "SELECT distance FROM vec_dense WHERE embedding MATCH ?1 AND k = 2",
-    )?;
+    let mut knn =
+        conn.prepare("SELECT distance FROM vec_dense WHERE embedding MATCH ?1 AND k = 2")?;
     let (mut nn_sum, mut nn_n) = (0.0f64, 0usize);
     for v in vectors.iter().take(GEOMETRY_SAMPLE / 4) {
         let blob: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -1348,10 +1337,7 @@ pub fn build_column_cards(db: &StemmaDb, embedder: &dyn Embedder) -> Result<ColC
         .map(|(_, _, c)| c.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let fingerprint = content_hash(&format!(
-        "{}|{COL_CARD_FORMAT}|{joined}",
-        identity.model
-    ));
+    let fingerprint = content_hash(&format!("{}|{COL_CARD_FORMAT}|{joined}", identity.model));
 
     let existing: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE name = 'col_cards'",
@@ -1525,7 +1511,16 @@ pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
         "CREATE INDEX IF NOT EXISTS temp.covered_key ON covered(src_table, src_column, src_rowid);",
     )?;
 
-    type Item = (String, String, i64, String, Option<i64>, String, String, bool);
+    type Item = (
+        String,
+        String,
+        i64,
+        String,
+        Option<i64>,
+        String,
+        String,
+        bool,
+    );
     let items: Vec<Item> = {
         let mut stmt = conn.prepare(
             "SELECT lv.src_table, lv.src_column, lv.src_rowid, lv.value,
@@ -1567,9 +1562,8 @@ pub fn enqueue_missing_embeddings(db: &StemmaDb) -> Result<usize> {
                     serialized = '', content_hash = ?2, updated_at = datetime('now')
              WHERE id = ?1",
         )?;
-        let mut adopt = conn.prepare_cached(
-            "UPDATE embed_queue SET content_hash = ?2 WHERE id = ?1",
-        )?;
+        let mut adopt =
+            conn.prepare_cached("UPDATE embed_queue SET content_hash = ?2 WHERE id = ?1")?;
         for (table, column, rowid, value, qid, status, stored_hash, covered) in items {
             let hash = content_hash(&value);
             match qid {
@@ -1793,9 +1787,8 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
             )?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
-        let mut del = conn.prepare_cached(
-            "DELETE FROM vocab_cols WHERE src_table = ?1 AND src_column = ?2",
-        )?;
+        let mut del =
+            conn.prepare_cached("DELETE FROM vocab_cols WHERE src_table = ?1 AND src_column = ?2")?;
         for (table, label) in pairs {
             // Labels are "src_col → dst_col" (inferred joins mark "→?");
             // both endpoint columns are key columns for their tables.
@@ -1876,7 +1869,17 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
     // 98 useful documents). The card's head value is the MODAL spelling
     // across the interpretation's rows (issue #6): deterministic, never the
     // representative row's accident.
-    type Cand = (String, String, i64, String, String, Option<i64>, String, String, bool);
+    type Cand = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<i64>,
+        String,
+        String,
+        bool,
+    );
     let candidates: Vec<Cand> = {
         let mut stmt = conn.prepare(
             "SELECT t.src_table, t.src_column, t.rep, t.value_norm,
@@ -1964,7 +1967,8 @@ pub fn enqueue_missing_interpretations(db: &StemmaDb) -> Result<usize> {
             "UPDATE embed_queue SET serialized = ?2, content_hash = ?3 WHERE id = ?1",
         )?;
         let mut processed = 0usize;
-        for (table, column, rep, value_norm, value, qid, status, stored_hash, covered) in candidates {
+        for (table, column, rep, value_norm, value, qid, status, stored_hash, covered) in candidates
+        {
             // Long sweeps must not monopolize the WAL writer: commit every
             // 500 items so concurrent query_log writes proceed and progress
             // survives interruption (the sweep is idempotent).
@@ -2083,8 +2087,7 @@ pub fn drain_embed_queue(
                 offered: offered.clone(),
             }),
             Some((_, t))
-                if !t.is_empty()
-                    && !stemma_embed::query_templates_agree(t, &offered_template) =>
+                if !t.is_empty() && !stemma_embed::query_templates_agree(t, &offered_template) =>
             {
                 Some(Error::QueryTemplateMismatch {
                     table: table.to_string(),
@@ -2281,6 +2284,8 @@ pub fn drain_embed_queue(
             )?;
         }
 
+        let mut changed_dense = false;
+        let mut changed_interp = false;
         for ((id, table, column, rowid, target), vector) in writes {
             let blob: Vec<u8> = vector.iter().flat_map(|x| x.to_le_bytes()).collect();
             let inserted = conn.execute(
@@ -2292,6 +2297,10 @@ pub fn drain_embed_queue(
             );
             match inserted {
                 Ok(_) => {
+                    match *target {
+                        "vec_dense" => changed_dense = true,
+                        _ => changed_interp = true,
+                    }
                     conn.execute(
                         "UPDATE embed_queue SET status = 'done', error = '',
                                 updated_at = datetime('now')
@@ -2313,6 +2322,12 @@ pub fn drain_embed_queue(
                 }
             }
         }
+        if changed_dense {
+            bump_vector_generation(conn, "vec_dense")?;
+        }
+        if changed_interp {
+            bump_vector_generation(conn, "vec_interp")?;
+        }
         tx.commit()?;
     }
 
@@ -2326,6 +2341,15 @@ pub fn drain_embed_queue(
         failed,
         remaining: remaining as usize,
     })
+}
+
+fn bump_vector_generation(conn: &stemmadb::rusqlite::Connection, table: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO vector_generations (vector_table, generation) VALUES (?1, 1)
+         ON CONFLICT(vector_table) DO UPDATE SET generation = generation + 1",
+        [table],
+    )?;
+    Ok(())
 }
 
 /// TEXT-typed columns of every user table.
@@ -2427,7 +2451,9 @@ mod tests {
         assert!(receipt.contains("null_mean"));
         // Second call is served by the receipt and agrees (to the receipt's
         // six-decimal storage precision).
-        let (n2, nn2) = derive_dense_geometry(&db).unwrap().expect("cached geometry");
+        let (n2, nn2) = derive_dense_geometry(&db)
+            .unwrap()
+            .expect("cached geometry");
         assert!((n2 - null_mean).abs() < 1e-5 && (nn2 - nn_mean).abs() < 1e-5);
 
         // Under-populated index: no geometry, no receipt left behind.
@@ -2638,10 +2664,7 @@ mod tests {
             .unwrap();
         build_lexical_index(&db, false).unwrap();
         let profiles = column_profiles(&db).unwrap();
-        let p = profiles
-            .iter()
-            .find(|p| p.src_column == "name")
-            .unwrap();
+        let p = profiles.iter().find(|p| p.src_column == "name").unwrap();
         assert_eq!(p.distinct_ratio, 1.0);
         assert!(
             p.distinct_lcb < 0.7,
@@ -2736,7 +2759,12 @@ mod tests {
         )
         .unwrap();
         let brands = ["allegra k", "calvin klein", "levi's", "carhartt", "nike"];
-        let cats = ["Outerwear & Coats", "Dresses", "Suits & Sport Coats", "Jeans"];
+        let cats = [
+            "Outerwear & Coats",
+            "Dresses",
+            "Suits & Sport Coats",
+            "Jeans",
+        ];
         for i in 0i64..40 {
             conn.execute(
                 "INSERT INTO src.products VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3251,7 +3279,10 @@ mod tests {
             .unwrap();
         enqueue_missing_embeddings(&db).unwrap();
         let err = drain_embed_queue(&db, &FakeEmbedder::new(8), EMBED_BATCH).unwrap_err();
-        assert!(matches!(err, Error::QueryTemplateMismatch { .. }), "got {err}");
+        assert!(
+            matches!(err, Error::QueryTemplateMismatch { .. }),
+            "got {err}"
+        );
         assert_eq!(queue_counts(&db), (0, 0, 3));
     }
 
@@ -3776,10 +3807,7 @@ mod tests {
                 .repeat(3)
         );
         db.conn()
-            .execute(
-                "UPDATE src.articles SET body = ?1 WHERE id = 2",
-                [&revised],
-            )
+            .execute("UPDATE src.articles SET body = ?1 WHERE id = 2", [&revised])
             .unwrap();
         // An in-place UPDATE preserves count:max:sum — the fingerprint's
         // documented blind spot — so this is the `force` path. The point of
@@ -3943,7 +3971,10 @@ mod tests {
                 .unwrap();
             (1.0 + m).ln()
         };
-        assert!(summary_log > current, "fixture: summaries sit above the cut");
+        assert!(
+            summary_log > current,
+            "fixture: summaries sit above the cut"
+        );
         db.conn()
             .execute(
                 "UPDATE derivations SET value_json =

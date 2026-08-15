@@ -15,16 +15,18 @@ fn main() {
         std::process::exit(2);
     }
     let passes: usize = args.get(4).map(|s| s.parse().expect("passes")).unwrap_or(2);
-    let questions: Vec<String> = std::io::BufReader::new(
-        std::fs::File::open(&args[3]).expect("questions file"),
-    )
-    .lines()
-    .map(|l| l.expect("read line"))
-    .filter(|l| !l.trim().is_empty())
-    .collect();
+    let questions: Vec<String> =
+        std::io::BufReader::new(std::fs::File::open(&args[3]).expect("questions file"))
+            .lines()
+            .map(|l| l.expect("read line"))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
 
-    let db = stemmadb::StemmaDb::open(std::path::Path::new(&args[1]), std::path::Path::new(&args[2]))
-        .expect("open store");
+    let db = stemmadb::StemmaDb::open(
+        std::path::Path::new(&args[1]),
+        std::path::Path::new(&args[2]),
+    )
+    .expect("open store");
 
     for pass in 0..passes {
         let mut times: Vec<f64> = Vec::new();
@@ -47,6 +49,9 @@ fn main() {
             (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
         };
         let total: f64 = times.iter().sum();
-        println!("pass={pass} median_ms={median:.1} total_ms={total:.1} n={}", times.len());
+        println!(
+            "pass={pass} median_ms={median:.1} total_ms={total:.1} n={}",
+            times.len()
+        );
     }
 }

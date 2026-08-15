@@ -23,13 +23,13 @@ resolution you cannot trust; the same standard applies to its documentation.
 ## The documents
 
 **[01 — Architecture](01-architecture.md)**
-System decomposition across nine Rust crates plus the Python client, MCP
+System decomposition across ten Rust crates plus the Python client, MCP
 server, reference agent and console; the process topology (one server
 process, everything else optional and separate, browsing that bypasses the
 server entirely); the ownership and trust boundaries — the read-only attach
-enforced by SQLite's VFS rather than by convention, the disposable derived
-state that makes drop-and-rebuild affordable, and the single sanctioned write
-from outside the core; the three trait seams (`KnowledgeStore`, `Embedder`,
+enforced by SQLite's VFS rather than by convention, rebuildable indexes beside
+retained operational history, and the single sanctioned write from outside the
+core; the three trait seams (`KnowledgeStore`, `Embedder`,
 LM backends) and which of them exist; the gRPC and MCP surfaces including the
 resolve-before-reference contract; and the argument for the shape — why a
 resolution engine beside a stock database beats putting the model inside the
@@ -37,12 +37,15 @@ database, and why a purpose-built resolver produces an artifact that a stack
 of general-purpose retrieval layers cannot.
 
 **[02 — Data model](02-data-model.md)**
-Every table with its DDL: the four `STRICT` bookkeeping tables
-(`model_registry`, `embed_queue`, `query_log`, `chat_log`), the lexical index
+Every table with its DDL: the seven `STRICT` bookkeeping tables
+(`model_registry`, `embed_queue`, `query_log`, `grounding_feedback`,
+`vector_generations`, `vector_sidecar_receipts`, `chat_log`), the lexical index
 (`lex_values` plus two external-content FTS5 tables and `lex_vocab`), the
 vector path (`vec_staging` → `vec_dense`, and why the staging table is
 deliberately not a virtual one), and the knowledge store (`kg_nodes`,
-`kg_edges`, `kg_meta`). The migration discipline:
+`kg_edges`, `kg_meta`). The vector-sidecar receipt binds an optional
+approximate index to its authoritative SQLite generation.
+The migration discipline:
 forward-only `PRAGMA user_version`, additive idempotent DDL re-applied
 wholesale, version-guarded `ALTER`s, drop-and-rebuild for pure derived
 indexes, and compiler-versioned fingerprints that let the knowledge
@@ -72,7 +75,9 @@ zero mentions for every query. The coherence bonus with a measured
 reordering, greedy non-overlapping selection, the trace contract, complexity
 analysis with measured latencies on a 92,696-document corpus, and fourteen
 named limitations — including the fusion constants that adding a fourth
-channel silently invalidated.
+channel silently invalidated. It also specifies the optional approximate
+vector sidecar, its exact-search ambiguity safeguard, and the measurements
+required before activation.
 
 **[04 — Knowledge graph](04-knowledge-graph.md)**
 The layered compiler and its algorithms: inclusion-dependency mining with the
@@ -91,31 +96,16 @@ the design of the loop's future: the instance layer, collective
 disambiguation over join paths, and KG-guided expansion.
 
 **[05 — Encoders and decoders](05-encoders-decoders.md)**
-The dense channel as built and as designed: `vec0` table shape, model-registry
-identity and the empty-`revision` gap, external staging versus the unbuilt
-embed queue, the four query-time symmetry requirements and which of them is
-currently unchecked, and the fusion debt that adding a fourth channel created
-without anyone editing the scoring code. Then the argument that makes
-per-corpus encoders necessary rather than nice — **embedding-space
-crowding**, where a domain-uniform corpus collapses into a narrow region of a
-general-purpose encoder's space and retrieval discrimination goes with it —
-grounded in the anisotropy, degeneration and hubness literature, and then
-*measured*: on this repository's own legal corpus a general encoder places
-California's regulations and the federal eCFR at centroid cosine 0.81 and
-retains 83% of the noise budget a well-spread corpus would have. How
-[ambit](https://github.com/pedapudi/ambit) — a measurement instrument, not a
-training pipeline — makes that number *exact* rather than indicative in
-stemma's entity-resolution regime, why its doctrine puts training last behind
-centering and deduplication, and why it and stemma compose without overlap:
-ambit names which records are unresolvable at what noise budget, and has no
-linking layer; stemma decides. Then what three rounds of corpus tuning
-actually did, including a split verdict and an honest negative result, and how
-tuned encoders slot in as registry-identified vector generations — four of
-them, each 100% uuid-covered, already on disk. The decoder's two roles — mention
-expansion before retrieval and constrained select-among-k with explicit NIL
-after it — the evidence against making the decoder the retrieval mechanism,
-the `rewritten_query` substitution artifact, and the agent/MCP layer as the
-consumption pattern that ties them together.
+The implemented dense channel, vector-table identity, interpretation cards,
+embed queue, and query-time symmetry checks. It documents the scoring debt
+created by a fourth retrieval channel. The geometry section explains
+embedding-space crowding and reports measurements from the legal corpus.
+[Ambit](https://github.com/pedapudi/ambit) supplies collision diagnostics for a
+stated noise budget. Stemma adds interpretation identity, graph paths, schema
+roles, and database probes because geometry cannot determine referent identity.
+The adaptation section records positive and negative retrieval results and
+keeps training behind cheaper repairs. The language-service section specifies
+bounded mention expansion and candidate adjudication.
 
 **[06 — Evaluation](06-evaluation.md)**
 The BIRD no-evidence protocol and why it is the only setting that measures
@@ -137,22 +127,34 @@ the mechanism × tier matrix as the primary artifact — with
 tier-mechanism containment graded so that a mechanism moving an off-target
 tier fails the run even when it moves it upward. Grounded in
 GraphRAG-Bench's finding that structure helps only on the tiers that need
-it, and that only per-tier reporting can see this.
+it, and that only per-tier reporting can see this. A separate implemented
+shadow comparator measures approximate dense retrieval against the exact
+SQLite oracle without semantic labels.
 
 **[08 — Query-level disambiguation](08-query-disambiguation.md)**
-The grounding-first semantic-parser roadmap: the resolution trace remains the
+The grounding-first semantic-parser contract: the resolution trace remains the
 only grounding artifact, an optional bounded service proposes parameterized
 queries, and deterministic validation admits a grounded SQLite syntax tree.
-It defines grounding gates, clarification behavior, semantic coverage,
+It defines calibration-free grounding decisions, the proper role of a small
+gold SQL set, trace-linked feedback, clarification behavior, semantic coverage,
 hermetic and live evaluation, and the explicit rejection of a custom
 intermediate representation.
 
+**[09 — Usage-guided learning](09-usage-guided-learning.md)**
+The boundary between explicit feedback and learned behavior. The episode event
+contract is implemented. Evidence grades, near-tie preferences,
+graph-and-geometry ambiguity hotspots, reviewed example export, and
+representation adaptation remain research designs. A runnable offline harness
+compares six bounded retrieval policies; collecting a reviewed study population
+and using its results in runtime retrieval remain open. The document states one
+falsifiable claim that connects these pieces.
+
 **[00 — Bibliography](00-bibliography.md)**
 The shared reference list, grouped by topic, with citation keys disambiguated
-by first-author given name where surnames collide. Sections A–G and I were checked
-against the published record — anthology pages, proceedings, DOIs — rather
-than cited from memory; section H is labelled as checked against a secondary
-list. It closes with notes on contested claims, including why this document
+by first-author given name where surnames collide. The core topical sections
+were checked against anthology pages, proceedings, and DOI records. The
+additional geometry section states its secondary-source verification boundary.
+The bibliography closes with notes on contested claims, including why this document
 set leads with the BIRD no-evidence ablations rather than with the widely
 quoted "~37% of failures are schema linking" figure, which turns out to rest
 on a single paper's own error profile.
@@ -162,4 +164,4 @@ on a single paper's own error profile.
 For the design argument, read 01 then 05 — the topology and the
 encoder/decoder split are the same decision seen from two sides. For the
 implementation, read 02 then 03 then 04, which is the order the data flows.
-For the research framing, read 06, 08 and the bibliography.
+For the research framing, read 06, 08, 09 and the bibliography.

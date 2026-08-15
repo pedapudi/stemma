@@ -27,13 +27,15 @@ labeled with its protocol and direction.
 **stemma-server** (`crates/stemma-server`, Rust) is the gRPC front door on
 `127.0.0.1:50051`, serving `Resolve` (selected mentions with evidence),
 `Explain` (the full trajectory, near-misses included), and `Parse` (grounded,
-validated query proposals). At
-startup it registers each configured database: it opens the `.stemmadb`
+validated query proposals). The same service records, lists, and deletes typed
+feedback for recorded episodes. At startup it registers each configured
+database: it opens the `.stemmadb`
 sidecar as the connection's `main` schema, attaches the user database
 read-only as `src`, builds the lexical index (`stemma-ingest`), compiles the
 knowledge graph (`stemma-kg`), and promotes any staged vectors into the
-dense index. After every non-empty resolve it appends one `query_log` row —
-a failed history write never fails the resolution. The topology image still
+dense index. After every non-empty Resolve, Explain, or Parse request, it
+appends one `query_log` row. A failed history write never fails resolution.
+The topology image still
 focuses on the grounding path; parsing reuses the same optional language
 service and never writes the user database.
 
@@ -123,7 +125,7 @@ rank-0 channels reach 1.0, then shaped by what the candidate is: exact
 matches land in [0.9, 1.0] (definitionally right about the value), documents
 cap at 0.85 (a mention resolves *into* a document; punishing length would
 break retrieval), and short values scale by a length-affinity factor. The
-dense cosine then acts as a calibrated floor —
+dense cosine then acts as a fixed heuristic floor —
 `score ≥ ((cos − 0.30)/0.30) · 0.78` — because a 0.6-cosine match must
 survive having no lexical company.
 
@@ -156,7 +158,10 @@ produced.
 
 **out** comes a `Trace`: `Resolve` serializes only the selected mentions,
 `Explain` the entire trajectory. The server then appends `query_log`
-(query · mentions · elapsed_ms · source · session).
+(query · mentions · elapsed_ms · source · session) with an opaque episode
+identifier, evidence selectors, and revision receipts. Explicit feedback
+references that episode. The console renders whole-episode approval and
+rejection controls below the in-situ trajectory.
 
 ---
 
@@ -164,9 +169,9 @@ produced.
 
 ![the .stemmadb store](../assets/diagrams/store.svg)
 
-One SQLite file (WAL mode, `PRAGMA user_version = 5`) holds everything
-stemma derives; the user database is attached read-only as `src` and is
-never written. Groups, with their writers:
+One SQLite file (WAL mode, `PRAGMA user_version = 7`) holds derived indexes,
+operational history, and feedback. The user database is attached read-only as
+`src` and is never written. Groups, with their writers:
 
 **lexical index** — written by `stemma-ingest` at server startup and on
 refresh (receipt-driven: only tables whose content fingerprint moved
@@ -205,12 +210,21 @@ serving is never blocked, and resolution gets denser as the drain runs. A
 registry row bound to a different model refuses the whole batch rather
 than mixing vector spaces.
 
+The optional approximate vector file is a rebuildable projection of document
+vectors. Its `vector_sidecar_receipts` row binds corpus fingerprint, vector
+revision, generation token, count, dimension, metric, and checksum. Invalid
+projections use the exact SQLite search path. Approximate identity keys map back
+to SQLite vectors for exact rescoring. Every mention-producing span receives an
+exact-search check before fusion.
+
 **operational history** — the store is also working memory. `query_log` is
-written by the resolution server after every resolve, tagged with `source`
-("console", "agent", "mcp") and `session`; `chat_log` is written by the
-console's `AgentChat` — conversation, role, content, and the tool trail as
-JSON. Both are ordinary tables, queryable through the console's SQL view or
-the MCP `sql` tool like everything else.
+written by the resolution server after every non-empty Resolve, Explain, or
+Parse request. It carries `source` and `session`. A persisted row also contains
+the episode identifier, compact
+candidate selectors, revision receipts, and parse output. `grounding_feedback`
+references those episodes. `chat_log` is written by the console with the
+conversation, role, content, and tool trail as JSON. These are ordinary tables,
+queryable through the console's SQL view or the MCP `sql` tool.
 
 **migrations** are additive: the full DDL is idempotent and re-applied on
 open, non-idempotent `ALTER`s are guarded per version (v2→v3 added

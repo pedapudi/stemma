@@ -1,25 +1,20 @@
 # Encoders and decoders
 
-**What is built, as of this writing:** the `Embedder` trait and its
-OpenAI-compatible backend ([`stemma-embed`](../../crates/stemma-embed/src/lib.rs)),
-the `vec_staging` → `vec_dense` promotion path with its `model_registry`
-write, **index-time embedding through the queue** (enqueue at startup, an
-async drain through the `Embedder`), the targeted dense retrieval channel
-inside the pipeline, the consumption pattern (MCP surface and reference
-agent), and — from the decoder half — **constrained adjudication**: the
-`LmBackend` trait and its OpenAI-compatible chat backend
-([`stemma-lm`](../../crates/stemma-lm/src/lib.rs)), and the ambiguous-band
-select-among-k with explicit NIL inside the pipeline
-(`stemma_resolve::resolve_full`), gated by `ResolveOptions.allow_lm`. The
-mechanics of the built parts are specified in
+**Implemented:** the `Embedder` trait and configured remote backend
+([`stemma-embed`](../../crates/stemma-embed/src/lib.rs)); staging promotion,
+model-registry writes, content-hashed queue drain, targeted dense retrieval,
+and query-time affinity; and the `LmBackend` trait
+([`stemma-lm`](../../crates/stemma-lm/src/lib.rs)). The language-service bands
+perform verified mention expansion for spans with no candidates and constrained
+candidate adjudication with explicit NIL. `ResolveOptions.allow_lm` gates both
+bands. The mechanics are specified in
 [02-data-model.md](02-data-model.md#vec_staging-and-vec_dense) and
 [03-resolution.md](03-resolution.md#stage-4b--the-dense-channel-targeted);
-this document gives the *why*, and everything it describes beyond those
-mechanics — online blue-green swaps,
-cross-encoder reranking, mention expansion, and the `Adjudication` evidence
-record — is **designed, not built**. (Re-embedding on data change *is*
-built: the content-hashed queue plus the server's refresh watch,
-[02-data-model.md](02-data-model.md#the-refresh-discipline).)
+this document explains the design reasons. Online blue-green swaps,
+cross-encoder reranking, and the structured `Adjudication` evidence record
+remain unimplemented. Re-embedding after data change is implemented through the
+content-hashed queue and server refresh watch
+([02-data-model.md](02-data-model.md#the-refresh-discipline)).
 
 The design rests on one division of labour, and this document argues it,
 specifies both halves, and then addresses the failure mode that decides
@@ -396,8 +391,8 @@ The dense channel joins as a fourth channel in
 and this is where adding it created a debt that has not been paid.
 
 The normalization denominator is the literal constant `3/K`: three channels
-at rank 0 gives `base = 1.0`. That was calibrated when there were exactly
-three channels, and it encodes the fact that **documents cannot reach the
+at rank 0 gives `base = 1.0`. That denominator was chosen when fusion had three
+channels, and it encodes the fact that **documents cannot reach the
 exact channel**, so their base topped out at 2/3 and their score at
 0.85 × 2/3 = 0.567 — comfortably below the 0.9 exact floor.
 
@@ -694,25 +689,30 @@ is unresolvable, and a low-rank space merely has less room. (The two are not
 unrelated: by a Chernoff bound, uniformity at t = 2 *is* a collision bound at
 σ = 0.25.)
 
-### The division of labour ambit implies
+### How geometry diagnostics combine with graph evidence
 
 ambit names the confusable records. Its per-entity fields report, by id, the
 radius each record needs to gather a fixed share of the corpus, and the
 expected collision count at σ\*. Its pocket detector surfaces tight groups
 with birth and death scales and lists their members by id.
 
-What it does not have — verified by grep across its documentation — is any
-notion of *linking*: no pair-linking, no transitive closure, no blocking keys,
-no match/non-match decision. It produces a diagnosis, not a resolution.
+Ambit has no pair-linking, transitive closure, blocking key, or match decision.
+It produces a geometry diagnosis. Stemma's entity-resolution and coherence
+layer records database evidence about each candidate.
 
-**That is exactly the seam stemma fills.** ambit says *these records are
-unresolvable at this noise budget*; stemma's entity-resolution and coherence
-layer decides *which of them are the same referent, and with what evidence*.
-The two halves compose without overlap, and the compose point is concrete: a
-record ambit flags with a high expected collision count is a record whose
-alias edges should carry a lower confidence, and a pocket ambit names is a
-candidate cluster for the instance layer to adjudicate rather than a set of
-independent rows.
+The combination requires the knowledge graph and indexed interpretation
+identity. A high collision count weakens embedding evidence when the close
+records occupy distinct schema roles or lack a verified database relation.
+Geometry does not weaken a declared foreign key or a same-interpretation
+identity. A crowded pocket can contain repeated instances of one indexed
+interpretation, records connected by joins, competing schema roles, and
+unrelated neighbors. Graph paths, database probes, and interpretation keys
+separate those cases before retrieval expansion or negative mining.
+
+Ambit remains an offline diagnostic. Runtime integration requires a controlled
+comparison against deeper fixed retrieval, score-margin expansion, and
+graph-directed expansion at identical bounds. The complete decision gate is in
+[usage-guided learning](09-usage-guided-learning.md#offline-ambit-decision-gate).
 
 Three honest limits on the diagnosis side, worth knowing before building on
 it: the merge tree runs on a subsample of at most 4,096 points, so pockets are
@@ -838,6 +838,13 @@ this machine; the retrieval table and the training configuration are reported
 by the project's own write-up and were not re-run here.*
 
 ### When measurement licenses training: ambit's hooks
+
+Stemma does not feed raw approvals or rejections into these hooks. A separate
+exporter must first verify the target against trace evidence, graph relations,
+indexed-corpus and vector-registry revisions, and deletion policy.
+Same-interpretation records and database-verified co-answer relations remain
+protected from negative mining. The full evidence grades and promotion gate are specified in
+[usage-guided learning](09-usage-guided-learning.md#exporting-reviewed-examples).
 
 When the diagnosis does land in the third row of the decision table, ambit
 ships the pieces to aim a fine-tune — about 200 lines, deliberately small:
@@ -1080,40 +1087,16 @@ Three properties are non-negotiable:
   demoted status on a NIL; the rationale-carrying evidence record does not
   exist yet.)
 
-`ResolveOptions.allow_lm` gates the whole band. With it off, resolution is
-purely lexical + dense + KG and fully local — no network, no model, no
-non-determinism. That is the default posture, and the LM is an escalation.
-
-### The `rewritten_query` artifact
-
-`ResolveResponse.rewritten_query` is the query with its mentions substituted
-by canonical values:
-
-> *"the Q3 numbers for the Seattle office"*
-> → *"the 2025Q3 numbers for the Seattle - Northgate office"*
-
-It exists because the most common downstream consumer is a query generator,
-and handing it a *pre-linked* question turns value linking from something it
-must do into something it must merely transcribe. This is the
-resolve-then-generate pattern [Talaei 2024] made concrete at the
-interface: the artifact carries the linking, and the generator writes SQL
-against a question whose oblique references have already been pinned.
-
-Substitution is mechanical once resolution is done — mentions carry byte
-offsets, candidates carry canonical values — but it is only *safe* once the
-pipeline can express confidence and abstention properly. Substituting a wrong
-value is worse than substituting nothing, because it launders a resolution
-error into a question that then looks unambiguous. So the field stays empty
-until adjudication and NIL exist: the substitution should happen for mentions
-the pipeline is confident about and leave the rest verbatim, which requires
-knowing the difference.
+`ResolveOptions.allow_lm` gates both language-service bands. With it off,
+resolution uses lexical, dense, and graph evidence without a language-service
+request. A configured remote embedder may still receive dense-channel spans.
 
 ### What the decoder must never do
 
 - It never enumerates candidates. Retrieval is the encoders' and the lexical
   channels' job.
 - It never sees the whole database. It sees *k* candidates and their evidence.
-- It never runs on the unambiguous band. An exact match scoring in [0.9, 1.0]
+- Adjudication never runs on the unambiguous band. An exact match scoring in [0.9, 1.0]
   does not need a model's opinion, and asking for one adds latency,
   non-determinism and a chance of being talked out of a correct answer.
 - It is never required. Every stage above it produces a complete, usable
@@ -1163,6 +1146,6 @@ Full bibliography, with venues and identifiers verified:
 - **Text-to-SQL** — [Talaei 2024] (CHESS).
 - **Embedding geometry** — [Ethayarajh 2019], [J. Gao 2019], [Bohan Li 2020],
   [Su 2021], [Huang 2021], [T. Gao 2021], [T. Wang 2020], [Radovanović 2010],
-  [Kusupati 2022], [Zhang 2025] (Qwen3-Embedding), and from section H:
+  [Kusupati 2022], [Zhang 2025], and from the additional geometry section:
   [Mu 2018], [Timkey 2021], [Cai 2021], [Godey 2024], [Jing 2022], [Roy 2007],
   [Rudman 2022], [Steck 2024], [Myllymäki 2017].
