@@ -56,6 +56,17 @@ pub fn register_extensions() {
     });
 }
 
+/// Escapes a filesystem path for the path part of a SQLite `file:` URI.
+/// `%` first (it introduces escapes), then `?` (starts the query) and `#`
+/// (starts the fragment) — unescaped, `#` silently truncates the path and
+/// `%XX` decodes, so the attach names some other, possibly empty, file.
+fn uri_escape_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('%', "%25")
+        .replace('?', "%3f")
+        .replace('#', "%23")
+}
+
 /// A stemma store bound to one user database.
 pub struct StemmaDb {
     conn: Connection,
@@ -72,10 +83,7 @@ impl StemmaDb {
         let conn = Connection::open(store_path)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "foreign_keys", "on")?;
-        let uri = format!(
-            "file:{}?mode=ro",
-            user_db_path.to_string_lossy().replace('?', "%3f")
-        );
+        let uri = format!("file:{}?mode=ro", uri_escape_path(user_db_path));
         conn.execute(
             &format!("ATTACH DATABASE ?1 AS {SRC_SCHEMA}"),
             rusqlite::params![uri],
@@ -786,6 +794,31 @@ mod tests {
             .conn()
             .execute("INSERT INTO src.offices VALUES (1, 'x', 'y')", []);
         assert!(err.is_err(), "user DB must be read-only");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn attaches_user_db_whose_path_has_uri_metacharacters() {
+        // `?`, `#` and `%` are URI syntax in a `file:` name; each must reach
+        // the filesystem literally. Unescaped, `#` cut the path short and
+        // `%41` decoded to `A` -- the attach named a different file.
+        let dir = std::env::temp_dir().join(format!("stemmadb-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["q?mark.db", "run#1.db", "pct%41.db", "all%3f#?.db"] {
+            let user = dir.join(name);
+            let store = dir.join(format!("{name}.stemmadb"));
+            {
+                let c = Connection::open(&user).unwrap();
+                c.execute_batch("CREATE TABLE IF NOT EXISTS offices(id INTEGER PRIMARY KEY);")
+                    .unwrap();
+            }
+            let db =
+                StemmaDb::open(&store, &user).unwrap_or_else(|e| panic!("opening {name}: {e}"));
+            assert_eq!(
+                db.src_tables().unwrap(),
+                vec!["offices".to_string()],
+                "{name} attached the wrong file"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
