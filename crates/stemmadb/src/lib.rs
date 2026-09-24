@@ -56,6 +56,13 @@ pub fn register_extensions() {
     });
 }
 
+/// Quotes an SQL identifier: wraps it in double quotes and doubles any
+/// embedded double quote, so user table and column names of any spelling
+/// can be spliced into generated SQL.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// A stemma store bound to one user database.
 pub struct StemmaDb {
     conn: Connection,
@@ -294,16 +301,34 @@ impl StemmaDb {
     /// knowledge compiler) compares against this same triple, prefixed with
     /// its own algorithm-version tag so an algorithm upgrade invalidates its
     /// receipts without touching anyone else's.
+    ///
+    /// A `WITHOUT ROWID` table has no rowid to aggregate; its fingerprint is
+    /// `"{count}:wr"`, which catches only changes in row count.
     pub fn src_table_fingerprint(&self, table: &str) -> Result<String> {
+        let src = format!("{SRC_SCHEMA}.{}", quote_ident(table));
+        if !self.src_table_has_rowid(table)? {
+            let n: i64 = self
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {src}"), [], |r| r.get(0))?;
+            return Ok(format!("{n}:wr"));
+        }
         let (n, mx, sum): (i64, i64, i64) = self.conn.query_row(
-            &format!(
-                "SELECT count(*), coalesce(max(rowid),0), coalesce(sum(rowid),0) \
-                 FROM {SRC_SCHEMA}.\"{table}\""
-            ),
+            &format!("SELECT count(*), coalesce(max(rowid),0), coalesce(sum(rowid),0) FROM {src}"),
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         Ok(format!("{n}:{mx}:{sum}"))
+    }
+
+    /// Whether a user table has a rowid — false for `WITHOUT ROWID` tables,
+    /// whose rows cannot be cited by `src_rowid`.
+    pub fn src_table_has_rowid(&self, table: &str) -> Result<bool> {
+        let wr: i64 = self.conn.query_row(
+            "SELECT coalesce(max(wr), 0) FROM pragma_table_list WHERE schema = ?1 AND name = ?2",
+            [SRC_SCHEMA, table],
+            |r| r.get(0),
+        )?;
+        Ok(wr == 0)
     }
 
     /// Tables of the attached user database (excluding SQLite internals).

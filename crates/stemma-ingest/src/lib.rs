@@ -24,7 +24,7 @@
 //!   re-embeds without a rebuild.
 
 use stemma_embed::Embedder;
-use stemmadb::{StemmaDb, SRC_SCHEMA};
+use stemmadb::{quote_ident, StemmaDb, SRC_SCHEMA};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -171,8 +171,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lex_trigram USING fts5(
 /// bumping it invalidates all lexical receipts at once, so an algorithm
 /// change re-derives everything on the next registration without any
 /// migration machinery. v2: measurement profiles + derived document
-/// boundary replaced the fixed-threshold kind ladder.
-pub const LEX_DERIVATION_VERSION: i64 = 2;
+/// boundary replaced the fixed-threshold kind ladder. v3: column selection
+/// follows SQLite's affinity rule (CLOB columns are indexed) and BLOB
+/// cells are skipped, so existing stores pick up newly indexed columns.
+pub const LEX_DERIVATION_VERSION: i64 = 3;
 
 /// Builds — or incrementally refreshes — the lexical index. Each table's
 /// content fingerprint is compared against its `derivations` receipt: only
@@ -321,14 +323,18 @@ fn ingest_table(
         .collect::<std::result::Result<_, _>>()?;
     remove_table_rows(conn, table)?;
     let mut values = 0usize;
+    let src = format!("{SRC_SCHEMA}.{}", quote_ident(table));
     for col in cols {
-        // Identifiers come from sqlite_master/table_info, quoted defensively.
+        // Identifiers come from sqlite_master/table_info and may contain
+        // anything, `"` included. TEXT affinity does not stop a BLOB from
+        // being stored in the column; blobs are not text values and would
+        // fail lex_values.value's STRICT TEXT type, so they are skipped.
+        let c = quote_ident(col);
         let sql = format!(
             "INSERT INTO lex_values (src_table, src_column, src_rowid, value, value_norm, is_doc)
-             SELECT ?1, ?2, rowid, \"{col}\", lower(trim(\"{col}\")), ?3
-             FROM {src}.\"{table}\"
-             WHERE \"{col}\" IS NOT NULL AND trim(\"{col}\") != ''",
-            src = SRC_SCHEMA,
+             SELECT ?1, ?2, rowid, {c}, lower(trim({c})), ?3
+             FROM {src}
+             WHERE {c} IS NOT NULL AND typeof({c}) != 'blob' AND trim({c}) != ''"
         );
         values += conn.execute(
             &sql,
@@ -1294,7 +1300,11 @@ pub fn build_column_cards(db: &StemmaDb, embedder: &dyn Embedder) -> Result<ColC
         };
         for col in cols {
             let n_distinct: i64 = conn.query_row(
-                &format!("SELECT count(DISTINCT \"{col}\") FROM {SRC_SCHEMA}.\"{table}\""),
+                &format!(
+                    "SELECT count(DISTINCT {c}) FROM {SRC_SCHEMA}.{t}",
+                    c = quote_ident(&col),
+                    t = quote_ident(&table)
+                ),
                 [],
                 |r| r.get(0),
             )?;
@@ -1304,9 +1314,11 @@ pub fn build_column_cards(db: &StemmaDb, embedder: &dyn Embedder) -> Result<ColC
             // a deterministic text tiebreak. The statement streams; example
             // consumption stops as soon as the card budget is full.
             let mut stmt = conn.prepare(&format!(
-                "SELECT CAST(\"{col}\" AS TEXT) FROM {SRC_SCHEMA}.\"{table}\"
-                 WHERE \"{col}\" IS NOT NULL AND typeof(\"{col}\") != 'blob'
-                 GROUP BY \"{col}\" ORDER BY count(*) DESC, 1"
+                "SELECT CAST({c} AS TEXT) FROM {SRC_SCHEMA}.{t}
+                 WHERE {c} IS NOT NULL AND typeof({c}) != 'blob'
+                 GROUP BY {c} ORDER BY count(*) DESC, 1",
+                c = quote_ident(&col),
+                t = quote_ident(&table)
             ))?;
             let mut rows = stmt.query([])?;
             let mut first = true;
@@ -2217,6 +2229,20 @@ pub fn drain_embed_queue(
         let mut embed_err = None;
         let mut writes: Vec<(&(i64, String, String, i64, &'static str), Vec<f32>)> = Vec::new();
         for (wchunk, outcome) in work.chunks(chunk).zip(outcomes) {
+            // A response with the wrong vector count breaks the Embedder
+            // contract; which vector belongs to which input is unknowable,
+            // so the chunk is treated as failed (charged an attempt) rather
+            // than zipped short, which left the tail pending forever.
+            let outcome = outcome.and_then(|vectors| {
+                if vectors.len() == wchunk.len() {
+                    Ok(vectors)
+                } else {
+                    Err(stemma_embed::Error::CountMismatch {
+                        got: vectors.len(),
+                        want: wchunk.len(),
+                    })
+                }
+            });
             match outcome {
                 Ok(vectors) => writes.extend(wchunk.iter().zip(vectors)),
                 Err(e) => {
@@ -2352,10 +2378,16 @@ fn bump_vector_generation(conn: &stemmadb::rusqlite::Connection, table: &str) ->
     Ok(())
 }
 
-/// TEXT-typed columns of every user table.
+/// Columns with TEXT affinity in every user table that has a rowid. A
+/// `WITHOUT ROWID` table is left out: lex_values cites cells by rowid, and
+/// such a table has none.
 fn text_columns(db: &StemmaDb) -> Result<Vec<TextColumn>> {
     let mut out = Vec::new();
     for table in db.src_tables()? {
+        if !db.src_table_has_rowid(&table)? {
+            tracing::warn!(table, "WITHOUT ROWID table: not value-indexed");
+            continue;
+        }
         let conn = db.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT name, type FROM pragma_table_info(?1, '{SRC_SCHEMA}')"
@@ -2365,8 +2397,7 @@ fn text_columns(db: &StemmaDb) -> Result<Vec<TextColumn>> {
         })?;
         for c in cols {
             let (name, ty) = c?;
-            let ty = ty.to_uppercase();
-            if ty.contains("TEXT") || ty.contains("CHAR") {
+            if has_text_affinity(&ty) {
                 out.push(TextColumn {
                     table: table.clone(),
                     column: name,
@@ -2375,6 +2406,14 @@ fn text_columns(db: &StemmaDb) -> Result<Vec<TextColumn>> {
         }
     }
     Ok(out)
+}
+
+/// SQLite's column-affinity rule for a declared type: a type containing
+/// "INT" is INTEGER, whatever else it says; otherwise "CHAR", "CLOB" or
+/// "TEXT" makes it TEXT.
+fn has_text_affinity(declared: &str) -> bool {
+    let ty = declared.to_uppercase();
+    !ty.contains("INT") && (ty.contains("CHAR") || ty.contains("CLOB") || ty.contains("TEXT"))
 }
 
 #[cfg(test)]
@@ -2478,6 +2517,82 @@ mod tests {
         assert_eq!(stats.tables, 2);
         assert_eq!(stats.text_columns, 3); // name, city, body — not num
         assert_eq!(stats.values, 5);
+    }
+
+    fn lex_count(db: &StemmaDb, table: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT count(*) FROM lex_values WHERE src_table = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_blob_cell_in_a_text_column_is_skipped_not_fatal() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.files(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO src.files VALUES (1, 'report.pdf'), (2, x'00ff10'), (3, 'memo.txt');",
+            )
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        assert_eq!(lex_count(&db, "files"), 2);
+    }
+
+    #[test]
+    fn without_rowid_tables_do_not_break_the_build() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.settings(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+                 INSERT INTO src.settings VALUES ('theme', 'dark');
+                 CREATE TABLE src.cities(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO src.cities VALUES (1, 'Lisbon');",
+            )
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        // No rowid to cite: the table is left out of the value index, and
+        // the rest of the corpus is indexed as usual.
+        assert_eq!(lex_count(&db, "settings"), 0);
+        assert_eq!(lex_count(&db, "cities"), 1);
+        // A second pass sees nothing changed.
+        assert_eq!(
+            build_lexical_index(&db, false).unwrap().reingested_tables,
+            0
+        );
+    }
+
+    #[test]
+    fn identifiers_with_double_quotes_are_escaped() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                r#"CREATE TABLE src."the ""best"" cafes"(id INTEGER PRIMARY KEY, "nick""name" TEXT);
+                   INSERT INTO src."the ""best"" cafes" VALUES (1, 'Blue Door');"#,
+            )
+            .unwrap();
+        build_lexical_index(&db, false).unwrap();
+        assert_eq!(lex_count(&db, r#"the "best" cafes"#), 1);
+    }
+
+    #[test]
+    fn text_affinity_follows_sqlite_rules() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE src.docs(id INTEGER PRIMARY KEY, body CLOB, code VARCHAR(8),
+                                       n BIGINT, pt POINT);
+                 INSERT INTO src.docs VALUES (1, 'long text', 'AB', 5, 7);",
+            )
+            .unwrap();
+        let stats = build_lexical_index(&db, false).unwrap();
+        // CLOB and VARCHAR have TEXT affinity; BIGINT and POINT (contains
+        // \"INT\") are INTEGER.
+        assert_eq!(stats.text_columns, 2);
+        assert_eq!(lex_count(&db, "docs"), 2);
     }
 
     #[test]
@@ -4090,6 +4205,35 @@ mod tests {
                 ..self.inner.identity()
             }
         }
+    }
+
+    /// Violates the Embedder contract: one vector short per request.
+    struct ShortEmbedder(FakeEmbedder);
+
+    impl stemma_embed::Embedder for ShortEmbedder {
+        fn embed(&self, texts: &[String]) -> stemma_embed::Result<Vec<Vec<f32>>> {
+            let mut v = self.0.embed(texts)?;
+            v.pop();
+            Ok(v)
+        }
+        fn identity(&self) -> stemma_embed::ModelIdentity {
+            self.0.identity()
+        }
+    }
+
+    #[test]
+    fn a_short_embedding_response_does_not_strand_items() {
+        let db = doc_db();
+        enqueue_missing_embeddings(&db).unwrap();
+        let embedder = ShortEmbedder(FakeEmbedder::new(8));
+        for _ in 0..=EMBED_MAX_ATTEMPTS {
+            let _ = drain_embed_queue(&db, &embedder, EMBED_BATCH);
+        }
+        let (pending, done, failed) = queue_counts(&db);
+        assert_eq!(pending, 0, "items left pending forever");
+        // Which vector belongs to which input is unknowable once the counts
+        // disagree, so nothing from a short response is written.
+        assert_eq!((done, failed), (0, 3));
     }
 
     /// A relational fixture with a measure column: `sale_price` is REAL,

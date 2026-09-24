@@ -14,7 +14,7 @@
 //! requirement, not a debugging convenience.
 
 use serde::Serialize;
-use stemmadb::StemmaDb;
+use stemmadb::{quote_ident, StemmaDb};
 
 #[cfg(feature = "usearch-sidecar")]
 mod dense;
@@ -2131,9 +2131,10 @@ fn reach_counts(
     if values.is_empty() {
         return Ok(out);
     }
+    let (table, column) = (&quote_ident(table), &quote_ident(column));
     let mut sql = match path.first() {
         None => format!(
-            "SELECT j0.\"{column}\", count(*) FROM {}.\"{table}\" j0",
+            "SELECT j0.{column}, count(*) FROM {}.{table} j0",
             stemmadb::SRC_SCHEMA
         ),
         Some(first) => {
@@ -2142,8 +2143,9 @@ fn reach_counts(
             } else {
                 &first.dst_table
             };
+            let start = quote_ident(start);
             format!(
-                "SELECT j0.\"{column}\", count(DISTINCT j{}.rowid) FROM {}.\"{start}\" j0",
+                "SELECT j0.{column}, count(DISTINCT j{}.rowid) FROM {}.{start} j0",
                 path.len(),
                 stemmadb::SRC_SCHEMA
             )
@@ -2154,25 +2156,26 @@ fn reach_counts(
             (
                 &hop.dst_table,
                 format!(
-                    "j{i}.\"{}\" = j{}.\"{}\"",
-                    hop.src_column,
+                    "j{i}.{} = j{}.{}",
+                    quote_ident(&hop.src_column),
                     i + 1,
-                    hop.dst_column
+                    quote_ident(&hop.dst_column)
                 ),
             )
         } else {
             (
                 &hop.src_table,
                 format!(
-                    "j{}.\"{}\" = j{i}.\"{}\"",
+                    "j{}.{} = j{i}.{}",
                     i + 1,
-                    hop.src_column,
-                    hop.dst_column
+                    quote_ident(&hop.src_column),
+                    quote_ident(&hop.dst_column)
                 ),
             )
         };
+        let next = quote_ident(next);
         sql.push_str(&format!(
-            " JOIN {}.\"{next}\" j{} ON {cond}",
+            " JOIN {}.{next} j{} ON {cond}",
             stemmadb::SRC_SCHEMA,
             i + 1
         ));
@@ -2181,7 +2184,7 @@ fn reach_counts(
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    sql.push_str(&format!(" WHERE j0.\"{column}\" IN ({ph}) GROUP BY 1"));
+    sql.push_str(&format!(" WHERE j0.{column} IN ({ph}) GROUP BY 1"));
     let params: Vec<&dyn stemmadb::rusqlite::ToSql> = values
         .iter()
         .map(|v| v as &dyn stemmadb::rusqlite::ToSql)
@@ -2326,9 +2329,11 @@ fn probe_value_links(
         &first.dst_table
     };
     let last = path.len();
+    let start = &quote_ident(start);
+    let (from_column, to_column) = (&quote_ident(from_column), &quote_ident(to_column));
     let mut sql = format!(
-        "SELECT j0.\"{from_column}\", j{last}.\"{to_column}\", \
-         min(j0.rowid), min(j{last}.rowid) FROM {}.\"{start}\" j0",
+        "SELECT j0.{from_column}, j{last}.{to_column}, \
+         min(j0.rowid), min(j{last}.rowid) FROM {}.{start} j0",
         stemmadb::SRC_SCHEMA
     );
     for (i, hop) in path.iter().enumerate() {
@@ -2336,25 +2341,26 @@ fn probe_value_links(
             (
                 &hop.dst_table,
                 format!(
-                    "j{i}.\"{}\" = j{}.\"{}\"",
-                    hop.src_column,
+                    "j{i}.{} = j{}.{}",
+                    quote_ident(&hop.src_column),
                     i + 1,
-                    hop.dst_column
+                    quote_ident(&hop.dst_column)
                 ),
             )
         } else {
             (
                 &hop.src_table,
                 format!(
-                    "j{}.\"{}\" = j{i}.\"{}\"",
+                    "j{}.{} = j{i}.{}",
                     i + 1,
-                    hop.src_column,
-                    hop.dst_column
+                    quote_ident(&hop.src_column),
+                    quote_ident(&hop.dst_column)
                 ),
             )
         };
+        let next = quote_ident(next);
         sql.push_str(&format!(
-            " JOIN {}.\"{next}\" j{} ON {cond}",
+            " JOIN {}.{next} j{} ON {cond}",
             stemmadb::SRC_SCHEMA,
             i + 1
         ));
@@ -2366,7 +2372,7 @@ fn probe_value_links(
             .join(", ")
     };
     sql.push_str(&format!(
-        " WHERE j0.\"{from_column}\" IN ({}) AND j{last}.\"{to_column}\" IN ({}) \
+        " WHERE j0.{from_column} IN ({}) AND j{last}.{to_column} IN ({}) \
          GROUP BY 1, 2",
         ph(0..from_values.len()),
         ph(from_values.len()..from_values.len() + to_values.len()),

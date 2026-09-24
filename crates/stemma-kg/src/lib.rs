@@ -27,7 +27,7 @@
 //! against it, never against a concrete backend. The first backend is SQLite
 //! tables inside the .stemmadb store; graph SQL never leaves that backend.
 
-use stemmadb::StemmaDb;
+use stemmadb::{quote_ident, StemmaDb};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -597,16 +597,15 @@ fn compile_schema_layer(
 ) -> Result<()> {
     let conn = db.conn();
     for t in tables {
-        let rows: i64 = conn
-            .query_row(
-                &format!(
-                    "SELECT coalesce(max(rowid),0) FROM {}.\"{t}\"",
-                    stemmadb::SRC_SCHEMA
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // max(rowid) approximates the row count without a scan; a WITHOUT
+        // ROWID table has no rowid and is counted.
+        let src = format!("{}.{}", stemmadb::SRC_SCHEMA, quote_ident(t));
+        let rows_sql = if db.src_table_has_rowid(t)? {
+            format!("SELECT coalesce(max(rowid),0) FROM {src}")
+        } else {
+            format!("SELECT count(*) FROM {src}")
+        };
+        let rows: i64 = conn.query_row(&rows_sql, [], |r| r.get(0)).unwrap_or(0);
         store.upsert_node(&Node {
             key: format!("table:{t}"),
             kind: KIND_TABLE.into(),
@@ -1179,8 +1178,10 @@ fn compile_inferred_joins(
     for (rt, rc) in &refs {
         let distinct: i64 = conn.query_row(
             &format!(
-                "SELECT count(DISTINCT \"{rc}\") FROM {}.\"{rt}\" WHERE \"{rc}\" IS NOT NULL",
-                stemmadb::SRC_SCHEMA
+                "SELECT count(DISTINCT {c}) FROM {}.{} WHERE {c} IS NOT NULL",
+                stemmadb::SRC_SCHEMA,
+                quote_ident(rt),
+                c = quote_ident(rc)
             ),
             [],
             |r| r.get(0),
@@ -1201,10 +1202,14 @@ fn compile_inferred_joins(
             let missing: i64 = conn.query_row(
                 &format!(
                     "SELECT count(*) FROM (
-                        SELECT DISTINCT \"{rc}\" AS v FROM {s}.\"{rt}\" WHERE \"{rc}\" IS NOT NULL
-                        EXCEPT SELECT \"{kc}\" FROM {s}.\"{kt}\"
+                        SELECT DISTINCT {rcq} AS v FROM {s}.{rtq} WHERE {rcq} IS NOT NULL
+                        EXCEPT SELECT {kcq} FROM {s}.{ktq}
                      )",
-                    s = stemmadb::SRC_SCHEMA
+                    s = stemmadb::SRC_SCHEMA,
+                    rcq = quote_ident(rc),
+                    rtq = quote_ident(rt),
+                    kcq = quote_ident(kc),
+                    ktq = quote_ident(kt)
                 ),
                 [],
                 |r| r.get(0),
@@ -1594,5 +1599,49 @@ mod tests {
         assert_eq!(label, "dept →? id");
         assert!(props.contains("\"method\":\"inferred\""));
         assert!(props.contains("\"confidence\":1.000"));
+    }
+    #[test]
+    fn compiles_without_rowid_and_quote_bearing_tables() {
+        let dir = std::env::temp_dir().join(format!("stemma-kg-{}-odd", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let storef = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&storef);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(
+                r#"CREATE TABLE settings(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+                   INSERT INTO settings VALUES ('theme', 'dark'), ('lang', 'pt');
+                   CREATE TABLE "team ""a"""(id INTEGER PRIMARY KEY, name TEXT);
+                   CREATE TABLE people(id INTEGER PRIMARY KEY, "te""am" INTEGER);
+                   INSERT INTO "team ""a""" VALUES (1, 'x'), (2, 'y');
+                   INSERT INTO people VALUES (1, 1), (2, 1), (3, 2);"#,
+            )
+            .unwrap();
+        }
+        let db = StemmaDb::open(&storef, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        let stats = compile(&db, false).unwrap();
+        assert_eq!(stats.recompiled_tables, 3);
+        let rows: String = db
+            .conn()
+            .query_row(
+                "SELECT props FROM kg_nodes WHERE key = 'table:settings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rows.contains("\"rows\":2"), "{rows}");
+        let inferred: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM kg_edges WHERE kind = 'inferred_fk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inferred, 1, "people.\"te\"\"am\" -> \"team \"\"a\"\"\".id");
+        assert_eq!(compile(&db, false).unwrap().recompiled_tables, 0);
     }
 }
