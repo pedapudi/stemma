@@ -890,11 +890,28 @@ fn parse_verdict(reply: &str, presented: usize) -> Option<Verdict> {
     (i < presented).then_some(Verdict::Choice(i))
 }
 
+/// Word characters: alphanumerics plus the combining diacritical marks
+/// that decomposed (NFD) text spells accents with — `cafe` + U+0301 is one
+/// word, not `cafe` and a separator. Only the combining blocks are listed
+/// (std has no general-category lookup); they cover Latin, Greek and
+/// Cyrillic diacritics.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '\u{0300}'..='\u{036F}'
+                | '\u{1AB0}'..='\u{1AFF}'
+                | '\u{1DC0}'..='\u{1DFF}'
+                | '\u{20D0}'..='\u{20FF}'
+                | '\u{FE20}'..='\u{FE2F}'
+        )
+}
+
 fn tokenize(query: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut start = None;
     for (i, ch) in query.char_indices() {
-        if ch.is_alphanumeric() {
+        if is_word_char(ch) {
             if start.is_none() {
                 start = Some(i);
             }
@@ -1660,7 +1677,7 @@ fn apply_kg_coherence(db: &StemmaDb, span: &str, candidates: &mut [Candidate]) -
 
     // Co-occurring terms of any span token, strongest first, at most 4.
     let tokens: Vec<String> = span
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !is_word_char(c))
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_lowercase())
         .collect();
@@ -4177,6 +4194,18 @@ mod tests {
         assert_eq!(explain.spans[1].admitted_by, "dense_geometry");
         assert_eq!(explain.spans[0].admitted_by, "");
         assert_eq!(explain.mentions, vec![0, 1], "trace keeps the nomination");
+    }
+
+    #[test]
+    fn tokens_keep_their_combining_marks() {
+        // NFD spells "café" as "cafe" + U+0301. The mark is not
+        // alphanumeric, but it belongs to the word: splitting on it cut the
+        // accent off the token (and off every span built from it).
+        let q = "cafe\u{301} menu";
+        let toks = tokenize(q);
+        let texts: Vec<&str> = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, vec!["cafe\u{301}", "menu"]);
+        assert_eq!(toks[0].end, "cafe\u{301}".len());
     }
 
     #[test]
