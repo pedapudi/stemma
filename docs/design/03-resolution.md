@@ -39,7 +39,7 @@ Every tunable in the pipeline, with its source and its job:
 
 | Constant | Value | Defined in | Role |
 |---|---:|---|---|
-| `MIN_SPAN_CHARS` | 3 | stemma-resolve | Spans shorter than this are never looked up |
+| `TRIGRAM_MIN_CHARS` | 3 | stemma-resolve | Spans shorter than this skip the trigram channel; exact and bm25 still run |
 | `MAX_SPAN_TOKENS` | 4 | stemma-resolve | Longest mention considered, in tokens |
 | `PER_CHANNEL_LIMIT` | 8 | stemma-resolve | Candidates fetched per channel per span |
 | `SAMPLE_ROWIDS` | 3 | stemma-resolve | Concrete rowids carried per value interpretation |
@@ -48,6 +48,7 @@ Every tunable in the pipeline, with its source and its job:
 | `TOP_K` | 5 | stemma-resolve | Max selected candidates per mention |
 | `DENSE_MAX_SPANS` | 4 | stemma-resolve | Spans per query that get a dense KNN probe |
 | `DENSE_OVERFETCH` | 4 | stemma-resolve | KNN over-fetch factor; hits are collapsed per interpretation, then truncated |
+| `FTS_AGGREGATION_WINDOW` | 512 | stemma-resolve | Best-ranked FTS matches aggregated into interpretations per span |
 | `RRF_K` | 4.0 | stemma-resolve (`fuse`) | Reciprocal-rank-fusion damping constant |
 | `EXACT_MAX_LEN` | 120 | stemma-ingest | Values longer than this are excluded from the exact channel; also anchors "value scale" for the derived document boundary |
 | `CONFIDENCE_LEVEL` | 0.95 | stemma-ingest | Jeffreys lower-bound level for every column shape judgment |
@@ -62,7 +63,10 @@ Every tunable in the pipeline, with its source and its job:
 | `COHERENCE_BOOST` | 0.15 | stemma-resolve | Boost for instance-verified candidates of the winning tuple |
 | `COHERENCE_CAP` | 0.9 | stemma-resolve | Coherence never lifts a candidate into the exact band |
 | `ADJUDICATION_MARGIN` | 0.08 | stemma-resolve | Top-two gap under which a mention routes to LM adjudication |
-| `STOPWORDS` | 29 words | stemma-resolve | Never a mention alone; allowed inside longer spans |
+| `CONTEXT_TIE_GAP` | 0.08 | stemma-resolve | Top-two gap under which tied value readings get query-conditioned card affinity |
+| `CONTEXT_COS_GAP` | 0.05 | stemma-resolve | Card-cosine gap required before the context winner is boosted |
+| `CONTEXT_BOOST` | 0.04 | stemma-resolve | Boost for the context winner, capped at 0.9 (`CONTEXT_CAP`) |
+| `STOPWORDS` | 30 words | stemma-resolve | Never a mention alone; allowed inside longer spans |
 
 `RRF_K = 4.0` is far below the k = 60 of the original formulation [Cormack 2009]. That is deliberate and is discussed under
 [fusion](#stage-5--reciprocal-rank-fusion): with only three channels and
@@ -88,7 +92,7 @@ fn tokenize(query: &str) -> Vec<Token>
 
 Maximal runs of `char::is_alphanumeric()` become tokens; everything else is a
 separator. Each token records its **byte** offsets into the query
-(end-exclusive) and a `stopword` flag from a 29-word list:
+(end-exclusive) and a `stopword` flag from a 30-word list:
 
 > a, an, and, are, at, by, did, do, does, for, from, how, in, is, it, of,
 > on, or, s, that, the, to, was, were, what, when, where, which, who, with
@@ -125,8 +129,11 @@ A five-token query yields 14 spans, an eight-token query 26. Both match the
 observed traces exactly. With an embedder configured and `T > 4`, one more
 span is added — see [the whole-query span](#the-whole-query-span) below.
 
-A span is marked `skipped` immediately if **all** its tokens are stopwords,
-or if its text is shorter than `MIN_SPAN_CHARS = 3` characters. Skipped spans
+A span is marked `skipped` immediately if **all** its tokens are stopwords.
+Length is not an admission rule: a two-character span such as `CA` or `Q3`
+is enumerated and looked up by the exact and bm25 channels; only the trigram
+channel, which cannot index fewer than three characters, skips it (see
+`TRIGRAM_MIN_CHARS`). Skipped spans
 are *kept in the trace* rather than discarded, so the console can grey them
 out and a reader can see that the pipeline considered and dismissed them. All
 other spans start with the provisional status `selected`, refined after
@@ -332,8 +339,9 @@ across token boundaries — `Northgate` finds `Seattle - Northgate`, which
 `unicode61` tokenization plus phrase matching would also find, but
 `Northgat` or `North gate` would not.
 
-The channel needs at least three characters, which is why `MIN_SPAN_CHARS`
-is 3. Queries that the trigram tokenizer legitimately cannot express produce
+The channel needs at least three characters, so spans shorter than
+`TRIGRAM_MIN_CHARS = 3` skip it; the exact and bm25 channels still serve
+them. Queries that the trigram tokenizer legitimately cannot express produce
 a SQLite error, which is caught and treated as zero hits for that channel
 rather than failing the resolution.
 
@@ -844,7 +852,7 @@ column" — the user's surrounding words disambiguating between
 interpretations of the same string, with no model call.
 
 1. Collect the query's **context terms**: tokens outside the current span,
-   non-stopword, ≥ `MIN_SPAN_CHARS` characters, lowercased and deduplicated.
+   non-stopword, at least 3 characters, lowercased and deduplicated.
 2. For each context term that is a compiled KG term, fetch the columns its
    `col_affinity` edges point at (≤ 4 per term by compiler construction —
    see [04-knowledge-graph.md](04-knowledge-graph.md#step-6--termcolumn-affinity)).
@@ -1014,7 +1022,7 @@ Five span statuses, each meaning a different kind of "no":
 | `overlapped` | Lost its byte range to a stronger span |
 | `no_candidates` | Nothing in any channel matched |
 | `weak` | Matched, but the best candidate is below threshold |
-| `skipped` | Stopword-only, or shorter than `MIN_SPAN_CHARS` |
+| `skipped` | Stopword-only |
 
 Three reject reasons, each meaning a different kind of loss:
 `below_threshold`, `outranked`, `span_not_selected`.
@@ -1127,13 +1135,6 @@ linearly and therefore latency linearly; the real fix is to let the
 knowledge graph's phrase vocabulary *propose* long spans directly rather than
 enumerating all n-grams up to a larger bound.
 
-**Two-character mentions are invisible.** `MIN_SPAN_CHARS = 3` is inherited
-from the trigram index's minimum, but it silently kills real abbreviations:
-*Q3*, *CA*, *US*, *H2*. In the mini-corpus trace of *"the Q3 numbers for the
-Seattle office"*, the span `Q3` is marked `skipped` — and `Q3` is a stored
-value in `reports.quarter`. The exact channel could serve short spans without
-the trigram index; it is not currently consulted for them.
-
 **Greedy selection is local.** Spans are assigned byte ranges one at a time
 by descending score. A single high-scoring wrong long span can block two
 correct short ones, and nothing reconsiders. The principled fix is joint
@@ -1218,8 +1219,12 @@ language-service bands. `source` and `session` are persisted with the episode.
 `Mutex<StemmaDb>` per registered database because `rusqlite::Connection` is
 not `Sync`. Concurrent requests to the same database queue behind each other
 — and now they queue behind a synchronous call to the configured embedding
-service as well. The remote client uses blocking I/O with a 60-second timeout
-inside the lock. The Python client allows 30 seconds by default.
+service as well. The remote client uses blocking I/O inside the lock, with a
+5-second connect timeout and a 180-second read timeout (sized for embedding
+drain batches, not interactive queries); after a failure the cooldown
+wrapper short-circuits calls until its window elapses, so a down endpoint
+costs one failed probe per window rather than one timeout per query. The
+Python client allows 30 seconds by default.
 
 **Fusion constants were not re-derived for four channels.** Documented above
 under [reachable score bands](#reachable-score-bands): the `3/K` normalizer

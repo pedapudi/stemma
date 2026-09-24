@@ -59,7 +59,7 @@ declared-but-never-emitted. The history model and why attribution
 (`source`, `session`) is a schema concern.
 
 **[03 — Resolution](03-resolution.md)**
-The pipeline stage by stage with every real constant — `MIN_SPAN_CHARS`,
+The pipeline stage by stage with every real constant — `TRIGRAM_MIN_CHARS`,
 `MAX_SPAN_TOKENS`, `PER_CHANNEL_LIMIT`, `SELECT_THRESHOLD`, `TOP_K`,
 `DENSE_MAX_SPANS`, `RRF_K`, `EXACT_MAX_LEN`. Tokenization and
 soft span enumeration; knowledge-graph-assisted mention detection; the three
