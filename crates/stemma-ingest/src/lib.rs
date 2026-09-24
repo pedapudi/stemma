@@ -55,6 +55,11 @@ pub enum Error {
     },
     #[error("{table} exists with no model_registry row; provenance unknown, refusing to append")]
     UnregisteredVectorTable { table: String },
+    #[error(
+        "vec_staging must hold exactly one model identity (model, dim, query_template); \
+         found {found:?}"
+    )]
+    StagedIdentity { found: Vec<(String, i64, String)> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -1032,9 +1037,13 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
     };
     let (model, dim, template) = match identities.as_slice() {
         [one] => one.clone(),
-        _ => panic!("vec_staging holds mixed model identities: {identities:?}"),
+        _ => return Err(Error::StagedIdentity { found: identities }),
     };
 
+    // One transaction: a staged row vec0 rejects (wrong byte length, bad
+    // type) rolls back to the previous index, registry row and generation,
+    // and leaves staging in place for a retry.
+    let tx = conn.unchecked_transaction()?;
     bump_vector_generation(conn, "vec_dense")?;
     conn.execute_batch(&format!(
         "DROP TABLE IF EXISTS vec_dense;
@@ -1059,6 +1068,7 @@ pub fn build_dense_index(db: &StemmaDb) -> Result<Option<DenseStats>> {
         stemmadb::rusqlite::params![model, dim, template],
     )?;
     conn.execute_batch("DROP TABLE vec_staging;")?;
+    tx.commit()?;
     let _ = derive_dense_geometry(db);
 
     Ok(Some(DenseStats {
@@ -3260,6 +3270,94 @@ mod tests {
             )
             .unwrap();
         assert_eq!(template, "");
+    }
+
+    fn dense_count(db: &StemmaDb) -> i64 {
+        db.conn()
+            .query_row("SELECT count(*) FROM vec_dense", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn mixed_staged_identities_are_an_error_not_a_panic() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        stage_vectors(&db, "model-a", 4, Some("{query}"));
+        db.conn()
+            .execute(
+                "UPDATE vec_staging SET model = 'model-b' WHERE src_rowid = 3",
+                [],
+            )
+            .unwrap();
+        let err = build_dense_index(&db).unwrap_err();
+        assert!(matches!(err, Error::StagedIdentity { .. }), "got {err}");
+        // Nothing was consumed: the loader can fix staging and retry.
+        let staged: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_staging", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(staged, 3);
+    }
+
+    #[test]
+    fn empty_staging_is_an_error_and_keeps_the_existing_index() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        stage_vectors(&db, "model-a", 4, Some("{query}"));
+        build_dense_index(&db).unwrap().unwrap();
+        stage_vectors(&db, "model-a", 4, Some("{query}"));
+        db.conn().execute("DELETE FROM vec_staging", []).unwrap();
+        let err = build_dense_index(&db).unwrap_err();
+        assert!(matches!(err, Error::StagedIdentity { .. }), "got {err}");
+        assert_eq!(
+            dense_count(&db),
+            3,
+            "an empty restage must not wipe the index"
+        );
+    }
+
+    #[test]
+    fn a_bad_staged_blob_leaves_the_previous_index_intact() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        stage_vectors(&db, "model-a", 4, Some("{query}"));
+        build_dense_index(&db).unwrap().unwrap();
+        let generation = |db: &StemmaDb| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT generation FROM vector_generations WHERE vector_table = 'vec_dense'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let before = generation(&db);
+        // Restage under a new model with one truncated vector.
+        stage_vectors(&db, "model-b", 4, Some("{query}"));
+        db.conn()
+            .execute(
+                "UPDATE vec_staging SET embedding = x'00' WHERE src_rowid = 2",
+                [],
+            )
+            .unwrap();
+        assert!(build_dense_index(&db).is_err());
+        assert_eq!(dense_count(&db), 3, "the old vectors survive");
+        let model: String = db
+            .conn()
+            .query_row(
+                "SELECT model FROM model_registry WHERE vector_table = 'vec_dense'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "model-a", "the registry still names the old space");
+        assert_eq!(
+            generation(&db),
+            before,
+            "a failed rebuild is not a new generation"
+        );
+        let staged: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_staging", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(staged, 3, "staging survives for a retry");
     }
 
     #[test]
