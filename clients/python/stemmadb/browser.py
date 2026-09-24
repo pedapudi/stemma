@@ -253,10 +253,13 @@ class StoreBrowser:
 
     def query_plan(self, sql: str) -> list[dict[str, Any]]:
         """SQLite's EXPLAIN QUERY PLAN as a depth-annotated tree, in source
-        order."""
+        order. Empty for a statement that is itself an EXPLAIN: its own rows
+        are the plan, and prefixing it again is a syntax error."""
         stripped = sql.strip().lower()
         if not stripped.startswith(_SELECT_PREFIXES):
             raise ValueError("read-only console: only SELECT/WITH/PRAGMA queries")
+        if stripped.startswith("explain"):
+            return []
         conn = self._connect_store() if os.path.exists(self.store) else self._connect_user()
         try:
             rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}").fetchall()
@@ -315,11 +318,15 @@ class StoreBrowser:
 
     # ---------- ad-hoc queries ----------
 
-    def query(self, sql: str, limit: int = 200) -> dict[str, Any]:
+    def query(
+        self, sql: str, limit: int = 200, cell_chars: int | None = 400
+    ) -> dict[str, Any]:
         """Runs a read-only query against store (main) + user DB (src).
 
         Connections are mode=ro, so writes fail at the SQLite level too; the
-        prefix check just produces a friendlier error earlier.
+        prefix check just produces a friendlier error earlier. Text cells are
+        clipped to `cell_chars` (None: unclipped) — callers with their own
+        budget pass theirs.
         """
         stripped = sql.strip().lower()
         if not stripped.startswith(_SELECT_PREFIXES):
@@ -328,16 +335,16 @@ class StoreBrowser:
         try:
             cur = conn.execute(sql)
             columns = [d[0] for d in cur.description] if cur.description else []
-            rows = [[_display(v) for v in r] for r in cur.fetchmany(limit)]
+            rows = [[_display(v, cell_chars) for v in r] for r in cur.fetchmany(limit)]
             truncated = cur.fetchone() is not None
             return {"columns": columns, "rows": rows, "truncated": truncated}
         finally:
             conn.close()
 
 
-def _display(v: Any) -> Any:
+def _display(v: Any, cell_chars: int | None = 400) -> Any:
     if isinstance(v, bytes):
         return f"<blob {len(v)}B>"
-    if isinstance(v, str) and len(v) > 400:
-        return v[:400] + "…"
+    if cell_chars is not None and isinstance(v, str) and len(v) > cell_chars:
+        return v[:cell_chars] + "…"
     return v

@@ -122,7 +122,8 @@ def build_server(grpc: str, dbs: dict[str, str], session: str = "") -> FastMCP:
 
         Prefer fetching the rows resolve pointed at (WHERE id IN (...));
         cells are clipped to 1500 chars, so SELECT the columns you need."""
-        result = browser(database).query(query)
+        # The browser's own 400-char display clip would pre-empt this one.
+        result = browser(database).query(query, cell_chars=None)
 
         def clip(v: Any) -> Any:
             if isinstance(v, str) and len(v) > 1500:
