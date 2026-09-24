@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
-    visit_expressions, visit_relations, BinaryOperator, Expr, TableFactor, Value, Visit, Visitor,
+    visit_expressions, visit_relations, BinaryOperator, Expr, TableFactor, UnaryOperator, Value,
+    Visit, Visitor,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -277,7 +278,7 @@ fn verify_target(
     conn: &rusqlite::Connection,
     vt: &ValueTarget,
     referenced_tables: &BTreeSet<String>,
-    aliases: &BTreeMap<String, String>,
+    aliases: &AliasMap,
     stats: &mut VerifyStats,
 ) -> anyhow::Result<Option<Target>> {
     let (op_sql, match_mode) = match (vt.op.as_str(), vt.is_string) {
@@ -290,10 +291,16 @@ fn verify_target(
     };
 
     // Resolve the table: alias/table qualifier first, else every referenced
-    // table that has the column.
+    // table that has the column. An alias bound to several tables (reused
+    // in a subquery) keeps every binding that has the column; denotation
+    // then decides, and two that both select rows count as ambiguous.
     let candidates: Vec<String> = match &vt.qualifier {
         Some(q) => match aliases.get(&q.to_lowercase()) {
-            Some(t) => vec![t.clone()],
+            Some(bound) => bound
+                .iter()
+                .filter(|t| bound.len() == 1 || table_has_column(conn, t, &vt.column))
+                .cloned()
+                .collect(),
             None => {
                 stats.missing_column += 1;
                 return Ok(None);
@@ -393,9 +400,15 @@ fn assign_tier(targets: &[Target], schema_tables: &BTreeSet<String>) -> (String,
     ("anchor".into(), "default: lexical anchor")
 }
 
-/// Collects table aliases: `FROM frpm AS T1` → {"t1": "frpm", "frpm": "frpm"}.
+/// Lowercased alias (or table name) → every table it is bound to anywhere
+/// in the statement. The map is statement-wide, not per scope, so an alias
+/// reused in a subquery (`FROM people AS T1 ... (SELECT ... FROM offices
+/// AS T1)`) keeps both bindings rather than the last one silently winning.
+pub type AliasMap = BTreeMap<String, BTreeSet<String>>;
+
+/// Collects table aliases: `FROM frpm AS T1` → {"t1": {"frpm"}, "frpm": {"frpm"}}.
 struct AliasCollector {
-    map: BTreeMap<String, String>,
+    map: AliasMap,
 }
 
 impl Visitor for AliasCollector {
@@ -405,12 +418,15 @@ impl Visitor for AliasCollector {
             if let Some(last) = name.0.last() {
                 let table = strip_quotes(&last.to_string());
                 if let Some(a) = alias {
-                    self.map.insert(
-                        strip_quotes(&a.name.to_string()).to_lowercase(),
-                        table.clone(),
-                    );
+                    self.map
+                        .entry(strip_quotes(&a.name.to_string()).to_lowercase())
+                        .or_default()
+                        .insert(table.clone());
                 }
-                self.map.insert(table.to_lowercase(), table);
+                self.map
+                    .entry(table.to_lowercase())
+                    .or_default()
+                    .insert(table);
             }
         }
         ControlFlow::Continue(())
@@ -421,11 +437,14 @@ impl Visitor for AliasCollector {
 /// from one gold SQL.
 pub fn derive_from_sql(
     sql: &str,
-) -> anyhow::Result<(BTreeSet<String>, Vec<ValueTarget>, BTreeMap<String, String>)> {
+) -> anyhow::Result<(BTreeSet<String>, Vec<ValueTarget>, AliasMap)> {
     let statements = SqlParser::parse_sql(&SQLiteDialect {}, sql)?;
 
     let mut tables = BTreeSet::new();
     let mut values = BTreeSet::new();
+    // Targets under a `NOT (...)`: collected again from the negated subtree
+    // and re-labelled below, so `NOT (city = 'x')` is not a positive target.
+    let mut negated = BTreeSet::new();
     let mut aliases = AliasCollector {
         map: BTreeMap::new(),
     };
@@ -438,11 +457,40 @@ pub fn derive_from_sql(
         });
         let _ = visit_expressions(stmt, |expr| {
             collect_value_targets(expr, &mut values);
+            if let Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: inner,
+            } = expr
+            {
+                let _ = visit_expressions(inner.as_ref(), |e| {
+                    collect_value_targets(e, &mut negated);
+                    std::ops::ControlFlow::<()>::Continue(())
+                });
+            }
             std::ops::ControlFlow::<()>::Continue(())
         });
         let _ = stmt.visit(&mut aliases);
     }
+    for vt in negated {
+        values.remove(&vt);
+        values.insert(negate(vt));
+    }
     Ok((tables, values.into_iter().collect(), aliases.map))
+}
+
+/// The same predicate under a NOT: `=` → `!=`, `like` → `not like`,
+/// `not in` → `in`. Verification scores only `=`, `in` and `like`, so a
+/// negated target is derived (and counted) but never gets gold rows.
+fn negate(mut vt: ValueTarget) -> ValueTarget {
+    vt.op = match vt.op.as_str() {
+        "=" => "!=".into(),
+        "!=" => "=".into(),
+        op => match op.strip_prefix("not ") {
+            Some(positive) => positive.into(),
+            None => format!("not {op}"),
+        },
+    };
+    vt
 }
 
 fn collect_value_targets(expr: &Expr, out: &mut BTreeSet<ValueTarget>) {
@@ -478,25 +526,40 @@ fn collect_value_targets(expr: &Expr, out: &mut BTreeSet<ValueTarget>) {
                 });
             }
         }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        }
+        | Expr::ILike {
+            expr,
+            pattern,
+            negated,
+            ..
+        } => {
             if let (Some((col, qual)), Some((lit, _))) = (column_name(expr), literal(pattern)) {
                 out.insert(ValueTarget {
                     column: col,
                     qualifier: qual,
-                    op: "like".into(),
+                    op: if *negated { "not like" } else { "like" }.into(),
                     literal: lit,
                     is_string: true,
                 });
             }
         }
-        Expr::InList { expr, list, .. } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             if let Some((col, qual)) = column_name(expr) {
                 for item in list {
                     if let Some((lit, is_string)) = literal(item) {
                         out.insert(ValueTarget {
                             column: col.clone(),
                             qualifier: qual.clone(),
-                            op: "in".into(),
+                            op: if *negated { "not in" } else { "in" }.into(),
                             literal: lit,
                             is_string,
                         });
@@ -525,9 +588,14 @@ fn column_name(expr: &Expr) -> Option<(String, Option<String>)> {
     }
 }
 
-/// A literal value and whether it is a string.
+/// A literal value and whether it is a string. A double-quoted identifier
+/// counts as a string: SQLite's dialect parses `"Seattle"` as an
+/// identifier, SQLite itself reads it as a string when no column has that
+/// name, and gold SQL relies on it. Denotation verification catches the
+/// rare case where it really was a column.
 fn literal(expr: &Expr) -> Option<(String, bool)> {
     match expr {
+        Expr::Identifier(id) if id.quote_style == Some('"') => Some((id.value.clone(), true)),
         Expr::Value(v) => match &v.value {
             Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some((s.clone(), true)),
             Value::Number(n, _) => Some((n.clone(), false)),
@@ -558,8 +626,14 @@ mod tests {
             tables,
             BTreeSet::from(["offices".to_string(), "people".to_string()])
         );
-        assert_eq!(aliases.get("t1"), Some(&"offices".to_string()));
-        assert_eq!(aliases.get("t2"), Some(&"people".to_string()));
+        assert_eq!(
+            aliases.get("t1"),
+            Some(&BTreeSet::from(["offices".to_string()]))
+        );
+        assert_eq!(
+            aliases.get("t2"),
+            Some(&BTreeSet::from(["people".to_string()]))
+        );
         let strings: Vec<_> = values
             .iter()
             .filter(|v| v.is_string)
@@ -601,7 +675,8 @@ mod tests {
     fn denotation_verification_records_gold_rows() {
         let conn = test_conn();
         let tables: BTreeSet<String> = ["offices".to_string(), "people".to_string()].into();
-        let aliases: BTreeMap<String, String> = [("t1".to_string(), "offices".to_string())].into();
+        let aliases: AliasMap =
+            [("t1".to_string(), BTreeSet::from(["offices".to_string()]))].into();
         let mut stats = VerifyStats::default();
         let vt = ValueTarget {
             column: "city".into(),
@@ -652,6 +727,74 @@ mod tests {
             .expect("verifies");
         assert_eq!(t.match_mode, "like");
         assert_eq!(t.rowids, vec![1, 2]);
+    }
+
+    /// Derives and verifies every target of one gold SQL against `conn`.
+    fn verified(conn: &rusqlite::Connection, sql: &str) -> (Vec<Target>, VerifyStats) {
+        let (tables, raw, aliases) = derive_from_sql(sql).unwrap();
+        let mut stats = VerifyStats::default();
+        let targets = raw
+            .iter()
+            .filter_map(|vt| verify_target(conn, vt, &tables, &aliases, &mut stats).unwrap())
+            .collect();
+        (targets, stats)
+    }
+
+    #[test]
+    fn negated_predicates_are_not_positive_targets() {
+        let conn = test_conn();
+        let sql = "SELECT id FROM people WHERE name NOT LIKE '%Chen%' \
+                   AND office_id IN (SELECT id FROM offices WHERE city NOT IN ('Seattle') \
+                                     AND NOT (city = 'Portland'))";
+        let (_, values, _) = derive_from_sql(sql).unwrap();
+        let ops: BTreeSet<&str> = values.iter().map(|v| v.op.as_str()).collect();
+        assert_eq!(ops, BTreeSet::from(["!=", "not in", "not like"]));
+        // The rows a negated predicate selects are exactly the ones the
+        // mention does NOT name; they must never become gold rows.
+        let (targets, stats) = verified(&conn, sql);
+        assert!(targets.is_empty(), "{targets:?}");
+        assert_eq!(stats.skipped_kind, 3);
+    }
+
+    #[test]
+    fn double_quoted_literals_are_string_targets() {
+        // SQLite's dialect parses "Seattle" as an identifier; SQLite itself
+        // falls back to a string when no such column exists, and gold SQL
+        // leans on that.
+        let conn = test_conn();
+        let (targets, _) = verified(
+            &conn,
+            r#"SELECT id FROM offices WHERE city = "Seattle" OR city IN ("Portland")"#,
+        );
+        let got: BTreeSet<(&str, &[i64])> = targets
+            .iter()
+            .map(|t| (t.literal.as_str(), t.rowids.as_slice()))
+            .collect();
+        assert_eq!(
+            got,
+            BTreeSet::from([("Portland", &[18][..]), ("Seattle", &[17][..])])
+        );
+        let (targets, _) = verified(&conn, r#"SELECT id FROM people WHERE name LIKE "%Chen""#);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn an_alias_reused_in_a_subquery_does_not_capture_outer_targets() {
+        let conn = test_conn();
+        let (targets, stats) = verified(
+            &conn,
+            "SELECT T1.id FROM people AS T1 WHERE T1.name = 'Wei Chen' AND T1.office_id IN \
+             (SELECT T1.id FROM offices AS T1 WHERE T1.city = 'Seattle')",
+        );
+        let got: BTreeSet<(&str, &str)> = targets
+            .iter()
+            .map(|t| (t.table.as_str(), t.column.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            BTreeSet::from([("offices", "city"), ("people", "name")]),
+            "{stats:?}"
+        );
     }
 
     fn tgt(table: &str, rowids: Vec<i64>) -> Target {
