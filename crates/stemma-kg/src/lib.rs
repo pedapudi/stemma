@@ -105,8 +105,11 @@ pub trait KnowledgeStore {
     fn upsert_node(&self, node: &Node) -> Result<()>;
     fn upsert_edge(&self, edge: &Edge) -> Result<()>;
     /// Removes every node whose key starts with any of the prefixes, plus
-    /// edges touching them. The unit of incremental recompilation.
+    /// edges touching them. The unit of incremental recompilation. Prefixes
+    /// match literally and case-sensitively.
     fn remove_by_key_prefixes(&self, prefixes: &[String]) -> Result<()>;
+    /// Removes the nodes with exactly these keys, plus edges touching them.
+    fn remove_by_keys(&self, keys: &[String]) -> Result<()>;
     fn stats(&self) -> Result<KgStats>;
     /// Simple paths between two tables over fk/inferred_fk edges, at most
     /// `max_hops` edges each, shortest first, at most `limit` paths. Edges
@@ -187,6 +190,23 @@ impl<'a> SqliteKnowledgeStore<'a> {
     }
 }
 
+impl SqliteKnowledgeStore<'_> {
+    fn remove_where(&self, predicate: &str, args: &[String]) -> Result<()> {
+        let conn = self.db.conn();
+        for a in args {
+            conn.execute(
+                &format!(
+                    "DELETE FROM kg_edges WHERE src IN (SELECT id FROM kg_nodes WHERE {predicate})
+                     OR dst IN (SELECT id FROM kg_nodes WHERE {predicate})"
+                ),
+                [a],
+            )?;
+            conn.execute(&format!("DELETE FROM kg_nodes WHERE {predicate}"), [a])?;
+        }
+        Ok(())
+    }
+}
+
 impl KnowledgeStore for SqliteKnowledgeStore<'_> {
     fn upsert_node(&self, node: &Node) -> Result<()> {
         self.db.conn().execute(
@@ -209,17 +229,13 @@ impl KnowledgeStore for SqliteKnowledgeStore<'_> {
     }
 
     fn remove_by_key_prefixes(&self, prefixes: &[String]) -> Result<()> {
-        let conn = self.db.conn();
-        for p in prefixes {
-            let like = format!("{}%", p.replace('%', ""));
-            conn.execute(
-                "DELETE FROM kg_edges WHERE src IN (SELECT id FROM kg_nodes WHERE key LIKE ?1)
-                 OR dst IN (SELECT id FROM kg_nodes WHERE key LIKE ?1)",
-                [&like],
-            )?;
-            conn.execute("DELETE FROM kg_nodes WHERE key LIKE ?1", [&like])?;
-        }
-        Ok(())
+        // Not LIKE: it treats `_` as a wildcard and folds ASCII case, so the
+        // prefix of table `a_b` also matched `aXb` and `A_B`.
+        self.remove_where("substr(key, 1, length(?1)) = ?1", prefixes)
+    }
+
+    fn remove_by_keys(&self, keys: &[String]) -> Result<()> {
+        self.remove_where("key = ?1", keys)
     }
 
     fn stats(&self) -> Result<KgStats> {
@@ -507,6 +523,20 @@ fn fingerprint(db: &StemmaDb, table: &str) -> Result<String> {
     Ok(format!("kg4:{}", db.src_table_fingerprint(table)?))
 }
 
+/// Removes everything one table contributed to the graph. The table node
+/// is matched exactly — its key has no terminator, so as a prefix
+/// `table:notes` would also take `table:notes_archive`; every other key
+/// family is terminated after the table name.
+fn remove_table_nodes(store: &SqliteKnowledgeStore, table: &str) -> Result<()> {
+    store.remove_by_keys(&[format!("table:{table}")])?;
+    store.remove_by_key_prefixes(&[
+        format!("column:{table}."),
+        format!("value:{table}."),
+        format!("term:{table}:"),
+        format!("phrase:{table}:"),
+    ])
+}
+
 /// Compiles (or incrementally refreshes) the schema, discovered-relation and
 /// profile layers. Only tables whose fingerprint changed are recompiled;
 /// `force` rebuilds everything.
@@ -536,12 +566,7 @@ pub fn compile(db: &StemmaDb, force: bool) -> Result<KgStats> {
         .query_map([], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     for gone in known.iter().filter(|k| !tables.contains(k)) {
-        store.remove_by_key_prefixes(&[
-            format!("table:{gone}"),
-            format!("column:{gone}."),
-            format!("value:{gone}."),
-            format!("term:{gone}:"),
-        ])?;
+        remove_table_nodes(&store, gone)?;
         conn.execute("DELETE FROM kg_meta WHERE src_table = ?1", [gone])?;
     }
     if dirty.is_empty() {
@@ -553,12 +578,7 @@ pub fn compile(db: &StemmaDb, force: bool) -> Result<KgStats> {
 
     // Scope the rebuild to dirty tables only.
     for t in &dirty {
-        store.remove_by_key_prefixes(&[
-            format!("table:{t}"),
-            format!("column:{t}."),
-            format!("value:{t}."),
-            format!("term:{t}:"),
-        ])?;
+        remove_table_nodes(&store, t)?;
     }
 
     compile_schema_layer(db, &store, &dirty)?;
@@ -1002,16 +1022,20 @@ fn compile_phrase_entities(
 
     // Drop phrases that are strict prefixes of a more complete phrase with
     // comparable support ("California Coastal" vs "California Coastal
-    // Commission") — keep the most informative form.
+    // Commission") — keep the most informative form. Whole words only:
+    // "New York" is not a prefix of "New Yorker Magazine".
     let mut phrases: Vec<(String, usize)> = counts
         .iter()
         .filter(|(_, &n)| n >= MIN_PHRASE_COUNT)
         .map(|(p, &n)| (p.clone(), n))
         .collect();
     phrases.retain(|(p, n)| {
-        !counts
-            .iter()
-            .any(|(longer, &ln)| longer != p && longer.starts_with(p.as_str()) && ln * 2 >= *n)
+        !counts.iter().any(|(longer, &ln)| {
+            longer
+                .strip_prefix(p.as_str())
+                .is_some_and(|rest| rest.starts_with(' '))
+                && ln * 2 >= *n
+        })
     });
     phrases.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -1594,5 +1618,132 @@ mod tests {
         assert_eq!(label, "dept →? id");
         assert!(props.contains("\"method\":\"inferred\""));
         assert!(props.contains("\"confidence\":1.000"));
+    }
+    fn user_db(tag: &str, sql: &str) -> StemmaDb {
+        let dir = std::env::temp_dir().join(format!("stemma-kg-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.db");
+        let storef = dir.join("user.stemmadb");
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_file(&storef);
+        {
+            let c = stemmadb::rusqlite::Connection::open(&user).unwrap();
+            c.execute_batch(sql).unwrap();
+        }
+        let db = StemmaDb::open(&storef, &user).unwrap();
+        stemma_ingest::build_lexical_index(&db, false).unwrap();
+        db
+    }
+
+    fn has_node(db: &StemmaDb, key: &str) -> bool {
+        db.conn()
+            .query_row("SELECT count(*) FROM kg_nodes WHERE key = ?1", [key], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+            > 0
+    }
+
+    #[test]
+    fn recompiling_a_table_leaves_same_prefix_tables_alone() {
+        let db = user_db(
+            "prefix",
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);
+             CREATE TABLE notes_archive(id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO notes VALUES (1, 'a'), (2, 'b');
+             INSERT INTO notes_archive VALUES (1, 'c'), (2, 'd');",
+        );
+        let a = compile(&db, false).unwrap();
+        db.conn()
+            .execute("DELETE FROM kg_meta WHERE src_table = 'notes'", [])
+            .unwrap();
+        let b = compile(&db, false).unwrap();
+        assert_eq!(b.recompiled_tables, 1);
+        assert!(
+            has_node(&db, "table:notes_archive"),
+            "recompiling notes swept notes_archive's table node"
+        );
+        assert_eq!((a.nodes, a.edges), (b.nodes, b.edges));
+    }
+
+    #[test]
+    fn key_prefixes_match_literally() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let store = SqliteKnowledgeStore::new(&db).unwrap();
+        for key in ["column:a_b.x", "column:aXb.x", "column:A_B.x"] {
+            store
+                .upsert_node(&Node {
+                    key: key.into(),
+                    kind: KIND_COLUMN.into(),
+                    label: key.into(),
+                    props: "{}".into(),
+                })
+                .unwrap();
+        }
+        store
+            .remove_by_key_prefixes(&["column:a_b.".to_string()])
+            .unwrap();
+        assert!(!has_node(&db, "column:a_b.x"));
+        assert!(has_node(&db, "column:aXb.x"), "`_` is not a wildcard");
+        assert!(has_node(&db, "column:A_B.x"), "prefixes are case-sensitive");
+    }
+
+    #[test]
+    fn phrase_nodes_are_swept_with_their_table() {
+        let db = user_db(
+            "phrases",
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO notes VALUES (1, 'a'), (2, 'b');",
+        );
+        compile(&db, false).unwrap();
+        let store = SqliteKnowledgeStore::new(&db).unwrap();
+        for key in ["phrase:notes:stale phrase", "phrase:ghost:gone phrase"] {
+            store
+                .upsert_node(&Node {
+                    key: key.into(),
+                    kind: KIND_TERM.into(),
+                    label: key.into(),
+                    props: "{}".into(),
+                })
+                .unwrap();
+        }
+        // `ghost` was compiled once and has since been dropped; `notes`
+        // changed and recompiles.
+        db.conn()
+            .execute_batch(
+                "INSERT INTO kg_meta (src_table, fingerprint, compiled_at)
+                     VALUES ('ghost', 'x', datetime('now'));
+                 DELETE FROM kg_meta WHERE src_table = 'notes';",
+            )
+            .unwrap();
+        compile(&db, false).unwrap();
+        assert!(!has_node(&db, "phrase:ghost:gone phrase"), "dropped table");
+        assert!(
+            !has_node(&db, "phrase:notes:stale phrase"),
+            "recompiled table"
+        );
+    }
+
+    #[test]
+    fn phrase_prefix_suppression_respects_word_boundaries() {
+        let db = StemmaDb::open_in_memory().unwrap();
+        let store = SqliteKnowledgeStore::new(&db).unwrap();
+        let docs: Vec<String> = (0..10)
+            .map(|_| "offices in New York with readers of New Yorker Magazine".to_string())
+            .collect();
+        store
+            .upsert_node(&Node {
+                key: "table:docs".into(),
+                kind: KIND_TABLE.into(),
+                label: "docs".into(),
+                props: "{}".into(),
+            })
+            .unwrap();
+        compile_phrase_entities(&store, "docs", &docs).unwrap();
+        assert!(has_node(&db, "phrase:docs:new yorker magazine"));
+        assert!(
+            has_node(&db, "phrase:docs:new york"),
+            "\"New York\" is not a prefix phrase of \"New Yorker Magazine\""
+        );
     }
 }
