@@ -123,9 +123,10 @@ def create_app(
     @app.post("/api/db/{name}/sql")
     def sql(name: str, req: SqlRequest):
         t0 = time.monotonic()
+        b = browser(name)  # outside the try: its 404 must not become a 400
         try:
-            out = browser(name).query(req.sql)
-            out["plan"] = browser(name).query_plan(req.sql)
+            out = b.query(req.sql)
+            out["plan"] = b.query_plan(req.sql)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         except Exception as e:
@@ -206,9 +207,14 @@ def create_app(
     @app.get("/api/db/{name}/history")
     def history(name: str, limit: int = 8):
         try:
+            # Each query's most recent ask, and the source of THAT ask —
+            # max(source) was the alphabetically last source ever seen.
             r = browser(name).query(
-                "SELECT query, max(asked_at) AS at, max(source) AS src FROM query_log "
-                f"GROUP BY query ORDER BY at DESC LIMIT {min(int(limit), 30)}"
+                "SELECT query, asked_at, source FROM ("
+                " SELECT query, asked_at, source, row_number() OVER ("
+                "  PARTITION BY query ORDER BY asked_at DESC, id DESC) AS rn"
+                " FROM query_log) WHERE rn = 1 "
+                f"ORDER BY asked_at DESC LIMIT {min(int(limit), 30)}"
             )
             return {"queries": [row[0] for row in r["rows"]],
                     "tagged": [{"query": row[0], "source": row[2]} for row in r["rows"]]}
