@@ -451,22 +451,16 @@ pub fn resolve_full_with_dense_search(
     // degrade, never abort. Two gates, both structural:
     // - vec_dense (whole documents) probes every span without an exact hit;
     // - vec_interp (interpretation cards, issue #7) probes only spans with
-    //   no strong lexical candidate at all — see [`has_strong_lexical`] —
-    //   and only when the store's registry names this embedder's space
-    //   ([`interp_channel_ready`], the drain's same-space discipline).
+    //   no strong lexical candidate at all — see [`has_strong_lexical`].
+    // Either table is probed only when the store's registry names this
+    // embedder's space ([`vector_space_ready`], the drain's same-space
+    // discipline).
     // The interp targets are a subset of the dense targets (an exact hit is
     // strong), so the shared target list is the dense one when vec_dense
     // exists and the interp one otherwise.
     if let Some(embedder) = embedder {
-        let has_dense: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = 'vec_dense'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        let has_dense = has_dense > 0;
-        let interp_ready = interp_channel_ready(db, embedder);
+        let has_dense = vector_space_ready(db, embedder, "vec_dense");
+        let interp_ready = vector_space_ready(db, embedder, "vec_interp");
         if has_dense || interp_ready {
             let strong: std::collections::HashSet<usize> = if interp_ready {
                 spans
@@ -1572,7 +1566,7 @@ fn interp_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
     Ok(hits)
 }
 
-/// Same-space discipline for the interp channel, checked the way the drain
+/// Same-space discipline for the semantic channels, checked the way the drain
 /// checks before appending (see stemma_ingest::drain_embed_queue): the
 /// table must exist, its registry row must exist (an existing table with no
 /// row is unknown provenance — refused, not guessed), the row must name the
@@ -1580,12 +1574,12 @@ fn interp_hits(db: &StemmaDb, v: &[f32]) -> Result<Vec<RawHit>> {
 /// embedder's ('' predates the column and constrains nothing). Resolution
 /// refuses by not firing the channel — degradation, never an error, like
 /// every optional signal here.
-fn interp_channel_ready(db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) -> bool {
+fn vector_space_ready(db: &StemmaDb, embedder: &dyn stemma_embed::Embedder, table: &str) -> bool {
     let conn = db.conn();
     let exists: i64 = conn
         .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name = 'vec_interp'",
-            [],
+            "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+            [table],
             |r| r.get(0),
         )
         .unwrap_or(0);
@@ -1594,20 +1588,74 @@ fn interp_channel_ready(db: &StemmaDb, embedder: &dyn stemma_embed::Embedder) ->
     }
     let registered: Option<(String, String)> = conn
         .query_row(
-            "SELECT model, query_template FROM model_registry
-             WHERE vector_table = 'vec_interp'",
-            [],
+            "SELECT model, query_template FROM model_registry WHERE vector_table = ?1",
+            [table],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
     let identity = embedder.identity();
-    match registered {
+    let ready = match &registered {
         Some((model, template)) => {
-            model == identity.model
+            *model == identity.model
                 && (template.is_empty()
-                    || stemma_embed::query_templates_agree(&template, &identity.query_template))
+                    || stemma_embed::query_templates_agree(template, &identity.query_template))
         }
         None => false,
+    };
+    if !ready {
+        let (registered_model, registered_template) = match &registered {
+            Some((m, t)) => (m.as_str(), t.as_str()),
+            None => ("<no model_registry row>", ""),
+        };
+        warn_space_refused(
+            db,
+            table,
+            registered_model,
+            registered_template,
+            &identity.model,
+            &identity.query_template,
+        );
+    }
+    ready
+}
+
+/// Logs, once per (store, table, registered identity, offered identity) per
+/// process, that a semantic channel is disabled because the store's vector
+/// space is not the embedder's. The gate runs on every query; the warning
+/// must not.
+fn warn_space_refused(
+    db: &StemmaDb,
+    table: &str,
+    registered_model: &str,
+    registered_template: &str,
+    offered_model: &str,
+    offered_template: &str,
+) {
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let store = db
+        .paths()
+        .map(|(s, _)| s.display().to_string())
+        .unwrap_or_else(|| ":memory:".into());
+    let key = format!(
+        "{store}\u{1f}{table}\u{1f}{registered_model}\u{1f}{registered_template}\u{1f}{offered_model}\u{1f}{offered_template}"
+    );
+    let first = WARNED
+        .lock()
+        .map(|mut g| g.get_or_insert_with(Default::default).insert(key))
+        .unwrap_or(true);
+    if first {
+        tracing::warn!(
+            store = %store,
+            table,
+            registered_model,
+            registered_template,
+            offered_model,
+            offered_template,
+            "vector space mismatch: {table} channel disabled for this store \
+             (registered {registered_model:?} / {registered_template:?}, \
+             embedder offers {offered_model:?} / {offered_template:?})"
+        );
     }
 }
 
@@ -4177,6 +4225,63 @@ mod tests {
         assert_eq!(explain.spans[1].admitted_by, "dense_geometry");
         assert_eq!(explain.spans[0].admitted_by, "");
         assert_eq!(explain.mentions, vec![0, 1], "trace keeps the nomination");
+    }
+
+    #[test]
+    fn dense_refuses_a_mismatched_vector_space() {
+        let pad = "Additional descriptive language follows so every record \
+                   clears the document classification threshold comfortably. "
+            .repeat(3);
+        let mut ddl = String::from("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);");
+        for topic in [
+            "alpine down parka",
+            "trail running vest",
+            "marathon trainer",
+        ] {
+            ddl.push_str(&format!(
+                "INSERT INTO notes (body) VALUES ('Catalog entry: {topic}. {pad}');"
+            ));
+        }
+        let db = custom_db("densespace", &ddl);
+        stemma_ingest::enqueue_missing_embeddings(&db).unwrap();
+        stemma_ingest::drain_embed_queue(&db, &HashEmbedder, stemma_ingest::EMBED_BATCH).unwrap();
+        let dense_fired = |db: &StemmaDb| {
+            resolve(db, "insulated winter outerwear", Some(&HashEmbedder))
+                .unwrap()
+                .spans
+                .iter()
+                .flat_map(|s| &s.candidates)
+                .any(|c| c.channels.iter().any(|ch| ch.channel == "dense"))
+        };
+        // Control: the registry names this embedder's space.
+        assert!(dense_fired(&db));
+
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET model = 'some-other-model'
+                 WHERE vector_table = 'vec_dense'",
+                [],
+            )
+            .unwrap();
+        assert!(!dense_fired(&db), "model mismatch");
+
+        db.conn()
+            .execute(
+                "UPDATE model_registry SET model = 'hash-embedder',
+                        query_template = 'Instruct: {query}'
+                 WHERE vector_table = 'vec_dense'",
+                [],
+            )
+            .unwrap();
+        assert!(!dense_fired(&db), "query-template mismatch");
+
+        db.conn()
+            .execute(
+                "DELETE FROM model_registry WHERE vector_table = 'vec_dense'",
+                [],
+            )
+            .unwrap();
+        assert!(!dense_fired(&db), "no registry row");
     }
 
     #[test]
