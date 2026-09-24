@@ -152,27 +152,30 @@ pub fn locate_gold_span(question: &str, target: &Target) -> Option<(usize, usize
     if needle_raw.is_empty() {
         return None;
     }
-    let hay = question.to_lowercase();
-    let needle = needle_raw.to_lowercase();
-    // to_lowercase can change byte lengths for non-ASCII; map back through
-    // char indices to stay safe.
-    if hay.len() == question.len() {
-        return hay.find(&needle).map(|i| (i, i + needle.len()));
-    }
-    // Rare non-ASCII path: scan char windows.
-    let chars: Vec<(usize, char)> = question.char_indices().collect();
-    let nchars = needle.chars().count();
-    for w in 0..chars.len() {
-        if w + nchars > chars.len() {
-            break;
-        }
-        let start = chars[w].0;
-        let end = chars.get(w + nchars).map(|c| c.0).unwrap_or(question.len());
-        if question[start..end].to_lowercase() == needle {
-            return Some((start, end));
+    // Lowercasing can change a char's length ('İ' → "i\u{307}"), so the
+    // haystack is folded char by char, remembering which original char each
+    // folded char came from; a match maps back through that table and must
+    // begin and end on original char boundaries. Both sides fold per char
+    // so context-sensitive folds (final sigma) cannot make them disagree.
+    let needle: Vec<char> = needle_raw.chars().flat_map(char::to_lowercase).collect();
+    let mut hay: Vec<char> = Vec::with_capacity(question.len());
+    // For each folded char: (original byte start, original byte end, whether
+    // it is the first folded char of its original char).
+    let mut origin: Vec<(usize, usize, bool)> = Vec::with_capacity(question.len());
+    for (i, ch) in question.char_indices() {
+        let end = i + ch.len_utf8();
+        for (k, lc) in ch.to_lowercase().enumerate() {
+            hay.push(lc);
+            origin.push((i, end, k == 0));
         }
     }
-    None
+    (0..hay.len())
+        .filter(|&w| w + needle.len() <= hay.len())
+        .find(|&w| {
+            let last = w + needle.len() - 1;
+            origin[w].2 && hay[w..=last] == needle[..] && origin.get(last + 1).is_none_or(|o| o.2)
+        })
+        .map(|w| (origin[w].0, origin[w + needle.len() - 1].1))
 }
 
 /// Scores one trace against one question. `probe` resolves gold-row
@@ -569,6 +572,35 @@ mod tests {
         let q = "the Q3 numbers for the seattle office";
         assert_eq!(locate_gold_span(q, &t), Some((23, 30)));
         assert_eq!(locate_gold_span("no match here", &t), None);
+    }
+
+    #[test]
+    fn gold_span_location_survives_length_changing_case_folds() {
+        // 'İ' lowercases to "i\u{307}" — two chars, three bytes — so a window
+        // sized from the lowercased needle is one char too long and the
+        // literal was never found.
+        let q = "flights to İstanbul today";
+        let start = q.find('İ').unwrap();
+        let t = target("İstanbul");
+        assert_eq!(
+            locate_gold_span(q, &t),
+            Some((start, start + "İstanbul".len()))
+        );
+        let t = target("İSTANBUL");
+        assert_eq!(
+            locate_gold_span(q, &t),
+            Some((start, start + "İstanbul".len()))
+        );
+        // At the very end of the question the over-long window ran off the
+        // end and the scan stopped.
+        let q = "flights to İstanbul";
+        assert_eq!(locate_gold_span(q, &t), Some((start, q.len())));
+        // Offsets stay on the original string's char boundaries when an
+        // earlier char changes length.
+        let q = "İzmir or Ankara";
+        let t = target("ankara");
+        let (s0, e0) = locate_gold_span(q, &t).unwrap();
+        assert_eq!(&q[s0..e0], "Ankara");
     }
 
     #[test]

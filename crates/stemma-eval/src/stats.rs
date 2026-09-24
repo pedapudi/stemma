@@ -35,9 +35,14 @@ pub fn paired_randomization_p(diffs: &[f64], permutations: usize) -> f64 {
 }
 
 /// Percentile bootstrap 95% CI on the mean of per-query differences.
+/// Zero resamples (`--permutations 0`) give no interval: `(NaN, NaN)`,
+/// which serializes as `null`.
 pub fn bootstrap_ci95(diffs: &[f64], resamples: usize) -> (f64, f64) {
     if diffs.is_empty() {
         return (0.0, 0.0);
+    }
+    if resamples == 0 {
+        return (f64::NAN, f64::NAN);
     }
     let mut rng = StdRng::seed_from_u64(SEED ^ 0xB007);
     let n = diffs.len();
@@ -172,6 +177,13 @@ mod tests {
         let m = mean(&diffs);
         assert!(lo <= m && m <= hi, "({lo}, {hi}) should bracket {m}");
         assert!(lo > 0.0, "clearly positive effect: lo = {lo}");
+    }
+
+    #[test]
+    fn zero_resamples_yield_no_interval_not_a_panic() {
+        // `--permutations 0` reaches here as resamples = 0.
+        let (lo, hi) = bootstrap_ci95(&[0.1, 0.2, 0.3], 0);
+        assert!(lo.is_nan() && hi.is_nan(), "({lo}, {hi})");
     }
 
     #[test]
